@@ -69,6 +69,7 @@ export const en: Record<string, string> = {
   "cmd.skills": "Toggle skills (picker, built-in and third-party)",
   "cmd.init": "Scan this repo to generate DAO.md project instructions",
   "cmd.context": "Show context usage breakdown",
+  "cmd.context-window": "Set model context window size (200K/1M/custom K)",
   "cmd.tasks": "Show background tasks",
   "cmd.mcp": "Show connected MCP servers",
   "cmd.diff": "Show uncommitted changes",

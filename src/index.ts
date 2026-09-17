@@ -1339,7 +1339,8 @@ async function main() {
 
   // L2.1:上下文窗口可被 env 覆盖(目标模型真实窗口若 <1M 必须设对,否则压缩永不触发→真实上限处崩)。
   // 真正的安全网是反应式压缩(见 loop.ts compact 钩子):即便此值偏大,撞上下文超限也会自动压缩重试。
-  const CONTEXT_WINDOW = Number(process.env.DAO_CONTEXT_WINDOW) || 1_000_000;
+  // /context-window 命令运行时修改此值(200K/1M 两档或自定义 K),同步写 env 供子进程继承。
+  let CONTEXT_WINDOW = Number(process.env.DAO_CONTEXT_WINDOW) || 1_000_000;
   // Q1 当前上下文 token:优先用主模型上次真实 prompt_tokens(准,尤其中文),无则回退 chars/3 估算。
   const contextTokens = () => session.lastPromptTokens ?? estimateTokens(session.messages);
   // P2-11 编辑后诊断命令(如 "tsc --noEmit"):设了才在写/改文件后跑、把报错回灌模型。
@@ -2100,6 +2101,23 @@ async function main() {
             if (!valid.includes(arg)) return { handled: true, output: `无效:${arg}(可选 ${valid.join("/")})` };
             process.env.DAO_REASONING_EFFORT = arg;
             return { handled: true, output: `思考强度已设为 ${arg}(下一回合生效)` };
+          }
+          if (name === "context-window") {
+            const arg = line.trim().split(/\s+/)[1];
+            const fmtTok = (n: number) => n.toLocaleString();
+            if (!arg) {
+              return { handled: true, output: `当前上下文窗口:${fmtTok(CONTEXT_WINDOW)} tok(${(CONTEXT_WINDOW / 1000).toFixed(0)}K)。\n用法:\n  /context-window 200K  — 200,000 tok\n  /context-window 1M    — 1,000,000 tok\n  /context-window 500   — 自定义,单位 K(即 500,000 tok)` };
+            }
+            // 解析:200K / 1M / 纯数字(单位 K)
+            const m = arg.match(/^(\d+(?:\.\d+)?)\s*([KkMm])?$/);
+            if (!m) return { handled: true, output: `无效格式:「${arg}」。用法:/context-window <200K|1M|<数字>K>(纯数字单位为 K)` };
+            const num = Number(m[1]);
+            const unit = (m[2] ?? "K").toUpperCase();
+            const tok = unit === "M" ? num * 1_000_000 : num * 1_000;
+            if (tok < 1000) return { handled: true, output: `上下文窗口过小(${tok} tok),最小 1K。` };
+            CONTEXT_WINDOW = tok;
+            process.env.DAO_CONTEXT_WINDOW = String(tok);
+            return { handled: true, output: `上下文窗口已设为 ${fmtTok(tok)} tok(${(tok / 1000).toFixed(0)}K),自动压缩阈值 ${fmtTok(Math.round(tok * 0.85))} tok(85%)。立即生效。` };
           }
           if (name === "status") {
             const pct = Math.round((contextTokens() / CONTEXT_WINDOW) * 100);

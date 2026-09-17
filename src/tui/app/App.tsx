@@ -32,7 +32,7 @@ const ECHO_OUTPUT = new Set(["Bash", "BashOutput", "Grep", "WebSearch", "WebFetc
 // 斜杠命令清单(补全菜单 + Tab 补全共用,单一真相源):命令名 + 顺序即菜单展示顺序。
 // 每条描述走 i18n 键 cmd.<name>(精炼一行,参考 命令面板),渲染处用 t("cmd."+name) 取值。
 const COMMAND_META: ReadonlyArray<string> = [
-  "model", "plan", "mode", "skills", "init", "context", "tasks", "mcp", "diff", "doctor",
+  "model", "plan", "mode", "skills", "init", "context", "context-window", "tasks", "mcp", "diff", "doctor",
   "review", "security-review", "hooks", "agents", "files", "memory", "permissions", "resume",
   "rewind", "branch", "rename", "export", "copy", "btw", "Config", "effort", "status", "plugin",
   "account", "simplify", "remember", "debug-session", "skillify", "batch",

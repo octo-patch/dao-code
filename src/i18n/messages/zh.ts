@@ -69,6 +69,7 @@ export const zh: Record<string, string> = {
   "cmd.skills": "技能:开关(弹选择器,逐个/批量内置·第三方)",
   "cmd.init": "扫描本仓库生成 DAO.md 项目指令",
   "cmd.context": "查看上下文占用明细",
+  "cmd.context-window": "设置模型上下文窗口大小(200K/1M/自定义K)",
   "cmd.tasks": "查看后台任务",
   "cmd.mcp": "查看已连接的 MCP 服务",
   "cmd.diff": "查看当前未提交改动",
