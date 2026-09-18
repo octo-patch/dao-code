@@ -226,6 +226,8 @@ export function App(deps: AppDeps) {
   const [accountPick, setAccountPick] = useState<{ items: { name: string; active: boolean; detail: string }[]; idx: number; mode: "switch" | "delete" } | null>(null);
   const [skillPick, setSkillPick] = useState<{ items: { name: string; on: boolean; source: string; detail: string }[]; idx: number; showBundled: boolean } | null>(null);
   const [modelPick, setModelPick] = useState<{ items: { model: string; active: boolean }[]; idx: number } | null>(null);
+  // Ctrl+J 唤出的对话导航面板:列出所有用户消息(摘要),↑↓ 选择、Enter 跳转(重打该轮对话到 scrollback)、Esc 关闭。
+  const [jumpPick, setJumpPick] = useState<{ idx: number } | null>(null);
   // 添加账户流程里的 provider 选择器(↑↓选/⏎确认/Esc取消),resolve(null) 表示取消。
   // "custom" 是自定义网关(OpenAI 兼容,如京东 llm-gw)分支——不新增 Provider 枚举值,落盘仍用 deepseek 请求路径。
   const [providerPick, setProviderPick] = useState<{ items: { provider: Provider | "custom"; label: string }[]; idx: number; resolve: (p: Provider | "custom" | null) => void } | null>(null);
@@ -981,6 +983,38 @@ export function App(deps: AppDeps) {
       if (n > 0) pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.convertedToBackground", n) });
       return;
     }
+    // Ctrl+G:唤出/关闭对话导航面板。随时可用(busy 也能回看历史)。
+    // 不用 Ctrl+J(虽 J for Jump 更直觉):Ink 的 parseKeypress 把 \x0a(LF)当 enter 而非 ctrl+j,
+    // 真实终端里 Ctrl+J 发的就是 \x0a,会被当回车——无法区分。Ctrl+G 的 \x07 能正确解析为 ctrl+g。
+    if (key.ctrl && ch === "g") {
+      const userItems = items.filter((it): it is TranscriptItem => "kind" in it && it.kind === "user");
+      if (userItems.length === 0) return; // 没有用户消息,不弹面板
+      setJumpPick((p) => (p ? null : { idx: userItems.length - 1 })); // 默认定位到最近一条
+      return;
+    }
+    // 对话导航面板:↑↓ 浏览、Enter 跳转(重打该轮对话)、Esc 关闭。
+    if (jumpPick) {
+      const userItems = items.filter((it): it is TranscriptItem => "kind" in it && it.kind === "user");
+      const n = userItems.length;
+      if (n === 0) { setJumpPick(null); return; }
+      if (key.escape) { setJumpPick(null); return; }
+      if (key.upArrow) { setJumpPick((p) => p && { idx: Math.max(0, p.idx - 1) }); return; }
+      if (key.downArrow) { setJumpPick((p) => p && { idx: Math.min(n - 1, p.idx + 1) }); return; }
+      if (key.return) {
+        // 选中第 idx 条用户消息,把它到下一条用户消息(或末尾)之间的所有 transcript 条目重打到 scrollback。
+        const target = userItems[jumpPick.idx]!;
+        const startAt = items.indexOf(target);
+        const nextUser = userItems[jumpPick.idx + 1];
+        const endAt = nextUser ? items.indexOf(nextUser) : items.length;
+        const slice = items.slice(startAt, endAt).filter((it): it is TranscriptItem => "kind" in it);
+        setJumpPick(null);
+        pushItem({ id: nextId(), kind: "notice", text: `↻ 跳转到第 ${jumpPick.idx + 1} 条用户消息(共 ${slice.length} 条记录)` });
+        for (const it of slice) pushItem({ ...it, id: nextId() });
+        pushItem({ id: nextId(), kind: "notice", text: "— 跳转回看结束 —" });
+        return;
+      }
+      return;
+    }
     if (busy) {
       // 运行中:支持排队输入(steering)。回车排队,下一个工具轮边界(不用等整个回合跑完)就会被注入。
       if (key.return) {
@@ -1281,6 +1315,35 @@ export function App(deps: AppDeps) {
                 </Text>
               );
             })}
+          </Box>
+        );
+      })()}
+
+      {jumpPick && (() => {
+        const userItems = items.filter((it): it is TranscriptItem => "kind" in it && it.kind === "user");
+        const n = userItems.length;
+        if (n === 0) return null;
+        const rows = userItems.map((it, i) => {
+          const label = (it.kind === "user" ? it.text : "").replace(/\n/g, " ").trim().slice(0, 60);
+          return `${i + 1}. ${label || "(空)"}`;
+        });
+        // 窗口滚动:条目多时只显示可见窗口,选中项始终在屏内(复用 skillPick 的窗口逻辑)。
+        const WIN = Math.max(5, Math.min(n, (process.stdout.rows ?? 40) - 8));
+        const start = n <= WIN ? 0 : Math.max(0, Math.min(jumpPick.idx - Math.floor(WIN / 2), Math.max(0, n - WIN)));
+        const shown = rows.slice(start, start + WIN);
+        return (
+          <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={c("gold")} paddingX={1}>
+            <Text color={c("gold")}>对话导航(共 {n} 条用户消息)· ↑↓ 选择 · ⏎ 跳转 · Esc 关闭</Text>
+            {start > 0 ? <Text color={c("dim")}>  ↑ {start} 条更早</Text> : null}
+            {shown.map((label, j) => {
+              const i = start + j;
+              return (
+                <Text key={i} color={i === jumpPick.idx ? c("gold") : c("ink")}>
+                  {i === jumpPick.idx ? "❯ " : "  "}{label}
+                </Text>
+              );
+            })}
+            {start + WIN < n ? <Text color={c("dim")}>  ↓ {n - start - WIN} 条更晚</Text> : null}
           </Box>
         );
       })()}

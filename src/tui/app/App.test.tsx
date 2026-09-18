@@ -1260,4 +1260,72 @@ describe("App", () => {
     const parts = submitted as ContentPart[];
     expect(parts.some((p) => p.type === "image_url" && p.image_url.url.startsWith("data:image/png;base64,"))).toBe(true);
   });
+
+  it("Ctrl+G 对话导航:列出用户消息、↑↓ 选择、Enter 跳转重打、Esc 关闭", async () => {
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        submit: async (text, { events }) => {
+          events.assistantDone({ role: "assistant", content: `答:${text}` });
+        },
+      })} />,
+    );
+    // 先产生 3 轮对话
+    for (const round of ["第一个问题", "第二个问题", "第三个问题"]) {
+      for (const ch of round) stdin.write(ch);
+      await delay();
+      stdin.write("\r");
+      await delay();
+    }
+    // 唤出对话导航面板
+    stdin.write("\x07"); // Ctrl+G
+    await delay();
+    let f = lastFrame()!;
+    expect(f).toContain("对话导航");
+    expect(f).toContain("共 3 条用户消息");
+    expect(f).toContain("第三个问题"); // 默认定位最近一条
+    expect(f).toContain("第一个问题");
+    // ↑ 移到第一条
+    stdin.write("\x1b[A"); // ↑
+    await delay();
+    stdin.write("\x1b[A"); // ↑
+    await delay();
+    f = lastFrame()!;
+    expect(f).toContain("❯ 1. 第一个问题");
+    // Enter 跳转 → 重打该轮对话到 scrollback
+    stdin.write("\r");
+    await delay();
+    f = lastFrame()!;
+    expect(f).toContain("跳转到第 1 条用户消息");
+    expect(f).toContain("跳转回看结束");
+    // 面板已关闭
+    expect(f).not.toContain("对话导航");
+  });
+
+  it("Ctrl+G 无用户消息时不弹面板", async () => {
+    const { lastFrame, stdin } = render(<App {...makeDeps()} />);
+    stdin.write("\x07"); // Ctrl+G
+    await delay();
+    const f = lastFrame()!;
+    expect(f).not.toContain("对话导航");
+  });
+
+  it("Ctrl+G 面板 Esc 关闭", async () => {
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        submit: async (text, { events }) => {
+          events.assistantDone({ role: "assistant", content: `答:${text}` });
+        },
+      })} />,
+    );
+    for (const ch of "hello") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    stdin.write("\x07"); // Ctrl+G
+    await delay();
+    expect(lastFrame()!).toContain("对话导航");
+    stdin.write("\x1b"); // Esc
+    await delay();
+    expect(lastFrame()!).not.toContain("对话导航");
+  });
 });
