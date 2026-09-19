@@ -90,7 +90,15 @@ export const monitorTool = defineTool({
           : undefined;
 
         const poller = setInterval(() => {
-          const r = processManager.poll(procId);
+          // processManager.reset() 会 clear procs——poller 不知道,下一次触发会抛"未知后台进程"。
+          // 捕获后走 finish 收尾,避免未捕获异常(退出时 reset → flushObs 窗口里 poller 仍可能触发)。
+          let r: ReturnType<typeof processManager.poll>;
+          try {
+            r = processManager.poll(procId);
+          } catch {
+            finish(`监控已被终止:${args.description}`);
+            return;
+          }
           if (r.stdout) {
             const parts = (lineBuffer + r.stdout).split("\n");
             lineBuffer = parts.pop() ?? ""; // 末尾不完整的一行留到下次拼接

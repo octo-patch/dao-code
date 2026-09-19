@@ -32,6 +32,11 @@ describe("BashOutput / KillShell", () => {
     expect(processManager.poll(id).status).toBe("exited");
   });
 
+  it("KillShell 对不存在的 id 不抛错,返回友好提示(描述承诺'不会报错')", async () => {
+    const out = await execShellKillTool.handler({ id: "proc-nonexistent" }, ctx);
+    expect(out).toContain("不存在");
+  });
+
   it("declares auto approval", () => {
     expect(execShellPollTool.approval).toBe("auto");
     expect(execShellKillTool.approval).toBe("auto");

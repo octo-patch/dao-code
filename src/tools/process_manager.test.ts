@@ -168,6 +168,22 @@ describe("processManager", () => {
     expect(processManager.hasShellNotifications()).toBe(false);
   });
 
+  // 回归测试:reset() 后,上一个会话残留进程的 exit 事件不应往新 notifications 数组里 push。
+  // 此前 exit 回调里不检查 this.procs.has(id),reset() clear procs + 赋值新 notifications 数组后,
+  // 延迟触发的 exit 事件会往新数组里 push 不该存在的通知,污染下一轮。
+  it("reset() 后延迟触发的 exit 事件不污染新 notifications 数组", async () => {
+    const id = processManager.start("echo pollute-test", workDir);
+    await waitExited(id);
+    processManager.drainNotifications(); // 清掉正常通知
+    expect(processManager.hasShellNotifications()).toBe(false);
+    // reset 后 exit 回调如果延迟触发,不应往新数组 push
+    processManager.reset();
+    // 给 exit 事件一点时间在事件循环里传播
+    await new Promise((r) => setTimeout(r, 100));
+    expect(processManager.hasShellNotifications()).toBe(false);
+    expect(processManager.drainNotifications()).toHaveLength(0);
+  });
+
   // ── adopt():接管已在跑的前台子进程(Ctrl+B 转后台用) ──
 
   describe("adopt", () => {

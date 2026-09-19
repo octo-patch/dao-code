@@ -107,6 +107,19 @@ class ProcessManager {
   private onChangeCb: (() => void) | undefined;
   private notify = () => this.onChangeCb?.();
 
+  // 已退出进程保留供 BashOutput 查最终状态,但无限累积会泄漏内存。
+  // 超过上限时删掉最老的已退出进程条目。
+  private static readonly MAX_FINISHED_PROCS = 200;
+  private gcFinished() {
+    let finished = 0;
+    for (const p of this.procs.values()) if (p.status === "exited") finished++;
+    if (finished <= ProcessManager.MAX_FINISHED_PROCS) return;
+    const old = [...this.procs.values()]
+      .filter((p) => p.status === "exited")
+      .sort((a, b) => (b.exitCode ?? 0) - (a.exitCode ?? 0)); // 顺序不重要,只要稳定删一批
+    for (const p of old.slice(0, finished - ProcessManager.MAX_FINISHED_PROCS)) this.procs.delete(p.id);
+  }
+
   onChange(cb: () => void): void { this.onChangeCb = cb; }
   drainNotifications(): string[] { return this.notifications.splice(0); }
   hasShellNotifications(): boolean { return this.notifications.length > 0; }
@@ -149,11 +162,14 @@ class ProcessManager {
       proc.signal = signal;
       // 进程退出时自动入队通知 -- 模型在下一个回合边界收到,不需要手动轮询。
       // notified 标记防止 poll()/kill() 路径二次入队同一个退出事件。
-      if (!proc.notified) {
+      // reset() 会 clear procs 并赋值新 notifications 数组——此时 procs 里已没有这个 id,
+      // 不检查就会往新数组里 push 上一个会话残留进程的退出通知,污染下一轮。
+      if (!proc.notified && this.procs.has(id)) {
         proc.notified = true;
         this.notifications.push(shellNotificationXml(id, command, code, signal));
         this.notify();
       }
+      this.gcFinished();
     });
     this.procs.set(id, proc);
     return id;
@@ -187,15 +203,25 @@ class ProcessManager {
     // 见 exec_shell.ts 的过继逻辑;这里只管接手之后的部分,不关心过继前谁在监听)。
     child.stdout?.on("data", (d: Buffer) => appendFileSync(stdoutPath, d));
     child.stderr?.on("data", (d: Buffer) => appendFileSync(stderrPath, d));
+    // adopt 的子进程用 pipe(不是文件 fd),exit 后 pipe 里可能还有未读完的 data。
+    // 用 close(stdio 流完全关闭)而非 exit 标记 exited,确保 poll() 看到 exited 时
+    // 文件里已包含全部输出——exit 先触发但 data 事件可能还在 flush pipe 残留。
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
     child.on("exit", (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+    });
+    child.on("close", () => {
       proc.status = "exited";
-      proc.exitCode = code;
-      proc.signal = signal;
-      if (!proc.notified) {
+      proc.exitCode = exitCode;
+      proc.signal = exitSignal;
+      if (!proc.notified && this.procs.has(id)) {
         proc.notified = true;
-        this.notifications.push(shellNotificationXml(id, command, code, signal));
+        this.notifications.push(shellNotificationXml(id, command, exitCode, exitSignal));
         this.notify();
       }
+      this.gcFinished();
     });
     this.procs.set(id, proc);
     return id;

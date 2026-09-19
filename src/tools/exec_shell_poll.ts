@@ -62,6 +62,7 @@ export const execShellPollTool = defineTool({
     if (r.stdout.trim()) parts.push(truncateOutput(r.stdout.trimEnd(), "stdout"));
     if (r.stderr.trim()) parts.push(`[stderr]\n${truncateOutput(r.stderr.trimEnd(), "stderr")}`);
     if (r.status === "exited") {
+      lastPollAt.delete(args.id); // 进程已退出,节流条目不再需要
       parts.push(`[exit ${r.exitCode ?? ""}${r.signal ? ` signal ${r.signal}` : ""}]`);
     }
     return parts.join("\n");

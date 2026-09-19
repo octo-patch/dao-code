@@ -165,6 +165,18 @@ describe("create/update:手动任务(不背靠 promise)", () => {
     expect(tm.get(id)?.status).toBe("canceled");
   });
 
+  it("cancelAll 也清理 create() 建的手动任务(此前只遍历 controllers,漏掉无 controller 的任务)", () => {
+    const tm = createTaskManager();
+    tm.create("手动任务1");
+    tm.create("手动任务2");
+    tm.launch("子代理任务", async () => "done");
+    expect(tm.running()).toHaveLength(3);
+    tm.cancelAll();
+    expect(tm.running()).toHaveLength(0);
+    // create 建的任务也被 cancel,不是永远挂着 running
+    for (const t of tm.all()) expect(t.status).not.toBe("running");
+  });
+
   it("all() 含已结束任务,running() 不含", () => {
     const tm = createTaskManager();
     const a = tm.create("a");

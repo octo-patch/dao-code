@@ -66,7 +66,11 @@ export const taskOutputTool = defineTool({
     }
     const from = cursors.get(args.id) ?? 0;
     const fresh = t.messages.slice(from);
-    cursors.set(args.id, t.messages.length);
+    if (t.status !== "running") {
+      cursors.delete(args.id); // 任务已结束,游标不再需要
+    } else {
+      cursors.set(args.id, t.messages.length);
+    }
     const lines = fresh.map(renderMessage).filter((l): l is string => l !== null);
     if (lines.length === 0) {
       return `状态: ${t.status}(自上次查询以来没有新消息)`;

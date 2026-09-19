@@ -104,6 +104,25 @@ export function createTaskManager(): TaskManager {
   let onChangeCb: (() => void) | undefined;
   const notify = () => onChangeCb?.();
 
+  // 已结束任务保留供 TaskList(include_finished) 查历史,但无限累积会泄漏内存。
+  // 超过上限时删掉最老的已结束任务及其 controllers/pending 残留。
+  const MAX_FINISHED_TASKS = 200;
+  const gcFinished = () => {
+    let finished = 0;
+    for (const t of tasks.values()) if (t.status !== "running") finished++;
+    if (finished <= MAX_FINISHED_TASKS) return;
+    // 按 endedAt 升序排已结束任务,删最老的直到不超限
+    const old = [...tasks.values()]
+      .filter((t) => t.status !== "running")
+      .sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0));
+    const toRemove = old.slice(0, finished - MAX_FINISHED_TASKS);
+    for (const t of toRemove) {
+      tasks.delete(t.id);
+      controllers.delete(t.id);
+      pending.delete(t.id);
+    }
+  };
+
   const cancelOne = (id: string): boolean => {
     const t = tasks.get(id);
     if (!t || t.status !== "running") return false;
@@ -111,6 +130,8 @@ export function createTaskManager(): TaskManager {
     ac?.abort(); // 手动建的任务(create())没有 controller,无进程可 abort,仍走下面的状态转移
     t.status = "canceled";
     t.endedAt = Date.now();
+    controllers.delete(id); // 已结束,controller 不再需要
+    gcFinished();
     notify();
     return true;
   };
@@ -129,6 +150,8 @@ export function createTaskManager(): TaskManager {
           t.status = "completed";
           t.result = result;
           t.endedAt = Date.now();
+          controllers.delete(id);
+          gcFinished();
           notifications.push(notificationXml(t));
           notify();
         },
@@ -137,6 +160,8 @@ export function createTaskManager(): TaskManager {
           t.status = "failed";
           t.error = e instanceof Error ? e.message : String(e);
           t.endedAt = Date.now();
+          controllers.delete(id);
+          gcFinished();
           notifications.push(notificationXml(t));
           notify();
         },
@@ -154,6 +179,8 @@ export function createTaskManager(): TaskManager {
           t.status = "completed";
           t.result = result;
           t.endedAt = Date.now();
+          controllers.delete(id);
+          gcFinished();
           notifications.push(notificationXml(t));
           notify();
         },
@@ -162,6 +189,8 @@ export function createTaskManager(): TaskManager {
           t.status = "failed";
           t.error = e instanceof Error ? e.message : String(e);
           t.endedAt = Date.now();
+          controllers.delete(id);
+          gcFinished();
           notifications.push(notificationXml(t));
           notify();
         },
@@ -183,11 +212,13 @@ export function createTaskManager(): TaskManager {
         if (t.status !== "running") return false; // 已结束的任务不可再改状态(防止和自动结算的通知重复)
         t.status = patch.status;
         t.endedAt = Date.now();
+        controllers.delete(id);
         if (patch.result !== undefined) {
           if (t.status === "completed") t.result = patch.result;
           else t.error = patch.result;
         }
         notifications.push(notificationXml(t));
+        gcFinished();
       }
       notify();
       return true;
@@ -197,6 +228,8 @@ export function createTaskManager(): TaskManager {
       if (!t || t.status !== "running") return false;
       t.status = status;
       t.endedAt = Date.now();
+      controllers.delete(id);
+      gcFinished();
       notify();
       return true;
     },
@@ -236,7 +269,9 @@ export function createTaskManager(): TaskManager {
     },
     cancel: cancelOne,
     cancelAll() {
-      for (const id of controllers.keys()) cancelOne(id);
+      // 遍历所有 running 任务,而非只遍历 controllers——create() 建的手动任务没有 controller,
+      // 不在 controllers 里,只遍历 controllers 会漏掉它们,导致退出时这些任务永远挂着 running。
+      for (const t of tasks.values()) if (t.status === "running") cancelOne(t.id);
     },
     onChange(cb) {
       onChangeCb = cb;
