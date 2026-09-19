@@ -1261,7 +1261,7 @@ describe("App", () => {
     expect(parts.some((p) => p.type === "image_url" && p.image_url.url.startsWith("data:image/png;base64,"))).toBe(true);
   });
 
-  it("Ctrl+G 对话导航:列出用户消息、↑↓ 选择、Enter 跳转重打、Esc 关闭", async () => {
+  it("Ctrl+G 对话导航:列出用户消息、↑↓ 选择、Enter 跳转回看、Esc 退出回看", async () => {
     const { lastFrame, stdin } = render(
       <App {...makeDeps({
         submit: async (text, { events }) => {
@@ -1291,14 +1291,20 @@ describe("App", () => {
     await delay();
     f = lastFrame()!;
     expect(f).toContain("❯ 1. 第一个问题");
-    // Enter 跳转 → 重打该轮对话到 scrollback
+    // Enter 跳转 → 进入回看模式(只读视图,显示那轮历史对话)
     stdin.write("\r");
     await delay();
     f = lastFrame()!;
-    expect(f).toContain("跳转到第 1 条用户消息");
-    expect(f).toContain("跳转回看结束");
+    expect(f).toContain("回看历史对话");
+    expect(f).toContain("第一个问题");
+    expect(f).toContain("答:第一个问题");
     // 面板已关闭
     expect(f).not.toContain("对话导航");
+    // Esc 退出回看,回到当前 transcript
+    stdin.write("\x1b");
+    await delay();
+    f = lastFrame()!;
+    expect(f).not.toContain("回看历史对话");
   });
 
   it("Ctrl+G 无用户消息时不弹面板", async () => {
@@ -1327,5 +1333,33 @@ describe("App", () => {
     stdin.write("\x1b"); // Esc
     await delay();
     expect(lastFrame()!).not.toContain("对话导航");
+  });
+
+  it("/compact 成功 → 显示\"已压缩对话\" notice", async () => {
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        runCommand: (l) => l.startsWith("/compact") ? { handled: true, compact: true } : { handled: true, output: "?" },
+        compact: async () => {},
+      })} />,
+    );
+    for (const ch of "/compact") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    for (let i = 0; i < 50 && !lastFrame()!.includes("已压缩对话"); i++) await delay(20);
+    expect(lastFrame()!).toContain("已压缩对话");
+  });
+
+  it("/compact 抛错 → 显示出错 notice,不静默吞掉", async () => {
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        runCommand: (l) => l.startsWith("/compact") ? { handled: true, compact: true } : { handled: true, output: "?" },
+        compact: async () => { throw new Error("压缩失败:摘要模型不可用"); },
+      })} />,
+    );
+    for (const ch of "/compact") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    for (let i = 0; i < 50 && !lastFrame()!.includes("压缩失败"); i++) await delay(20);
+    expect(lastFrame()!).toContain("压缩失败");
   });
 });

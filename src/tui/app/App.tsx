@@ -226,8 +226,11 @@ export function App(deps: AppDeps) {
   const [accountPick, setAccountPick] = useState<{ items: { name: string; active: boolean; detail: string }[]; idx: number; mode: "switch" | "delete" } | null>(null);
   const [skillPick, setSkillPick] = useState<{ items: { name: string; on: boolean; source: string; detail: string }[]; idx: number; showBundled: boolean } | null>(null);
   const [modelPick, setModelPick] = useState<{ items: { model: string; active: boolean }[]; idx: number } | null>(null);
-  // Ctrl+J 唤出的对话导航面板:列出所有用户消息(摘要),↑↓ 选择、Enter 跳转(重打该轮对话到 scrollback)、Esc 关闭。
+  // Ctrl+G 唤出的对话导航面板:列出所有用户消息(摘要),↑↓ 选择、Enter 跳转(回看那轮对话)、Esc 关闭。
   const [jumpPick, setJumpPick] = useState<{ idx: number } | null>(null);
+  // 回看模式:Enter 跳转后激活,在动态区渲染选中的那轮历史对话(只读);Esc 退出回到当前 transcript。
+  // 不把历史条目 push 进 items(那会污染 scrollback 且无法撤销),而是临时切到只读视图。
+  const [reviewMode, setReviewMode] = useState<TranscriptItem[] | null>(null);
   // 添加账户流程里的 provider 选择器(↑↓选/⏎确认/Esc取消),resolve(null) 表示取消。
   // "custom" 是自定义网关(OpenAI 兼容,如京东 llm-gw)分支——不新增 Provider 枚举值,落盘仍用 deepseek 请求路径。
   const [providerPick, setProviderPick] = useState<{ items: { provider: Provider | "custom"; label: string }[]; idx: number; resolve: (p: Provider | "custom" | null) => void } | null>(null);
@@ -499,7 +502,16 @@ export function App(deps: AppDeps) {
       if (name === "model" && !text.trim().split(/\s+/)[1] && deps.listModels) { openModelPicker(); return; }
       const res = deps.runCommand(full);
       if (res.exit) { exit(); return; }
-      if (res.compact) { await deps.compact(); pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.compacted") }); setStatus(deps.getStatus()); return; }
+      if (res.compact) {
+        try {
+          await deps.compact();
+          pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.compacted") });
+        } catch (e) {
+          pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.error", (e as Error).message) });
+        }
+        setStatus(deps.getStatus());
+        return;
+      }
       if (name === "clear" || res.clearTranscript) setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []); // /clear /rewind /resume:重置可视 transcript
       if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
       // 自定义命令:展开成 prompt → 当作一个回合跑。
@@ -992,7 +1004,12 @@ export function App(deps: AppDeps) {
       setJumpPick((p) => (p ? null : { idx: userItems.length - 1 })); // 默认定位到最近一条
       return;
     }
-    // 对话导航面板:↑↓ 浏览、Enter 跳转(重打该轮对话)、Esc 关闭。
+    // 回看模式:Esc 退出回到当前 transcript;其他键一律吞掉(只读视图,不响应输入)。
+    if (reviewMode) {
+      if (key.escape) setReviewMode(null);
+      return;
+    }
+    // 对话导航面板:↑↓ 浏览、Enter 跳转(回看那轮对话)、Esc 关闭。
     if (jumpPick) {
       const userItems = items.filter((it): it is TranscriptItem => "kind" in it && it.kind === "user");
       const n = userItems.length;
@@ -1001,16 +1018,15 @@ export function App(deps: AppDeps) {
       if (key.upArrow) { setJumpPick((p) => p && { idx: Math.max(0, p.idx - 1) }); return; }
       if (key.downArrow) { setJumpPick((p) => p && { idx: Math.min(n - 1, p.idx + 1) }); return; }
       if (key.return) {
-        // 选中第 idx 条用户消息,把它到下一条用户消息(或末尾)之间的所有 transcript 条目重打到 scrollback。
+        // 选中第 idx 条用户消息,把它到下一条用户消息(或末尾)之间的 transcript 条目切到回看视图(只读)。
+        // 不 push 进 items(那会污染 scrollback 且无法撤销),而是临时切到只读视图,Esc 退出回到当前 transcript。
         const target = userItems[jumpPick.idx]!;
         const startAt = items.indexOf(target);
         const nextUser = userItems[jumpPick.idx + 1];
         const endAt = nextUser ? items.indexOf(nextUser) : items.length;
         const slice = items.slice(startAt, endAt).filter((it): it is TranscriptItem => "kind" in it);
         setJumpPick(null);
-        pushItem({ id: nextId(), kind: "notice", text: `↻ 跳转到第 ${jumpPick.idx + 1} 条用户消息(共 ${slice.length} 条记录)` });
-        for (const it of slice) pushItem({ ...it, id: nextId() });
-        pushItem({ id: nextId(), kind: "notice", text: "— 跳转回看结束 —" });
+        setReviewMode(slice);
         return;
       }
       return;
@@ -1194,6 +1210,16 @@ export function App(deps: AppDeps) {
           )
         }
       </Static>
+
+      {reviewMode && (
+        <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={c("gold")} paddingX={1}>
+          <Text color={c("gold")}>↻ 回看历史对话(共 {reviewMode.length} 条记录)· Esc 返回当前对话</Text>
+          {reviewMode.map((it) => (
+            <Row key={it.id} item={it} c={c} />
+          ))}
+          <Text color={c("dim")}>— 回看结束,按 Esc 返回 —</Text>
+        </Box>
+      )}
 
       {live && (
         <Box flexDirection="column" marginTop={1}>
