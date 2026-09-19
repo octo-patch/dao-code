@@ -31,7 +31,6 @@ import { loadPlugins, installPlugin, removePlugin, pluginsRoot, pluginComponentD
 import { loadProjectInstructions } from "./project_doc.js";
 import { gatherEnvSnapshotData, formatEnvSnapshot, probeTopLevelDir, probeMemory, formatFastEnvFields, wrapDelayedEnvNotice } from "./env_snapshot.js";
 import { execShellTool, cleanupDbBackups } from "./tools/exec_shell.js";
-import { verifyDoneTool } from "./tools/verify.js";
 import { execShellPollTool } from "./tools/exec_shell_poll.js";
 import { execShellKillTool } from "./tools/exec_shell_kill.js";
 import { grepFilesTool } from "./tools/grep_files.js";
@@ -575,7 +574,7 @@ async function main() {
     enterPlanModeTool, exitPlanModeTool,
     enterWorktreeTool, exitWorktreeTool,
     monitorTool,
-    configTool, sendMessageTool, verifyDoneTool,
+    configTool, sendMessageTool,
     cronCreateTool, cronDeleteTool, cronListTool,
   ]) {
     registry.register(t);

@@ -68,7 +68,7 @@ function isSensitiveTargetCall(p: DecideParams): boolean {
 // 网络查询(WebSearch/WebFetch)auto 下放行:属"读取型"取信息,deny 规则仍能覆盖;WebFetch 自带 SSRF 挡内网/元数据。
 const AUTO_ALLOWLIST = new Set([
   "Read", "Grep", "Glob", "ListDir",
-  "TodoWrite", "AskUserQuestion", "MemoryRead", "Skill", "VerifyDone", "echo",
+  "TodoWrite", "AskUserQuestion", "MemoryRead", "Skill", "echo",
   "WebSearch", "WebFetch",
   "LSP",
   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskOutput", "TaskStop",
