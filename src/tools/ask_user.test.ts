@@ -78,7 +78,38 @@ describe("AskUserQuestion tool", () => {
       },
     );
     expect(asked).toEqual(["用什么框架?", "用什么语言?"]);
-    expect(out).toBe("React\nTypeScript");
+    expect(out).toBe("[1. 用什么框架?] React\n[2. 用什么语言?] TypeScript");
+  });
+
+  it("中间问题选'先讨论一下':已答的带标号返回,讨论项标注,后续问题标注未问且不再弹出", async () => {
+    const asked: string[] = [];
+    const discussValue = "我想先讨论一下,先别急着定方向。";
+    const out = await askUserTool.handler(
+      {
+        questions: [
+          { question: "用什么框架?", options: [{ label: "React" }, { label: "Vue" }] },
+          { question: "用什么语言?", options: [{ label: "TypeScript" }, { label: "JavaScript" }] },
+          { question: "用什么数据库?", options: [{ label: "Postgres" }, { label: "MySQL" }] },
+        ],
+      },
+      {
+        workspaceRoot: "/tmp",
+        ask: async () => "不该走到这",
+        askChoice: async (q) => {
+          asked.push(q);
+          // 问题 2 选"先讨论一下"
+          return q.includes("语言") ? discussValue : "React";
+        },
+      },
+    );
+    // 问题 1、2 弹出了,问题 3 没弹
+    expect(asked).toEqual(["用什么框架?", "用什么语言?"]);
+    // 返回格式:已答带标号、讨论项标注、未问项标注
+    expect(out).toBe(
+      "[1. 用什么框架?] React\n" +
+      "[2. 用什么语言?] ⚠ 用户想先讨论一下,先别急着定方向。\n" +
+      "[3. 用什么数据库?] (未问——用户要求先讨论)",
+    );
   });
 
   it("structured options with description are passed as 'label - description'", async () => {

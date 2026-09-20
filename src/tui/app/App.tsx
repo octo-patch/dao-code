@@ -872,9 +872,18 @@ export function App(deps: AppDeps) {
       const doneRowIdx = choice.multi ? nOpt : -1;
       const fillIdx = nOpt + (choice.multi ? 1 : 0);
       const discussIdx = nOpt + (choice.multi ? 2 : 1);
-      const done = (val: string) => { choice.resolve(val); setChoice(null); setAskInput(""); setChoiceChecked(new Set()); setChoiceWarn(false); };
-      // 选"先讨论一下" = 停下把回合让给用户:先把讨论意向作 tool 结果记入,再打断本回合(否则模型会读完继续干)。
-      const discuss = () => { done(t("ui.choice.discussValue")); controllerRef.current?.abort(); };
+      // 用户的选择/输入要反显到 transcript(和主输入框 onSubmit 一样),否则用户看不到自己答了什么。
+      const done = (val: string) => {
+        pushItem({ id: nextId(), kind: "user", text: val });
+        choice.resolve(val);
+        setChoice(null);
+        setAskInput("");
+        setChoiceChecked(new Set());
+        setChoiceWarn(false);
+      };
+      // 选"先讨论一下":把讨论意向作 tool 结果返回给模型,让模型据此收尾(生成回复而非继续干活)。
+      // 不 abort——abort 会打断模型,导致模型看不到 tool 结果、无法生成"好的,我们讨论一下"这类收尾回复。
+      const discuss = () => { done(t("ui.choice.discussValue")); };
       const toggle = (i: number) => { setChoiceWarn(false); setChoiceChecked((s) => { const n = new Set(s); if (n.has(i)) n.delete(i); else n.add(i); return n; }); };
       const submitMulti = () => { // 提交已勾选;空集不静默提交,提示先勾选(避免误触丢问题)
         const picked = [...choiceChecked].sort((a, b) => a - b).map((i) => choice.options[i]!);
@@ -934,7 +943,11 @@ export function App(deps: AppDeps) {
     }
     if (ask) {
       if (key.escape) { ask.resolve("[用户中断]"); setAsk(null); setAskInput(""); controllerRef.current?.abort(); return; }
-      if (key.return) { ask.resolve(askInput); setAsk(null); setAskInput(""); }
+      if (key.return) {
+        const val = askInput || "(用户未回答)";
+        pushItem({ id: nextId(), kind: "user", text: val });
+        ask.resolve(askInput); setAsk(null); setAskInput("");
+      }
       else if (key.backspace || key.delete) setAskInput((s) => s.slice(0, -1));
       else if (ch && !key.ctrl && !key.meta) setAskInput((s) => s + ch);
       return;
