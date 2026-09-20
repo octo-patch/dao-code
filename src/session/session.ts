@@ -114,6 +114,8 @@ export class Session {
 
   clear(): void {
     this.messages = [{ role: "system", content: this.systemPrompt }];
+    this.lastPromptTokens = undefined; // 清空后上下文用量归零,StatusBar/shouldCompact 不再误报旧值
+    this.lastSentLength = 0;
   }
 
   setModel(model: string): void {

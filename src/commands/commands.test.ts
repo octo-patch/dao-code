@@ -135,8 +135,12 @@ describe("dispatchCommand", () => {
   it("/clear resets the conversation", () => {
     const s = sess();
     s.addUser("a");
+    s.lastPromptTokens = 50000;
+    s.lastSentLength = 10;
     dispatchCommand("/clear", s);
     expect(s.messages).toHaveLength(1);
+    expect(s.lastPromptTokens).toBeUndefined();
+    expect(s.lastSentLength).toBe(0);
   });
 
   it("/exit signals exit", () => {
