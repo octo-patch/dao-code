@@ -303,12 +303,27 @@ export function App(deps: AppDeps) {
   const history = useRef<string[]>([]);
   const histIdx = useRef<number>(-1); // -1 = 不在历史浏览中
 
-  const pushItem = (it: TranscriptItem) =>
-    setItems((p) => {
-      if (welcomeCommitted.current) return [...p, it];
-      welcomeCommitted.current = true;
-      return [{ id: 0, kind: "welcome" } as const, ...p, it];
+  // 首次 pushItem 时分两步:先单独提交 welcome 进 <Static>,再在下一帧提交真正的 item。
+  // 一次性合并 [welcome, user] 会在低终端(欢迎屏溢出)下触发 shouldClearTerminal 路径,
+  // 该路径与 spinner setTick 的微任务竞态会导致 user 行渲染为空(偶发"首次输入不反显")。
+  // 拆成两次 setItems 后:第一次只把 welcome 从动态区固化进 <Static>(index 0→1),
+  // 第二次才追加 user(index 1→2),每次只新增一个 item,<Static> 的增量渲染不会命中
+  // shouldClearTerminal,消除竞态。
+  const welcomeSplitDone = useRef(welcomeCommitted.current);
+  const pushItem = (it: TranscriptItem) => {
+    if (welcomeCommitted.current || welcomeSplitDone.current) {
+      setItems((p) => [...p, it]);
+      return;
+    }
+    // 首次:先固化 welcome,下一帧再追加 item——两步走,不合并。
+    welcomeSplitDone.current = true;
+    welcomeCommitted.current = true;
+    setItems([{ id: 0, kind: "welcome" } as const]);
+    queueMicrotask(() => {
+      if (process.env.DAO_DEBUG_TUI) process.stderr.write(`[tui] pushItem: welcome committed, queuing ${it.kind}\n`);
+      setItems((p) => [...p, it]);
     });
+  };
 
   // spinner / elapsed 计时(仅 busy 时)。
   useEffect(() => {
@@ -1208,6 +1223,15 @@ export function App(deps: AppDeps) {
   // 动态区可用列宽:tail() 按此把逻辑长行折成视觉行来限高(见 tail 注释)。
   const liveCols = process.stdout.columns ?? 80;
 
+  // 调试日志:DAO_DEBUG_TUI=1 时记录 <Static> 渲染入参,便于排查"首次输入不反显"等渲染竞态。
+  if (process.env.DAO_DEBUG_TUI) {
+    const prevItemsRef = useRef<number>(-1);
+    if (prevItemsRef.current !== items.length) {
+      prevItemsRef.current = items.length;
+      const kinds = items.map((it) => it.kind).join(",");
+      process.stderr.write(`[tui] Static render: items.length=${items.length} kinds=[${kinds}] busy=${busy} live=${!!live}\n`);
+    }
+  }
   return (
     <Box flexDirection="column">
       {/* 会话开始前:欢迎屏在动态区,随终端 resize 实时重排(useTermWidth 订阅)。 */}
