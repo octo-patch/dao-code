@@ -91,6 +91,44 @@ describe("ToolRegistry", () => {
     );
   });
 
+  it("单必填字段工具缺参数 → 附最小调用示例", async () => {
+    // Grep 缺 pattern 是高频错误:模型把 pattern 记串或漏传。最小调用示例比参数列表更直接。
+    const reg = new ToolRegistry();
+    reg.register(defineTool({
+      name: "Grep",
+      description: "search content",
+      capability: "read", approval: "auto",
+      schema: z.object({
+        pattern: z.string().describe("正则表达式"),
+        path: z.string().optional().describe("搜索子目录"),
+      }),
+      handler: async () => "",
+    }));
+    await expect(reg.dispatch("Grep", '{"path": "src"}', { workspaceRoot: "/tmp" })).rejects.toThrow(
+      /Grep 缺少必填参数「pattern」.*最小调用示例:Grep\(\{"pattern": "<值>"\}\)/s,
+    );
+  });
+
+  it("多必填字段工具缺参数 → 不附最小调用示例(示例太长反而干扰)", async () => {
+    const reg = new ToolRegistry();
+    reg.register(defineTool({
+      name: "Multi",
+      description: "multi required",
+      capability: "read", approval: "auto",
+      schema: z.object({
+        a: z.string(),
+        b: z.string(),
+      }),
+      handler: async () => "",
+    }));
+    try {
+      await reg.dispatch("Multi", '{"a": "x"}', { workspaceRoot: "/tmp" });
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect((e as Error).message).not.toContain("最小调用示例");
+    }
+  });
+
   it("缺必填字段 + 没传任何参数 → 提示缺哪个字段、工具要什么", async () => {
     const reg = new ToolRegistry();
     reg.register(defineTool({

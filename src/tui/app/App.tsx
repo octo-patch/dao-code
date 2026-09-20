@@ -171,6 +171,8 @@ export function App(deps: AppDeps) {
   const initial = deps.initialItems ?? [];
   const idRef = useRef(initial.reduce((m, it) => Math.max(m, it.id), 0) + 1);
   const nextId = () => idRef.current++;
+  // token 数格式化:<1k 显示原数,1k+ 显示 k 单位(与 StatusBar 的 fmt 风格一致)。
+  const fmtTok = (n: number) => (n < 1000 ? String(n) : (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k");
   // 欢迎屏延迟固化:会话开始前留在动态区(随终端 resize 重排),
   // 首个 transcript 项产生时才作为 items[0] 进 <Static>(恢复会话则直接固化)。
   const [items, setItems] = useState<({ id: number; kind: "welcome" } | TranscriptItem)[]>(
@@ -518,11 +520,22 @@ export function App(deps: AppDeps) {
       const res = deps.runCommand(full);
       if (res.exit) { exit(); return; }
       if (res.compact) {
+        const compactingId = nextId();
+        pushItem({ id: compactingId, kind: "notice", text: t("ui.notice.compacting") });
         try {
-          await deps.compact();
-          pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.compacted") });
+          const { before, after } = await deps.compact();
+          // 替换"正在压缩"为最终结果(而非追加一条,避免两条 notice 并存)。
+          setItems((prev) => prev.map((it) =>
+            it.id === compactingId
+              ? { ...it, text: after < before
+                  ? t("ui.notice.compactResult", fmtTok(before), fmtTok(after), Math.round((1 - after / before) * 100))
+                  : t("ui.notice.compactSkipped") }
+              : it,
+          ));
         } catch (e) {
-          pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.error", (e as Error).message) });
+          setItems((prev) => prev.map((it) =>
+            it.id === compactingId ? { ...it, text: t("ui.notice.error", (e as Error).message) } : it,
+          ));
         }
         setStatus(deps.getStatus());
         return;

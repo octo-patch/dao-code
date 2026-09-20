@@ -1494,12 +1494,16 @@ async function main() {
   };
 
   // Ink 态压缩:不向 stdout 写(会冲渲染),只压缩消息;提示由 App 通过 events/notice 给出。
-  const inkCompact = async (): Promise<void> => {
+  // 返回前后 token 估算,供 App 展示压缩效果(如 "~12K → ~3K tok")。
+  const inkCompact = async (): Promise<{ before: number; after: number }> => {
+    const before = estimateTokens(session.messages);
     session.messages = await compactMessages(
       session.messages,
       { summarize: summarizeWithBreaker },
       todoStore.get().length ? formatTodos(todoStore.get()) : undefined,
     );
+    const after = estimateTokens(session.messages);
+    return { before, after };
   };
 
   // 统一反思器(回合末):一个 fork,既反思进展(advisory,有问题才注入)又抽记忆(含 mergeInto 合并)。

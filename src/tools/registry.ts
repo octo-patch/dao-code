@@ -75,6 +75,17 @@ function formatZodError(name: string, schema: ZodTypeAny, rawArgs: string, err: 
   const passedKeys = (() => { try { return Object.keys(JSON.parse(rawArgs) as object); } catch { return []; } })();
   const paramList = describeToolParams(schema);
 
+  // 当工具只有一个必填字段且模型漏传时,附一个最小调用示例——比参数列表更直接,模型纠正更快。
+  // 真实撞见:Grep 缺 pattern、Glob 缺 glob、Read 缺 path,模型反复重试同一错误调用。
+  const requiredFields = ((toJsonSchema(schema).required ?? []) as string[]);
+  const missingFields = issues
+    .filter((i) => (i as { code?: string; received?: string }).code === "invalid_type" && (i as { received?: string }).received === "undefined")
+    .map((i) => ((i as { path?: (string | number)[] }).path ?? []).join("."))
+    .filter(Boolean);
+  const minCallHint = (missingFields.length > 0 && requiredFields.length === 1)
+    ? ` 最小调用示例:${name}({"${requiredFields[0]}": "<值>"})`
+    : "";
+
   const lines: string[] = [];
   for (const issue of issues) {
     const iss = issue as { code?: string; path?: (string | number)[]; expected?: string; received?: string; keys?: string[]; message?: string };
@@ -84,7 +95,7 @@ function formatZodError(name: string, schema: ZodTypeAny, rawArgs: string, err: 
       const hint = passedKeys.length > 0
         ? `你传了 [${passedKeys.join(", ")}],但 ${name} 不含名为「${field}」的字段——参数名可能写错了(比如把别的工具的参数名用到了这里)。`
         : `${name} 需要参数「${field}」,但你没传任何参数。`;
-      lines.push(`${name} 缺少必填参数「${field}」(${iss.expected})。${hint} ${name} 接受的参数:${paramList}`);
+      lines.push(`${name} 缺少必填参数「${field}」(${iss.expected})。${hint} ${name} 接受的参数:${paramList}${minCallHint}`);
     } else if (iss.code === "invalid_type") {
       lines.push(`${name} 参数「${field}」需要 ${iss.expected},收到 ${iss.received}。${name} 接受的参数:${paramList}`);
     } else if (iss.code === "unrecognized_keys") {

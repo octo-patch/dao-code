@@ -25,7 +25,7 @@ function makeDeps(over: Partial<AppDeps> = {}): AppDeps {
     },
     runCommand: (line) =>
       line.startsWith("/help") ? { handled: true, output: "命令:/help /exit" } : { handled: true, output: "未知" },
-    compact: async () => {},
+    compact: async () => ({ before: 12000, after: 3000 }),
     getStatus: () => ({ model: "deepseek-v4-pro", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3 }),
     register: () => {},
     ...over,
@@ -1339,7 +1339,7 @@ describe("App", () => {
     const { lastFrame, stdin } = render(
       <App {...makeDeps({
         runCommand: (l) => l.startsWith("/compact") ? { handled: true, compact: true } : { handled: true, output: "?" },
-        compact: async () => {},
+        compact: async () => ({ before: 12000, after: 3000 }),
       })} />,
     );
     for (const ch of "/compact") stdin.write(ch);
@@ -1347,6 +1347,7 @@ describe("App", () => {
     stdin.write("\r");
     for (let i = 0; i < 50 && !lastFrame()!.includes("已压缩对话"); i++) await delay(20);
     expect(lastFrame()!).toContain("已压缩对话");
+    expect(lastFrame()!).toContain("节省 75%");
   });
 
   it("/compact 抛错 → 显示出错 notice,不静默吞掉", async () => {

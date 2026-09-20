@@ -51,7 +51,7 @@ export interface AppDeps {
   submit: (text: string | ContentPart[], hooks: { events: TurnEvents; signal: AbortSignal }) => Promise<void>;
   // 斜杠命令(/model /plan /clear /compact /help /exit;以及自定义命令展开成 prompt)。
   runCommand: (line: string) => { handled: boolean; output?: string; exit?: boolean; compact?: boolean; prompt?: string; clearTranscript?: boolean; resumeItems?: TranscriptItem[] };
-  compact: () => Promise<void>;
+  compact: () => Promise<{ before: number; after: number }>;
   getStatus: () => StatusInfo;
   // verbose/debug 模式:展示工具原样参数、工具结果全量、思考全量(默认显意图 + 截断)。
   verbose?: boolean;
