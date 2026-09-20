@@ -4,8 +4,12 @@ import { render } from "ink-testing-library";
 import { Onboarding } from "./Onboarding.js";
 import { setLang } from "../../i18n/i18n.js";
 
-const DOWN = "\x1B[B", ENTER = "\r";
-const delay = (ms = 40) => new Promise((r) => setTimeout(r, ms));
+const ENTER = "\r";
+// 完整套件并发跑时 CPU 竞争会拉长 React 状态更新周期,固定 40ms delay 不够。
+// 用 100ms 延迟 + waitFor 轮询兜底,确保 spy 被调用后再断言。
+const delay = (ms = 100) => new Promise((r) => setTimeout(r, ms));
+const waitForCall = (spy: ReturnType<typeof vi.fn>, timeout = 10000) =>
+  vi.waitFor(() => { if (spy.mock.calls.length === 0) throw new Error("not called yet"); }, { timeout });
 beforeEach(() => setLang("en"));
 
 const welcome = {
@@ -31,39 +35,43 @@ describe("Onboarding state machine", () => {
     expect(lastFrame()).not.toContain("快速开始");      // 页脚不显
     stdin.write(ENTER); await delay();                  // 语言=English(默认)
     stdin.write(ENTER); await delay();                  // provider=deepseek(默认)
-    stdin.write("sk-x"); await delay(); stdin.write(ENTER); await delay(60); // key 校验通过
+    stdin.write("sk-x"); await delay(); stdin.write(ENTER); await delay(200); // key 校验通过
     stdin.write("y"); await delay();                    // 信任
+    await waitForCall(d.writeLang);
     expect(d.writeLang).toHaveBeenCalledWith("en");
     expect(d.trustCurrent).toHaveBeenCalled();
     expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({ lang: "en", trusted: true }));
     expect(onFinish.mock.calls[0]?.[0].resolved.key).toBe("sk-x");
-  });
+  }, 30000);
   it("persist rejecting → shows error + onFinish(null) (no hang)", async () => {
     const onFinish = vi.fn();
     const d = deps({ persist: vi.fn(async () => { throw new Error("disk full"); }) });
     const { stdin, lastFrame } = render(<Onboarding {...d} onFinish={onFinish} />);
     stdin.write(ENTER); await delay();                  // lang
     stdin.write(ENTER); await delay();                  // provider
-    stdin.write("sk-x"); await delay(); stdin.write(ENTER); await delay(60); // key 校验通过 → persist 抛错
+    stdin.write("sk-x"); await delay(); stdin.write(ENTER); await delay(200); // key 校验通过 → persist 抛错
+    await waitForCall(onFinish);
     expect(onFinish).toHaveBeenCalledWith(null);        // 不冻屏:干净退出
     expect(lastFrame()).toContain("disk full");         // 朱砂错误行可见
-  });
+  }, 30000);
   it("finishTrust rejecting (writeLang) → shows error + onFinish(null)", async () => {
     const onFinish = vi.fn();
     const d = deps({ writeLang: vi.fn(async () => { throw new Error("lang write failed"); }) });
     const { stdin, lastFrame } = render(<Onboarding {...d} onFinish={onFinish} />);
     stdin.write(ENTER); await delay();
     stdin.write(ENTER); await delay();
-    stdin.write("sk-x"); await delay(); stdin.write(ENTER); await delay(60);
-    stdin.write("y"); await delay(40);                   // 信任 → finishTrust → writeLang 抛错
+    stdin.write("sk-x"); await delay(); stdin.write(ENTER); await delay(200);
+    stdin.write("y"); await delay();                    // 信任 → finishTrust → writeLang 抛错
+    await waitForCall(onFinish);
     expect(onFinish).toHaveBeenCalledWith(null);
     expect(lastFrame()).toContain("lang write failed");
-  });
+  }, 30000);
   it("aborts (null) on empty key", async () => {
     const onFinish = vi.fn(); const d = deps();
     const { stdin } = render(<Onboarding {...d} onFinish={onFinish} />);
     stdin.write(ENTER); await delay(); stdin.write(ENTER); await delay(); // lang, provider
     stdin.write(ENTER); await delay();                  // 空 key → 放弃
+    await waitForCall(onFinish);
     expect(onFinish).toHaveBeenCalledWith(null);
-  });
+  }, 30000);
 });

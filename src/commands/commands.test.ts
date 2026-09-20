@@ -137,10 +137,17 @@ describe("dispatchCommand", () => {
     s.addUser("a");
     s.lastPromptTokens = 50000;
     s.lastSentLength = 10;
+    s.addUsage({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_cache_hit_tokens: 50 }, "deepseek-v4-pro");
     dispatchCommand("/clear", s);
     expect(s.messages).toHaveLength(1);
     expect(s.lastPromptTokens).toBeUndefined();
     expect(s.lastSentLength).toBe(0);
+    // usage 也应归零(Input/Output/Cache hit/Cost 都重置)
+    expect(s.usage.promptTokens).toBe(0);
+    expect(s.usage.completionTokens).toBe(0);
+    expect(s.usage.cacheHitTokens).toBe(0);
+    expect(s.cacheHitRatio()).toBe(0);
+    expect(s.costCNY()).toBe(0);
   });
 
   it("/exit signals exit", () => {
