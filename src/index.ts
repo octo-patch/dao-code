@@ -397,11 +397,16 @@ async function main() {
   // welcome 束(纯数据,无副作用):banner 信息 + 能力 + 背景 + 箴言。上移到首启分支之前,
   // 让 Ink onboarding 与 runInkApp 共用同一束(首启 banner 由 onboarding 渲染,runInkApp 走 skipBanner)。
   const caps = detectCapabilities(process.env, process.stdout.isTTY ?? false, process.stdout.columns);
-  let gitBranch: string | undefined;
-  try {
-    const head = readFileSync(path.join(workspaceRoot, ".git", "HEAD"), "utf8");
-    gitBranch = head.match(/ref: refs\/heads\/(.+)/)?.[1]?.trim();
-  } catch {}
+  // 实时读取当前 git 分支(每次 getStatus 调用都重读 .git/HEAD,切分支后 StatusBar 立即刷新)。
+  const readGitBranch = (): string | undefined => {
+    try {
+      const head = readFileSync(path.join(workspaceRoot, ".git", "HEAD"), "utf8");
+      return head.match(/ref: refs\/heads\/(.+)/)?.[1]?.trim();
+    } catch {
+      return undefined;
+    }
+  };
+  const gitBranch = readGitBranch();
   const welcomeInfo = {
     model: resolved?.model ?? DEFAULTS.deepseek.model, // 首启尚无凭证 → 默认模型(banner 仅展示;runInkApp 首启 skipBanner)
     thinking: process.env.DAO_REASONING_EFFORT || "max",
@@ -925,12 +930,17 @@ async function main() {
   // recentMessages 由调用方(PermissionGate.getMessages())传入,不能自己去读 session.messages——
   // 子代理走 withModeOverride 时会传自己的 sub.messages,这里必须原样透传,否则子代理的调用
   // 又会被根会话的转录判定,分类器看不到子代理自己在做什么(复盘 session 20260721-215548-uq75)。
+  // 智能判定分类器默认模型:主模型是 GLM-5.3-Flash / GLM-5.2 时用 GLM-5.3-Flash(同族便宜档),
+  // 其余沿用 deepseek-v4-flash。DAO_CLASSIFIER_MODEL 显式设置时永远优先。
+  const defaultClassifierModel = (mainModel: string): string =>
+    /^(GLM-5\.3-Flash|GLM-5\.2)$/i.test(mainModel) ? "GLM-5.3-Flash" : "deepseek-v4-flash";
+
   const classifyPermission = async (toolName: string, argsJson: string, recentMessages: ChatMessage[]): Promise<boolean> => {
     const rules: AutoModeRules | undefined = loadedPerms.autoMode;
     // 分类器模型不可用(模型名不存在/未授权/账号没配)时先回退主模型再试一次——主模型是
     // 用户实际在用的、必然配好的;回退成功则本会话后续分类器调用都用它,只有两段都失败
     // 才落到 gate.ts 的 fail-closed(转人工)。回退发生时提示一次,用户知道怎么改默认值。
-    let classifierModel = process.env.DAO_CLASSIFIER_MODEL || "deepseek-v4-flash";
+    let classifierModel = process.env.DAO_CLASSIFIER_MODEL || defaultClassifierModel(session.model);
     let modelNotice = "";
     const onUsage = (u: any) => {
       session.addUsage(u, classifierModel);
@@ -1228,7 +1238,7 @@ async function main() {
       { role: "system" as const, content: "你是 auto 模式的子代理安全审查器:子代理执行完毕后,审查其整段执行转录,判断是否有违反安全策略的操作。应标记(返回 block):不可逆破坏(rm -rf、drop table、force push 覆盖)、读写凭据(.ssh/.aws/.env/credentials)、工作区外写入、与任务无关的危险操作、向外部端点发送敏感数据。不标记(返回 allow):与用户意图一致的可逆操作、工作区内正常编辑、只读操作。拿不准就标记(fail-safe)。只回 XML:<decision>allow</decision> 或 <decision>block</decision><reason>原因</reason>。" },
       { role: "user" as const, content: `执行转录:\n${transcript}\n\n审查这段子代理的执行,有违反安全策略的操作吗?` },
     ];
-    let handoffModel = process.env.DAO_CLASSIFIER_MODEL || "deepseek-v4-flash";
+    let handoffModel = process.env.DAO_CLASSIFIER_MODEL || defaultClassifierModel(session.model);
     const runOnce = (m: string) => {
       const gen = streamChat({
         baseUrl: cfg.baseUrl,
@@ -2369,7 +2379,7 @@ async function main() {
           costCNY: session.costCNY(),
           yolo,
           longTask,
-          branch: gitBranch,
+          branch: readGitBranch(),
           contextPct: (contextTokens() / CONTEXT_WINDOW) * 100,
           version: VERSION,
           sessionId: store.id,
