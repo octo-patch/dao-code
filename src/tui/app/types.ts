@@ -38,7 +38,9 @@ export interface StatusInfo {
   yolo: boolean;
   longTask?: boolean; // 长任务自主模式(含原 Coordinator 阶段化编排)
   branch?: string;
-  contextPct: number; // 当前上下文占 1M 窗口的百分比
+  contextPct: number; // 当前上下文占窗口的百分比
+  contextWindow: number; // 上下文窗口大小(tok)
+  contextUsed: number; // 已用上下文(tok)
   version?: string; // dao-code 版本号(不带 v 前缀)
   sessionId?: string; // 当前会话 id(.dao/sessions/<id>),便于对照 /audit、session 日志排查
 }

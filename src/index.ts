@@ -930,10 +930,10 @@ async function main() {
   // recentMessages 由调用方(PermissionGate.getMessages())传入,不能自己去读 session.messages——
   // 子代理走 withModeOverride 时会传自己的 sub.messages,这里必须原样透传,否则子代理的调用
   // 又会被根会话的转录判定,分类器看不到子代理自己在做什么(复盘 session 20260721-215548-uq75)。
-  // 智能判定分类器默认模型:主模型是 GLM-5.3-Flash / GLM-5.2 时用 GLM-5.3-Flash(同族便宜档),
+  // 智能判定分类器默认模型:主模型是 GLM-5.3-Flash / GLM-5.2 时用同族自身(同族便宜档),
   // 其余沿用 deepseek-v4-flash。DAO_CLASSIFIER_MODEL 显式设置时永远优先。
   const defaultClassifierModel = (mainModel: string): string =>
-    /^(GLM-5\.3-Flash|GLM-5\.2)$/i.test(mainModel) ? "GLM-5.3-Flash" : "deepseek-v4-flash";
+    /^(GLM-5\.3-Flash|GLM-5\.2)$/i.test(mainModel) ? mainModel : "deepseek-v4-flash";
 
   const classifyPermission = async (toolName: string, argsJson: string, recentMessages: ChatMessage[]): Promise<boolean> => {
     const rules: AutoModeRules | undefined = loadedPerms.autoMode;
@@ -1354,8 +1354,10 @@ async function main() {
   const contextWindowManualOverride = Number.isFinite(Number(process.env.DAO_CONTEXT_WINDOW));
   let contextWindowManuallySet = contextWindowManualOverride;
   let CONTEXT_WINDOW = Number(process.env.DAO_CONTEXT_WINDOW) || contextWindowFor(cfg.model);
-  // Q1 当前上下文 token:优先用主模型上次真实 prompt_tokens(准,尤其中文),无则回退 chars/3 估算。
-  const contextTokens = () => session.lastPromptTokens ?? estimateTokens(session.messages);
+  // Q1 当前上下文 token:优先用主模型上次真实 prompt_tokens(准,尤其中文)。
+  // 无真实值时返回 0——启动与 /clear 后 StatusBar 应显示 0% 而非按系统提示估算的非零值
+  // (系统提示是常驻开销,不是"对话已用上下文";真实用量要到首次 API 调用后才有)。
+  const contextTokens = () => session.lastPromptTokens ?? 0;
   // P2-11 编辑后诊断命令(如 "tsc --noEmit"):设了才在写/改文件后跑、把报错回灌模型。
   // 显式 DAO_DIAGNOSTICS_CMD 优先;否则 DAO_DIAGNOSTICS=1 时按项目自动探测(tsc/eslint)。默认不跑。
   const DIAG_CMD = process.env.DAO_DIAGNOSTICS_CMD?.trim()
@@ -1882,7 +1884,7 @@ async function main() {
             const cacheRatio = u.promptTokens > 0 ? ((u.cacheHitTokens / u.promptTokens) * 100).toFixed(1) : "—";
             // 优化建议
             const suggestions: string[] = [];
-            if (toolTok > used * 0.15) suggestions.push(`工具定义占 ${Math.round(toolTok / used * 100)}%（/mcp off 关不用的 server 减少工具数）`);
+            if (used > 0 && toolTok > used * 0.15) suggestions.push(`工具定义占 ${Math.round(toolTok / used * 100)}%（/mcp off 关不用的 server 减少工具数）`);
             if (toolResultTok > histTok * 0.5) suggestions.push(`工具结果占对话 ${Math.round(toolResultTok / Math.max(1, histTok) * 100)}%（/compact 压缩历史）`);
             if (skillTok > 5000) suggestions.push(`技能描述占 ~${skillTok.toLocaleString()} tok（/skills off <名> 关不需要的）`);
             if (pct >= 85) suggestions.push("接近上限，下回合将自动压缩（也可 /compact 主动压缩）");
@@ -2385,6 +2387,8 @@ async function main() {
           longTask,
           branch: readGitBranch(),
           contextPct: (contextTokens() / CONTEXT_WINDOW) * 100,
+          contextWindow: CONTEXT_WINDOW,
+          contextUsed: contextTokens(),
           version: VERSION,
           sessionId: store.id,
         }),

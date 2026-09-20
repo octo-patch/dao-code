@@ -1749,7 +1749,7 @@ function StatusBar({
         {status.permMode === "auto" ? <Text color={c("jade")}>{t("ui.status.auto")}</Text> : ""}
         {bgShells && bgShells > 0 ? <Text color={c("gold")}>⎈ {bgShells} shell{bgShells > 1 ? "s" : ""} · </Text> : ""}
         {status.accountName ? <Text color={c("jade")}>{status.accountName}/</Text> : null}
-        {status.model} · {t("ui.status.input")} {fmt(status.promptTokens)} · {t("ui.status.output")} {fmt(status.completionTokens)} · {t("ui.status.cacheHit")} {pct}%{status.costCNY ? ` · ￥${status.costCNY.toFixed(status.costCNY < 1 ? 3 : 2)}` : ""} · {t("ui.status.context")} {status.contextPct < 1 ? "<1" : Math.round(status.contextPct)}%
+        {status.model} · {t("ui.status.input")} {fmt(status.promptTokens)} · {t("ui.status.output")} {fmt(status.completionTokens)} · {t("ui.status.cacheHit")} {pct}%{status.costCNY ? ` · ￥${status.costCNY.toFixed(status.costCNY < 1 ? 3 : 2)}` : ""} · {t("ui.status.context")} {fmt(status.contextUsed)}/{fmt(status.contextWindow)} ({status.contextPct < 1 && status.contextPct > 0 ? "<1" : Math.round(status.contextPct)}%)
         {status.branch ? ` · ⎇ ${status.branch}` : ""}
         {status.version ? ` · v${status.version}` : ""}
         {status.sessionId ? ` · ${status.sessionId}` : ""}

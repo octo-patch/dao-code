@@ -136,11 +136,17 @@ describe("contextWindowFor", () => {
   it("glm-5.2 返回 200K", () => {
     expect(contextWindowFor("glm-5.2")).toBe(200_000);
   });
+  it("GLM-5.3-Flash 返回 200K(大小写不敏感)", () => {
+    expect(contextWindowFor("GLM-5.3-Flash")).toBe(200_000);
+    expect(contextWindowFor("glm-5.3-flash")).toBe(200_000);
+  });
+  it("glm-5.3(非 Flash)仍返回 1M", () => {
+    expect(contextWindowFor("glm-5.3")).toBe(1_000_000);
+  });
   it("其他模型默认 1M", () => {
     expect(contextWindowFor("deepseek-v4-pro")).toBe(1_000_000);
     expect(contextWindowFor("deepseek-v4-flash")).toBe(1_000_000);
     expect(contextWindowFor("glm-5.1")).toBe(1_000_000);
-    expect(contextWindowFor("glm-5.3")).toBe(1_000_000);
     expect(contextWindowFor("kimi-k2.6")).toBe(1_000_000);
     expect(contextWindowFor("unknown-model")).toBe(1_000_000);
   });

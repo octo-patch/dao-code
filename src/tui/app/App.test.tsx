@@ -26,7 +26,7 @@ function makeDeps(over: Partial<AppDeps> = {}): AppDeps {
     runCommand: (line) =>
       line.startsWith("/help") ? { handled: true, output: "命令:/help /exit" } : { handled: true, output: "未知" },
     compact: async () => ({ before: 12000, after: 3000 }),
-    getStatus: () => ({ model: "deepseek-v4-pro", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3 }),
+    getStatus: () => ({ model: "deepseek-v4-pro", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3, contextWindow: 1_000_000, contextUsed: 3000 }),
     register: () => {},
     ...over,
   };
@@ -52,7 +52,7 @@ describe("App", () => {
         {...makeDeps({
           getStatus: () => ({
             model: "deepseek-v4-pro", mode: "normal", promptTokens: 12, completionTokens: 3,
-            cacheHitRatio: 0.5, yolo: false, contextPct: 0.3, version: "0.4.10", sessionId: "20260719-200800-h2w9",
+            cacheHitRatio: 0.5, yolo: false, contextPct: 0.3, contextWindow: 1_000_000, contextUsed: 3000, version: "0.4.10", sessionId: "20260719-200800-h2w9",
           }),
         })}
       />,
@@ -1083,7 +1083,7 @@ describe("App", () => {
     const { lastFrame } = render(
       <App
         {...makeDeps({
-          getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: true, longTask: true, contextPct: 0 }),
+          getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: true, longTask: true, contextPct: 0, contextWindow: 1_000_000, contextUsed: 0 }),
         })}
       />,
     );
@@ -1153,7 +1153,7 @@ describe("App", () => {
     setLang("en");
     const f = render(
       <App {...makeDeps({
-        getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: false, longTask: true, contextPct: 0 }),
+        getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: false, longTask: true, contextPct: 0, contextWindow: 1_000_000, contextUsed: 0 }),
       })} />,
     ).lastFrame()!;
     expect(f).toContain("Long task");
@@ -1248,7 +1248,7 @@ describe("App", () => {
     const { lastFrame, stdin } = render(
       <App {...makeDeps({
         submit: async (t, { events }) => { submitted = t; events.assistantDone({ role: "assistant", content: "ok" }); },
-        getStatus: () => ({ model: "kimi-k2.6", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3 }), // 支持图片输入的模型
+        getStatus: () => ({ model: "kimi-k2.6", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3, contextWindow: 1_000_000, contextUsed: 3000 }), // 支持图片输入的模型
       })} />,
     );
     stdin.write(`\x1b[200~${imgPath}\x1b[201~`);

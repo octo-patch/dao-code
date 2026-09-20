@@ -72,9 +72,11 @@ export function supportsVision(model: string): boolean {
 
 // 各模型默认上下文窗口(tok)。未列出的模型按 DEFAULT_CONTEXT_WINDOW(1M)处理。
 // 据各厂商官方文档(2026-09 核实);与真实窗口不符会导致压缩永不触发或过早触发。
-// glm-5.2:智谱官方文档标注 200K;deepseek-v4/kimi/glm-5.1/glm-5.3 等仍按 1M。
+// glm-5.2 / GLM-5.3-Flash:智谱官方文档标注 200K;deepseek-v4/kimi/glm-5.1/glm-5.3 等仍按 1M。
+// key 统一小写,contextWindowFor 按小写匹配——模型名大小写因 provider/用户配置而异。
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   "glm-5.2": 200_000,
+  "glm-5.3-flash": 200_000,
 };
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 
@@ -82,9 +84,10 @@ const DEFAULT_CONTEXT_WINDOW = 1_000_000;
  * 模型默认上下文窗口(tok)。未显式列出的模型返回 1M。
  * 用于初始化 CONTEXT_WINDOW 和 /model 切换时联动(用户手动 /context-window 或
  * DAO_CONTEXT_WINDOW 覆盖时,手动值优先,不随模型切换改变)。
+ * 按模型名小写匹配,兼容 GLM-5.3-Flash / glm-5.2 等不同大小写写法。
  */
 export function contextWindowFor(model: string): number {
-  return MODEL_CONTEXT_WINDOWS[model] ?? DEFAULT_CONTEXT_WINDOW;
+  return MODEL_CONTEXT_WINDOWS[model.toLowerCase()] ?? DEFAULT_CONTEXT_WINDOW;
 }
 
 function isV2(raw: unknown): raw is ProfilesConfig {
