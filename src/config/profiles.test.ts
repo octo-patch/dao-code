@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { migrateConfig, resolveActive, DEFAULTS, MODELS_BY_PROVIDER, supportsVision } from "./profiles.js";
+import { migrateConfig, resolveActive, DEFAULTS, MODELS_BY_PROVIDER, supportsVision, contextWindowFor } from "./profiles.js";
 
 describe("migrateConfig", () => {
   it("wraps a legacy { apiKey } config into a default deepseek profile", () => {
@@ -129,5 +129,19 @@ describe("supportsVision", () => {
     expect(supportsVision("deepseek-v4-pro")).toBe(false);
     expect(supportsVision("glm-5.2")).toBe(false);
     expect(supportsVision("unknown-model")).toBe(false);
+  });
+});
+
+describe("contextWindowFor", () => {
+  it("glm-5.2 返回 200K", () => {
+    expect(contextWindowFor("glm-5.2")).toBe(200_000);
+  });
+  it("其他模型默认 1M", () => {
+    expect(contextWindowFor("deepseek-v4-pro")).toBe(1_000_000);
+    expect(contextWindowFor("deepseek-v4-flash")).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.1")).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.3")).toBe(1_000_000);
+    expect(contextWindowFor("kimi-k2.6")).toBe(1_000_000);
+    expect(contextWindowFor("unknown-model")).toBe(1_000_000);
   });
 });

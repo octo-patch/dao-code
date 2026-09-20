@@ -6,13 +6,13 @@ import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
 import { loadProfiles, saveProfiles, setActive, removeProfile } from "./config/profiles_store.js";
-import { DEFAULTS, MODELS_BY_PROVIDER, type Provider, type ResolvedCredential } from "./config/profiles.js";
+import { DEFAULTS, MODELS_BY_PROVIDER, contextWindowFor, type Provider, type ResolvedCredential } from "./config/profiles.js";
 import { resolveExtractModel } from "./tools/fetch_extract.js";
 import { resolveCredential, persistKey } from "./config/credential.js";
 import { validateCredential, fetchModels } from "./config/validate_key.js";
 import { runtimeKeychain, noopKeychain, keychainAvailable, keychainDelete } from "./config/keychain.js";
 import { migrateLegacyDir } from "./config/migrate_dirs.js";
-import { streamChat as streamChatRaw } from "./client/client.js";
+import { streamChat as streamChatRaw, isContextLengthError, isRateLimitError } from "./client/client.js";
 import { runTurn as runTurnRaw, sanitizeHistoryForResume } from "./agent/loop.js";
 import { executeToolCalls as executeToolCallsRaw } from "./tools/execute.js";
 import { initObs, wrapStreamChat, wrapRunTurn, wrapToolExec, flushObs, setObsSession, setObsMeta, obsStatus } from "./obs/index.js";
@@ -941,11 +941,12 @@ async function main() {
     } catch (e) {
       const status = (e as { status?: number }).status;
       const msg = e instanceof Error ? e.message : String(e);
-      // 模型不存在/未授权类:404(京东网关)、400 带 Model 不存在(千帆 4010/DeepSeek)、
-      // 4012 未授权(京东)。其它错误(网络/限流/上下文)不回退——那类错换模型也没用,
-      // 直接走 fail-closed 与既有语义一致。
-      const modelUnavailable = status === 404 || (status === 400 && /model|模型/i.test(msg)) || /Model Not Exist|does not exist|Unknown model|UnsupportedModel|模型不存在|未授权该模型|4010|4012/i.test(msg);
-      if (!modelUnavailable) throw e;
+      // 分类器模型不可用时回退主模型再试一次。判据放宽:除"换模型也没用"的两类
+      // (上下文超限——需上层压缩;限流/配额——需换账号或等待)外,任何失败都回退——
+      // 包括模型不存在/未授权(404、400 带 model、4010/4012)、网络/超时/5xx/空响应
+      // (streamChat 流式重试+非流式兜底耗尽后抛"连接…失败")。flash 模型不稳定时
+      // 不应让用户被打扰,回退到主模型(必然配好)继续判定。
+      if (isContextLengthError(e) || isRateLimitError(e)) throw e;
       const fallback = session.model;
       if (fallback === classifierModel) throw e;
       modelNotice = `\n[智能判定] 分类器模型 ${classifierModel} 不可用(${msg.slice(0, 120)}),已回退用主模型 ${fallback} 判定;想固定指定请设 DAO_CLASSIFIER_MODEL\n`;
@@ -1250,10 +1251,10 @@ async function main() {
     try {
       return await runOnce(handoffModel);
     } catch (e) {
-      const status = (e as { status?: number }).status;
       const msg = e instanceof Error ? e.message : String(e);
-      const modelUnavailable = status === 404 || (status === 400 && /model|模型/i.test(msg)) || /Model Not Exist|does not exist|Unknown model|UnsupportedModel|模型不存在|未授权该模型|4010|4012/i.test(msg);
-      if (!modelUnavailable || session.model === handoffModel) throw e;
+      // 同 classifyPermission:除上下文超限/限流外,任何失败都回退主模型。
+      if (isContextLengthError(e) || isRateLimitError(e)) throw e;
+      if (session.model === handoffModel) throw e;
       process.stdout.write(`\n[智能判定] 安全审查模型 ${handoffModel} 不可用(${msg.slice(0, 120)}),已回退用主模型 ${session.model};想固定指定请设 DAO_CLASSIFIER_MODEL\n`);
       handoffModel = session.model;
       return await runOnce(handoffModel);
@@ -1336,10 +1337,13 @@ async function main() {
     return true;
   };
 
-  // L2.1:上下文窗口可被 env 覆盖(目标模型真实窗口若 <1M 必须设对,否则压缩永不触发→真实上限处崩)。
+  // L2.1:上下文窗口按模型默认值初始化(glm-5.2=200K,其他=1M),可被 env 覆盖。
   // 真正的安全网是反应式压缩(见 loop.ts compact 钩子):即便此值偏大,撞上下文超限也会自动压缩重试。
   // /context-window 命令运行时修改此值(200K/1M 两档或自定义 K),同步写 env 供子进程继承。
-  let CONTEXT_WINDOW = Number(process.env.DAO_CONTEXT_WINDOW) || 1_000_000;
+  // /model 切换时:若用户未手动覆盖(env 未设),自动联动到新模型的默认值;手动覆盖后锁死,不随切换改变。
+  const contextWindowManualOverride = Number.isFinite(Number(process.env.DAO_CONTEXT_WINDOW));
+  let contextWindowManuallySet = contextWindowManualOverride;
+  let CONTEXT_WINDOW = Number(process.env.DAO_CONTEXT_WINDOW) || contextWindowFor(cfg.model);
   // Q1 当前上下文 token:优先用主模型上次真实 prompt_tokens(准,尤其中文),无则回退 chars/3 估算。
   const contextTokens = () => session.lastPromptTokens ?? estimateTokens(session.messages);
   // P2-11 编辑后诊断命令(如 "tsc --noEmit"):设了才在写/改文件后跑、把报错回灌模型。
@@ -2116,6 +2120,7 @@ async function main() {
             if (tok < 1000) return { handled: true, output: `上下文窗口过小(${tok} tok),最小 1K。` };
             CONTEXT_WINDOW = tok;
             process.env.DAO_CONTEXT_WINDOW = String(tok);
+            contextWindowManuallySet = true; // 手动设过后锁死,后续切模型不再自动联动
             return { handled: true, output: `上下文窗口已设为 ${fmtTok(tok)} tok(${(tok / 1000).toFixed(0)}K),自动压缩阈值 ${fmtTok(Math.round(tok * 0.85))} tok(85%)。立即生效。` };
           }
           if (name === "status") {
@@ -2331,12 +2336,22 @@ async function main() {
             if (isCustomGw && modelArg) {
               session.setModel(modelArg);
               if (activeProf) { activeProf.model = modelArg; saveProfiles(keyFile, profilesCfg).catch(() => {}); }
+              // 未手动覆盖时,切模型联动上下文窗口到新模型默认值
+              if (!contextWindowManuallySet) {
+                CONTEXT_WINDOW = contextWindowFor(session.model);
+                process.env.DAO_CONTEXT_WINDOW = String(CONTEXT_WINDOW);
+              }
               return { handled: true, output: `已切换模型:${modelArg}` };
             }
             const result = dispatchCommand(line, session, cfg.provider);
             if (activeProf) {
               activeProf.model = session.model;
               saveProfiles(keyFile, profilesCfg).catch(() => {});
+            }
+            // 未手动覆盖时,切模型联动上下文窗口到新模型默认值
+            if (!contextWindowManuallySet) {
+              CONTEXT_WINDOW = contextWindowFor(session.model);
+              process.env.DAO_CONTEXT_WINDOW = String(CONTEXT_WINDOW);
             }
             return result;
           }

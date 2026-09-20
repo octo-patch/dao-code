@@ -70,6 +70,23 @@ export function supportsVision(model: string): boolean {
   return VISION_MODELS.has(model);
 }
 
+// 各模型默认上下文窗口(tok)。未列出的模型按 DEFAULT_CONTEXT_WINDOW(1M)处理。
+// 据各厂商官方文档(2026-09 核实);与真实窗口不符会导致压缩永不触发或过早触发。
+// glm-5.2:智谱官方文档标注 200K;deepseek-v4/kimi/glm-5.1/glm-5.3 等仍按 1M。
+const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  "glm-5.2": 200_000,
+};
+const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+
+/**
+ * 模型默认上下文窗口(tok)。未显式列出的模型返回 1M。
+ * 用于初始化 CONTEXT_WINDOW 和 /model 切换时联动(用户手动 /context-window 或
+ * DAO_CONTEXT_WINDOW 覆盖时,手动值优先,不随模型切换改变)。
+ */
+export function contextWindowFor(model: string): number {
+  return MODEL_CONTEXT_WINDOWS[model] ?? DEFAULT_CONTEXT_WINDOW;
+}
+
 function isV2(raw: unknown): raw is ProfilesConfig {
   return !!raw && typeof raw === "object" && (raw as { version?: unknown }).version === 2;
 }
