@@ -1224,10 +1224,10 @@ export function App(deps: AppDeps) {
   const liveCols = process.stdout.columns ?? 80;
 
   // 调试日志:DAO_DEBUG_TUI=1 时记录 <Static> 渲染入参,便于排查"首次输入不反显"等渲染竞态。
+  const debugItemsRef = useRef<number>(-1);
   if (process.env.DAO_DEBUG_TUI) {
-    const prevItemsRef = useRef<number>(-1);
-    if (prevItemsRef.current !== items.length) {
-      prevItemsRef.current = items.length;
+    if (debugItemsRef.current !== items.length) {
+      debugItemsRef.current = items.length;
       const kinds = items.map((it) => it.kind).join(",");
       process.stderr.write(`[tui] Static render: items.length=${items.length} kinds=[${kinds}] busy=${busy} live=${!!live}\n`);
     }
