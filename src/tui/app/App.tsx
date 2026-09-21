@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Box, Text, Static, useApp, useInput, usePaste } from "ink";
+import { Box, Text, Static, useApp, useInput, usePaste, useStdout } from "ink";
 import { highlight } from "cli-highlight";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -165,8 +165,16 @@ function resultDetail(name: string, ok: boolean, content: string): string {
 
 export function App(deps: AppDeps) {
   const { exit } = useApp();
+  const { stdout } = useStdout();
   const [bg, setBg] = useState(deps.welcome.bg); // /theme 运行时可切浅/深
   const c = (sem: Parameters<typeof semHex>[0]) => semHex(sem, bg);
+  // /clear /rewind /resume 重置 transcript 时递增,强制 <Static> 重挂载:
+  // Ink 的 <Static> 内部维护 index(只渲染 items.slice(index)),重置 items 为短数组后
+  // index 仍指向旧位置 → 新 welcome 不渲染;且 fullStaticOutput(已写入终端的累积
+  // static 文本)不会被清,每帧仍把旧内容写到屏幕。换 key 触发 unmount→remount,
+  // Ink 的 handleStaticChange 会清空 fullStaticOutput,新 <Static> 的 index 从 0
+  // 开始能正常渲染 welcome。配合写清屏转义序列擦掉终端上已输出的物理字符。
+  const [staticKey, setStaticKey] = useState(0);
 
   const initial = deps.initialItems ?? [];
   const idRef = useRef(initial.reduce((m, it) => Math.max(m, it.id), 0) + 1);
@@ -540,7 +548,14 @@ export function App(deps: AppDeps) {
         setStatus(deps.getStatus());
         return;
       }
-      if (name === "clear" || res.clearTranscript) setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []); // /clear /rewind /resume:重置可视 transcript
+      if (name === "clear" || res.clearTranscript) {
+        // /clear /rewind /resume:重置可视 transcript。
+        // 递增 staticKey 强制 <Static> 重挂载(清 fullStaticOutput + 重置内部 index),
+        // 并写清屏转义序列擦掉终端上已输出的物理字符,否则旧内容残留在屏幕上。
+        setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []);
+        setStaticKey((k) => k + 1);
+        stdout?.write("\x1b[2J\x1b[3J\x1b[H");
+      }
       if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
       // 自定义命令:展开成 prompt → 当作一个回合跑。
       if (res.prompt) {
@@ -671,7 +686,11 @@ export function App(deps: AppDeps) {
   // 选中会话 → 委派 /resume <id>(载入逻辑在 index),并应用其结果(重置 transcript + 提示)。
   const loadResume = (id: string) => {
     const res = deps.runCommand("/resume " + id);
-    if (res.clearTranscript) setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []);
+    if (res.clearTranscript) {
+      setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []);
+      setStaticKey((k) => k + 1);
+      stdout?.write("\x1b[2J\x1b[3J\x1b[H");
+    }
     if (res.resumeItems?.length) for (const it of res.resumeItems) pushItem({ ...it, id: nextId() }); // 重放末段对话
     if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
     setStatus(deps.getStatus());
@@ -1251,7 +1270,7 @@ export function App(deps: AppDeps) {
       {items.length === 0 && !deps.skipBanner ? (
         <Welcome info={deps.welcome.info} caps={deps.welcome.caps} bg={bg} maxim={deps.welcome.maxim} />
       ) : null}
-      <Static items={items}>
+      <Static key={staticKey} items={items}>
         {(item, index) =>
           item.kind === "welcome" ? (
             deps.skipBanner ? null : <Welcome key={item.id} info={deps.welcome.info} caps={deps.welcome.caps} bg={bg} maxim={deps.welcome.maxim} />

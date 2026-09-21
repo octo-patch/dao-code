@@ -1335,6 +1335,33 @@ describe("App", () => {
     expect(lastFrame()!).not.toContain("对话导航");
   });
 
+  it("/clear 清屏:旧 transcript 内容不残留,只剩 /clear 回显", async () => {
+    // Ink <Static> 内部维护 index(只渲染 items.slice(index)),重置 items 为短数组后
+    // index 仍指向旧位置 → 新 welcome 不渲染;且 fullStaticOutput(已写入终端的
+    // 累积 static 文本)不会被清,每帧仍把旧内容写到屏幕。修复:换 key 强制
+    // <Static> 重挂载 + 写清屏转义序列。
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        runCommand: (l) => l.startsWith("/clear") ? { handled: true, output: "已清空对话(保留系统设定)" } : { handled: true, output: "?" },
+      })} />,
+    );
+    // 先产生一轮对话,让 transcript 里有内容
+    for (const ch of "hello") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    expect(lastFrame()!).toContain("echo: hello");
+    // 执行 /clear
+    for (const ch of "/clear") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    // /clear 后:旧对话内容应消失
+    const after = lastFrame()!;
+    expect(after).toContain("已清空对话");
+    expect(after).not.toContain("echo: hello");
+  });
+
   it("/compact 成功 → 显示\"已压缩对话\" notice", async () => {
     const { lastFrame, stdin } = render(
       <App {...makeDeps({
