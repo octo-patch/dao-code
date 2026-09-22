@@ -784,6 +784,14 @@ async function main() {
     })),
     ...diskSkills.map((s) => ({ name: s.name, on: !disabledSet.has(s.name), source: skillSource(s) + invMark(s), detail: s.description })),
   ];
+  // 斜杠命令面板用:列出可 /调用的 skill(slug + 简述),与 findUserInvocableSkill 同一数据源(skills)。
+  const listInvocableSkills = () =>
+    skills
+      .filter((s) => s.userInvocable !== false)
+      .map((s) => ({
+        slug: `${s.namespace ? s.namespace + ":" : ""}${s.slug ?? s.name}`,
+        description: s.description,
+      }));
   const setSkillEnabled = (name: string, on: boolean) => { if (on) disabledSet.delete(name); else disabledSet.add(name); persistDisabled(); };
   const batchSkills = (scope: "bundled" | "installed" | "all", on: boolean) => {
     const names = scope === "bundled" ? allBundledNames : scope === "installed" ? diskSkills.map((s) => s.name) : [...allBundledNames, ...diskSkills.map((s) => s.name)];
@@ -2460,6 +2468,7 @@ async function main() {
         listSkills,
         setSkillEnabled,
         batchSkills,
+        listInvocableSkills,
         listModels,
       });
       taskManager.cancelAll(); // 退出时中止所有后台任务

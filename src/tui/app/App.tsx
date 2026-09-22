@@ -1155,8 +1155,13 @@ export function App(deps: AppDeps) {
     if (key.delete) { setField((f) => ({ ...f, text: f.text.slice(0, f.cursor) + f.text.slice(f.cursor + 1) })); return; } // 删光标处
     if (key.tab) {
       // 斜杠命令补全:输入以 / 开头且尚无空格时,Tab 补到唯一匹配(+空格)或公共前缀。
+      // 候选 = 内置命令 + 可 /调用的 skill slug。
       if (field.text.startsWith("/") && !field.text.includes(" ")) {
-        const matches = SLASH_COMMANDS.filter((cmd) => ("/" + cmd).startsWith(field.text)).map((cmd) => "/" + cmd);
+        const cmdMatches = SLASH_COMMANDS.filter((cmd) => ("/" + cmd).startsWith(field.text)).map((cmd) => "/" + cmd);
+        const skillMatches = (deps.listInvocableSkills?.() ?? [])
+          .filter((s) => ("/" + s.slug).startsWith(field.text))
+          .map((s) => "/" + s.slug);
+        const matches = [...cmdMatches, ...skillMatches];
         if (matches.length === 1) {
           const done = matches[0]! + " ";
           setField({ text: done, cursor: done.length });
@@ -1552,21 +1557,28 @@ export function App(deps: AppDeps) {
           </Box>
           {input.startsWith("/") && !input.includes(" ") ? (() => {
             // 命令面板(参考):竖排,左命令右简介,列对齐;过多则截断并提示继续输入筛选。
-            const matched = COMMAND_META.filter((name) => ("/" + name).startsWith(input));
-            if (matched.length === 0) return <Text color={c("dim")}>{t("ui.cmd.noMatch")}</Text>;
-            const shown = matched.slice(0, MAX_SLASH_MENU);
-            const w = Math.max(...shown.map((name) => name.length)) + 3; // "/name" 列宽(含 / 与右侧间距)
+            // 候选 = 内置命令 + 可 /调用的 skill(内置命令在前,skill 在后)。
+            const cmdMatched = COMMAND_META.filter((name) => ("/" + name).startsWith(input));
+            const skillMatched = (deps.listInvocableSkills?.() ?? [])
+              .filter((s) => ("/" + s.slug).startsWith(input))
+              .map((s) => ({ name: s.slug, desc: s.description }));
+            const matched = cmdMatched.length + skillMatched.length;
+            if (matched === 0) return <Text color={c("dim")}>{t("ui.cmd.noMatch")}</Text>;
+            const cmdShown = cmdMatched.slice(0, MAX_SLASH_MENU);
+            const skillShown = skillMatched.slice(0, Math.max(0, MAX_SLASH_MENU - cmdShown.length));
+            const allShown = [...cmdShown.map((n) => ({ name: n, desc: t("cmd." + n) })), ...skillShown];
+            const w = Math.max(...allShown.map((x) => x.name.length)) + 3; // "/name" 列宽(含 / 与右侧间距)
             return (
               <Box flexDirection="column">
-                {shown.map((name) => (
-                  <Text key={name}>
+                {allShown.map((x) => (
+                  <Text key={x.name}>
                     {"  "}
-                    <Text color={c("jade")}>{("/" + name).padEnd(w)}</Text>
-                    <Text color={c("dim")}>{t("cmd." + name)}</Text>
+                    <Text color={c("jade")}>{("/" + x.name).padEnd(w)}</Text>
+                    <Text color={c("dim")}>{x.desc}</Text>
                   </Text>
                 ))}
-                {matched.length > shown.length ? (
-                  <Text color={c("dim")}>{t("ui.cmd.more", matched.length - shown.length)}</Text>
+                {matched > allShown.length ? (
+                  <Text color={c("dim")}>{t("ui.cmd.more", matched - allShown.length)}</Text>
                 ) : null}
               </Box>
             );
