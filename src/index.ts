@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createInterface, type Interface } from "node:readline/promises";
 import { readFileSync, mkdirSync, writeFileSync, readdirSync, rmSync } from "node:fs";
+import { promises as fs } from "node:fs";
 import { execSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
@@ -143,6 +144,20 @@ function transcriptFromMessages(messages: ChatMessage[]): TranscriptItem[] {
       out.push({ id: id++, kind: "assistant", text: m.content });
   }
   return out;
+}
+
+// 读 settings.json 的 checkpoint.enabled:项目级 > 用户级;缺失/损坏 → false(默认关闭)。
+async function readCheckpointEnabled(userFile: string, projectFile: string | null): Promise<boolean> {
+  const readVal = async (file: string): Promise<boolean | undefined> => {
+    try {
+      const raw = await fs.readFile(file, "utf8");
+      const v = (JSON.parse(raw) as { checkpoint?: { enabled?: unknown } }).checkpoint?.enabled;
+      return typeof v === "boolean" ? v : undefined;
+    } catch { return undefined; }
+  };
+  const projectVal = projectFile ? await readVal(projectFile) : undefined;
+  const userVal = await readVal(userFile);
+  return projectVal ?? userVal ?? false;
 }
 
 async function main() {
@@ -1730,7 +1745,13 @@ async function main() {
         }
       } catch { /* 快照失败不影响 */ }
       skillSink = createSkillAuditSink(store.dir);
-      const ckpt = createCheckpointer(workspaceRoot);
+      // 影子 git 默认关闭;读 settings.json 的 checkpoint.enabled(项目级 > 用户级)决定是否开启。
+      // DAO_NO_CHECKPOINT / DAO_CHECKPOINT 环境变量在 createCheckpointer 内部处理,优先级更高。
+      const checkpointEnabled = await readCheckpointEnabled(
+        path.join(os.homedir(), ".dao", "settings.json"),
+        trustProject ? path.join(workspaceRoot, ".dao", "settings.json") : null,
+      );
+      const ckpt = createCheckpointer(workspaceRoot, { enabled: checkpointEnabled });
       const turnCheckpoints: (string | null)[] = []; // 第 k 项 = 第 k 条用户消息【之前】的影子 git 快照 sha,供 /rewind 联动回滚文件
       let sessionTitle: string | undefined; // /rename 设置
       if (longTask && !continueFlag) session.messages.push({ role: "system", content: lang === "en" ? LONG_TASK_DIRECTIVE_EN : LONG_TASK_DIRECTIVE });
@@ -2089,7 +2110,7 @@ async function main() {
             let codeMsg = "";
             if (withCode) {
               const sha = turnCheckpoints[n - 1];
-              if (!ckpt.enabled) codeMsg = " 文件未回滚(无影子 git)。";
+              if (!ckpt.enabled) codeMsg = " 文件未回滚(影子 git 未开启,可在 settings.json 设 checkpoint.enabled = true)。";
               else if (!sha) codeMsg = " 文件未回滚(该节点无快照)。";
               else {
                 ckpt.snapshot("回退前自动快照"); // 先存当前状态,回退可逆
@@ -2329,7 +2350,7 @@ async function main() {
             return { handled: true, prompt: expandCommand(customCommands.get(name)!.body, args) };
           }
           if (name === "restore") {
-            if (!ckpt.enabled) return { handled: true, output: "检查点不可用(无 git)" };
+            if (!ckpt.enabled) return { handled: true, output: "检查点不可用(影子 git 未开启)。可在 settings.json 设置 checkpoint.enabled = true 开启。" };
             const snaps = ckpt.list();
             const target = snaps[1] ?? snaps[0]; // 回退到上一个回合前的快照
             if (!target) return { handled: true, output: "暂无可回退的检查点" };

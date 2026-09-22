@@ -11,10 +11,17 @@ beforeEach(() => {
 });
 
 describe("createCheckpointer(影子 git)", () => {
-  it("快照→改动→新快照→restore 回退(文件还原 + 新增文件移除)", () => {
+  it("默认关闭:不传 enabled 返回 noop,不创建 shadow.git", () => {
+    const cp = createCheckpointer(root);
+    expect(cp.enabled).toBe(false);
+    expect(cp.snapshot("x")).toBeNull();
+    expect(existsSync(path.join(root, ".dao", "shadow.git"))).toBe(false);
+  });
+
+  it("enabled: true 开启快照→改动→新快照→restore 回退(文件还原 + 新增文件移除)", () => {
     const a = path.join(root, "a.txt");
     writeFileSync(a, "v1");
-    const cp = createCheckpointer(root);
+    const cp = createCheckpointer(root, { enabled: true });
     expect(cp.enabled).toBe(true);
 
     const ref1 = cp.snapshot("turn1");
@@ -31,10 +38,34 @@ describe("createCheckpointer(影子 git)", () => {
   });
 
   it("不污染用户 .git(只用 .dao/shadow.git)", () => {
-    const cp = createCheckpointer(root);
+    const cp = createCheckpointer(root, { enabled: true });
     cp.snapshot("x");
     expect(existsSync(path.join(root, ".git"))).toBe(false);
     expect(existsSync(path.join(root, ".dao", "shadow.git"))).toBe(true);
+  });
+
+  it("DAO_NO_CHECKPOINT 强制关闭,即使 enabled: true", () => {
+    const prev = process.env.DAO_NO_CHECKPOINT;
+    process.env.DAO_NO_CHECKPOINT = "1";
+    try {
+      const cp = createCheckpointer(root, { enabled: true });
+      expect(cp.enabled).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.DAO_NO_CHECKPOINT;
+      else process.env.DAO_NO_CHECKPOINT = prev;
+    }
+  });
+
+  it("DAO_CHECKPOINT=1 环境变量可开启(无需传 enabled)", () => {
+    const prev = process.env.DAO_CHECKPOINT;
+    process.env.DAO_CHECKPOINT = "1";
+    try {
+      const cp = createCheckpointer(root);
+      expect(cp.enabled).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.DAO_CHECKPOINT;
+      else process.env.DAO_CHECKPOINT = prev;
+    }
   });
 });
 
@@ -70,7 +101,7 @@ describe("createCheckpointer 硬超时(git add 卡死场景不无限阻塞)", ()
 
   it("git add -A 卡住时 snapshot 在硬超时内返回 null,不会傻等子进程跑完", () => {
     writeFileSync(path.join(root, "a.txt"), "v1");
-    const cp = createCheckpointer(root);
+    const cp = createCheckpointer(root, { enabled: true });
     const t0 = Date.now();
     const ref = cp.snapshot("turn1");
     const elapsed = Date.now() - t0;
