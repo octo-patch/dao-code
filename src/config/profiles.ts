@@ -2,7 +2,7 @@
 // 多 key 切换 = 切 profile;多 provider = profile 带不同 provider;未来订阅 = 另一种凭证类型。
 // 不引入"用户(user)"概念——DAO 是本地 CLI,DeepSeek 无账号体系,user 等于给不存在的登录服务器建模。
 
-export type Provider = "deepseek" | "anthropic" | "openai" | "volcengine" | "qianfan";
+export type Provider = "deepseek" | "anthropic" | "openai" | "volcengine" | "qianfan" | "zhipu";
 
 export interface Profile {
   provider: Provider;
@@ -23,6 +23,9 @@ export const DEFAULTS: Record<Provider, { baseUrl: string; model: string }> = {
   deepseek: { baseUrl: "https://api.deepseek.com", model: "deepseek-v4-pro" },
   volcengine: { baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3", model: "deepseek-v4-pro" },
   qianfan: { baseUrl: "https://qianfan.baidubce.com/v2/tokenplan/personal", model: "deepseek-v4-pro" },
+  // 智谱 GLM 编码套餐(Coding Plan):套餐 key 须打专属 Coding 端点(OpenAI Chat Completion 协议),
+  // 与平台通用端点 open.bigmodel.cn/api/paas/v4 的 key 不通用(官方文档 coding-plan/quick-start)。
+  zhipu: { baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4", model: "glm-5.3" },
   anthropic: { baseUrl: "https://api.anthropic.com", model: "claude-opus-4-8" },
   openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-5" },
 };
@@ -49,6 +52,8 @@ export const MODELS_BY_PROVIDER: Record<Provider, string[]> = {
     "ark-code-latest",
   ],
   qianfan: ["deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2", "glm-5.1", "kimi-k2.6", "ernie-5.1"],
+  // zhipu coding plan 当前两档:glm-5.3(旗舰,纯文本)+ glm-5.3-flash(多模态,支持图片输入)。
+  zhipu: ["glm-5.3", "glm-5.3-flash"],
   anthropic: [DEFAULTS.anthropic.model],
   openai: [DEFAULTS.openai.model],
 };
@@ -57,12 +62,15 @@ export const MODELS_BY_PROVIDER: Record<Provider, string[]> = {
 // 维护依据(2026-07-17 核实官方文档,2026-07-26 补充 kimi-k2.7-code 用户确认):
 // - kimi-k2.6: Kimi 官方文档明确"支持图片和视频输入"
 // - kimi-k2.7-code: 用户确认同样支持图片输入
+// - glm-5.3-flash: 智谱官方文档标注"原生多模态模型,能够原生理解图片视频"(coding-plan/latest-model)
 // - glm-5.2/glm-5.1: 智谱文档标注"输入模态:文本",不支持
+// - glm-5.3: 智谱文档标注纯文本模型,不支持
 // - ernie-5.1: 千帆模型列表只在"文本生成"分类,不支持
 // - deepseek-v4-pro/flash: 千帆模型列表只在"文本生成"分类,不支持
 export const VISION_MODELS = new Set<string>([
   "kimi-k2.6",
   "kimi-k2.7-code",
+  "glm-5.3-flash",
 ]);
 
 /** 当前 model 是否支持图片输入。不在 VISION_MODELS 中的模型一律视为不支持。 */
@@ -70,14 +78,10 @@ export function supportsVision(model: string): boolean {
   return VISION_MODELS.has(model);
 }
 
-// 各模型默认上下文窗口(tok)。未列出的模型按 DEFAULT_CONTEXT_WINDOW(1M)处理。
-// 据各厂商官方文档(2026-09 核实);与真实窗口不符会导致压缩永不触发或过早触发。
-// glm-5.2 / GLM-5.3-Flash:智谱官方文档标注 200K;deepseek-v4/kimi/glm-5.1/glm-5.3 等仍按 1M。
-// key 统一小写,contextWindowFor 按小写匹配——模型名大小写因 provider/用户配置而异。
-const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
-  "glm-5.2": 200_000,
-  "glm-5.3-flash": 200_000,
-};
+// 上下文窗口默认值(tok):一律按各厂商官方文档取 1M。唯一例外是自定义网关上的 GLM 系列
+// (见 contextWindowFor 内特判)——网关转发窗口实测受限,保守 200K。
+// 注意:volcengine/qianfan 等官方 coding-plan/token-plan 渠道的 GLM 系列同样按官方 1M,
+// 200K 只适用于自定义网关(OpenAI 兼容代理)场景,不要按模型名一刀切。
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 
 /**
@@ -85,9 +89,17 @@ const DEFAULT_CONTEXT_WINDOW = 1_000_000;
  * 用于初始化 CONTEXT_WINDOW 和 /model 切换时联动(用户手动 /context-window 或
  * DAO_CONTEXT_WINDOW 覆盖时,手动值优先,不随模型切换改变)。
  * 按模型名小写匹配,兼容 GLM-5.3-Flash / glm-5.2 等不同大小写写法。
+ * GLM 系列按渠道区分:zhipu/volcengine/qianfan 等官方渠道按智谱官方文档一律 1M;
+ * 自定义网关(provider 落盘记 deepseek、baseUrl 非官方端点)按保守 200K——网关实际
+ * 转发窗口未知,标 1M 会让压缩永不触发、直接撞网关上限报错。
  */
-export function contextWindowFor(model: string): number {
-  return MODEL_CONTEXT_WINDOWS[model.toLowerCase()] ?? DEFAULT_CONTEXT_WINDOW;
+export function contextWindowFor(model: string, provider?: Provider, baseUrl?: string): number {
+  const key = model.toLowerCase();
+  // 自定义网关上的 GLM 系列:网关转发窗口未知,保守 200K(0.5.9 实测先例)。
+  if (/^glm-/.test(key) && provider === "deepseek" && baseUrl && baseUrl !== DEFAULTS.deepseek.baseUrl) {
+    return 200_000;
+  }
+  return DEFAULT_CONTEXT_WINDOW;
 }
 
 function isV2(raw: unknown): raw is ProfilesConfig {

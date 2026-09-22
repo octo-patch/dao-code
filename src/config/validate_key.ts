@@ -1,4 +1,5 @@
 import type { Provider } from "./profiles.js";
+import { DEFAULTS } from "./profiles.js";
 
 // 落盘前轻量校验凭证:打 provider 的 /models(最便宜的鉴权请求),确认 key 有效。
 // 对标 opencode wizard 的 "runs a model check";避免存了错 key 要到首条消息才炸。
@@ -17,11 +18,14 @@ export async function validateCredential(
     // 给了具体 model(自定义网关选完模型后)或 coding/token-plan 路径(无 /models):都用一发最小 chat
     // 探针判鉴权(max_tokens:1)。自定义网关尤其需要按选中 model 探针——网关 /models 是全量列表,
     // 不代表该 token 都授权了(京东网关未授权模型返回 4012),只有真打一发才能确认这个 model 能跑。
-    if (cred.model || cred.provider === "volcengine" || cred.provider === "qianfan") {
+    if (cred.model || cred.provider === "volcengine" || cred.provider === "qianfan" || cred.provider === "zhipu") {
+      // 探针模型:给了 model 用 model;否则用该 provider 的默认模型——zhipu coding 端点没有
+      // deepseek 系模型,沿用写死的 deepseek-v4-flash 会把有效 key 误判成失败。
+      const probeModel = cred.model ?? (cred.provider ? DEFAULTS[cred.provider].model : "deepseek-v4-flash");
       res = await fetchImpl(`${cred.baseUrl}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${cred.key}` },
-        body: JSON.stringify({ model: cred.model ?? "deepseek-v4-flash", messages: [{ role: "user", content: "1" }], max_tokens: 1 }),
+        body: JSON.stringify({ model: probeModel, messages: [{ role: "user", content: "1" }], max_tokens: 1 }),
       });
     } else {
       res = await fetchImpl(`${cred.baseUrl}/models`, {

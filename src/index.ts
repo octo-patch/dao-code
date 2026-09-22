@@ -313,12 +313,12 @@ async function main() {
   const noProjectInstructions = evalFlag || rawArgs.includes("--no-project-instructions");
   const noWeb = evalFlag || rawArgs.includes("--no-web");
   const verbose = rawArgs.includes("--verbose") || rawArgs.includes("--debug");
-  // headless 临时 key:--api-key <key> + --provider <deepseek|volcengine|qianfan|...>
+  // headless 临时 key:--api-key <key> + --provider <deepseek|volcengine|qianfan|zhipu|...>
   const apiKeyIdx = rawArgs.indexOf("--api-key");
   const cliApiKey = apiKeyIdx >= 0 ? rawArgs[apiKeyIdx + 1] : undefined;
   const providerIdx = rawArgs.indexOf("--provider");
   const cliProviderRaw = providerIdx >= 0 ? rawArgs[providerIdx + 1] : undefined;
-  const cliProvider = (cliProviderRaw === "deepseek" || cliProviderRaw === "volcengine" || cliProviderRaw === "qianfan" || cliProviderRaw === "anthropic" || cliProviderRaw === "openai") ? cliProviderRaw : undefined;
+  const cliProvider = (cliProviderRaw === "deepseek" || cliProviderRaw === "volcengine" || cliProviderRaw === "qianfan" || cliProviderRaw === "zhipu" || cliProviderRaw === "anthropic" || cliProviderRaw === "openai") ? cliProviderRaw : undefined;
   const flags = new Set(["--yolo", "--continue", "-c", "--goal", "--task", "--coordinator", "--verbose", "--debug", "--api-key", "--provider", "--model", "--obs", "--reflect-memory", "--reflect-challenger", "--progress-advice", "--no-progress-advice", "--eval", "--no-memory", "--no-skills", "--no-mcp", "--no-hooks", "--no-project-instructions", "--no-web"]);
   // 同时把每个 flag 后面的参数值也加进 flags(避免被拼成 prompt)
   if (cliApiKey) flags.add(cliApiKey);
@@ -954,9 +954,12 @@ async function main() {
   // 子代理走 withModeOverride 时会传自己的 sub.messages,这里必须原样透传,否则子代理的调用
   // 又会被根会话的转录判定,分类器看不到子代理自己在做什么(复盘 session 20260721-215548-uq75)。
   // 智能判定分类器默认模型:主模型是 GLM-5.3-Flash / GLM-5.2 时用同族自身(同族便宜档),
-  // 其余沿用 deepseek-v4-flash。DAO_CLASSIFIER_MODEL 显式设置时永远优先。
+  // glm-5.3(zhipu coding plan 旗舰)用同族便宜档 glm-5.3-flash;其余沿用 deepseek-v4-flash。
+  // DAO_CLASSIFIER_MODEL 显式设置时永远优先。
   const defaultClassifierModel = (mainModel: string): string =>
-    /^(GLM-5\.3-Flash|GLM-5\.2)$/i.test(mainModel) ? mainModel : "deepseek-v4-flash";
+    /^(GLM-5\.3-Flash|GLM-5\.2)$/i.test(mainModel) ? mainModel
+      : /^glm-5\.3$/i.test(mainModel) ? "glm-5.3-flash"
+      : "deepseek-v4-flash";
 
   const classifyPermission = async (toolName: string, argsJson: string, recentMessages: ChatMessage[]): Promise<boolean> => {
     const rules: AutoModeRules | undefined = loadedPerms.autoMode;
@@ -1186,7 +1189,7 @@ async function main() {
   const toolCatalog = apiTools.map((t) => `${t.function.name} — ${t.function.description.split(/[。\n]/)[0]!.slice(0, 60)}`).join("\n");
   const callFlash = async (system: string, user: string): Promise<string> => {
     const gen = streamChat({
-      baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: "deepseek-v4-flash",
+      baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: defaultClassifierModel(session.model),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       extra: { thinking: { type: "disabled" }, temperature: 0 },
     });
@@ -1370,13 +1373,13 @@ async function main() {
     return true;
   };
 
-  // L2.1:上下文窗口按模型默认值初始化(glm-5.2=200K,其他=1M),可被 env 覆盖。
+  // L2.1:上下文窗口按模型默认值初始化(GLM 系列按渠道:zhipu 官方 1M / 自定义网关 200K;glm-5.2=200K,其他=1M),可被 env 覆盖。
   // 真正的安全网是反应式压缩(见 loop.ts compact 钩子):即便此值偏大,撞上下文超限也会自动压缩重试。
   // /context-window 命令运行时修改此值(200K/1M 两档或自定义 K),同步写 env 供子进程继承。
   // /model 切换时:若用户未手动覆盖(env 未设),自动联动到新模型的默认值;手动覆盖后锁死,不随切换改变。
   const contextWindowManualOverride = Number.isFinite(Number(process.env.DAO_CONTEXT_WINDOW));
   let contextWindowManuallySet = contextWindowManualOverride;
-  let CONTEXT_WINDOW = Number(process.env.DAO_CONTEXT_WINDOW) || contextWindowFor(cfg.model);
+  let CONTEXT_WINDOW = Number(process.env.DAO_CONTEXT_WINDOW) || contextWindowFor(cfg.model, cfg.provider, cfg.baseUrl);
   // Q1 当前上下文 token:优先用主模型上次真实 prompt_tokens(准,尤其中文)。
   // 无真实值时返回 0——启动与 /clear 后 StatusBar 应显示 0% 而非按系统提示估算的非零值
   // (系统提示是常驻开销,不是"对话已用上下文";真实用量要到首次 API 调用后才有)。
@@ -1549,7 +1552,7 @@ async function main() {
     reflectBusy = true;
     try {
       const fork = process.env.DAO_DISTILL_FORK !== "0";
-      const model = fork ? session.model : "deepseek-v4-flash";
+      const model = fork ? session.model : defaultClassifierModel(session.model);
       const tools = fork ? apiToolsForMode(registry, session.mode, lang) : undefined;
       // 只发上次主请求已缓存的前缀(slice 到 lastSentLength)→ 前缀字节一致、命中热缓存。
       const msgs = fork && session.lastSentLength > 0 ? session.messages.slice(0, session.lastSentLength) : session.messages;
@@ -1598,7 +1601,7 @@ async function main() {
   };
 
   // 回合末入口:deepseek 官方 key 不限流,每轮都跑(仅 reflectBusy 防并发);
-  // 其它 provider(volcengine/qianfan 等 coding-plan/token-plan,计费敏感)用自适应节奏(连续安静则放慢)。
+  // 其它 provider(volcengine/qianfan/zhipu 等 coding-plan/token-plan,计费敏感)用自适应节奏(连续安静则放慢)。
   const maybeReflect = async (opts: { compactionImminent: boolean }): Promise<void> => {
     if (!reflectMemoryFlag || argvPrompt || NO_MEMORY) return; // 默认关闭,--reflect-memory 才跑
     // deepseek 不限流:跳过 cadence,每轮直接跑(仅用 reflectBusy 防并发堆叠)。
@@ -2383,7 +2386,7 @@ async function main() {
               if (activeProf) { activeProf.model = modelArg; saveProfiles(keyFile, profilesCfg).catch(() => {}); }
               // 未手动覆盖时,切模型联动上下文窗口到新模型默认值
               if (!contextWindowManuallySet) {
-                CONTEXT_WINDOW = contextWindowFor(session.model);
+                CONTEXT_WINDOW = contextWindowFor(session.model, cfg.provider, cfg.baseUrl);
                 process.env.DAO_CONTEXT_WINDOW = String(CONTEXT_WINDOW);
               }
               return { handled: true, output: `已切换模型:${modelArg}` };
@@ -2395,7 +2398,7 @@ async function main() {
             }
             // 未手动覆盖时,切模型联动上下文窗口到新模型默认值
             if (!contextWindowManuallySet) {
-              CONTEXT_WINDOW = contextWindowFor(session.model);
+              CONTEXT_WINDOW = contextWindowFor(session.model, cfg.provider, cfg.baseUrl);
               process.env.DAO_CONTEXT_WINDOW = String(CONTEXT_WINDOW);
             }
             return result;

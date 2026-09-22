@@ -98,6 +98,33 @@ describe("validateCredential · qianfan probe", () => {
   });
 });
 
+describe("validateCredential · zhipu probe", () => {
+  const zp = { baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4", key: "zp-x", provider: "zhipu" as const };
+
+  it("probes chat/completions with a tiny POST for zhipu, using the provider default model glm-5.3", async () => {
+    let seenUrl = ""; let seenMethod = ""; let seenBody = "";
+    const fakeFetch = async (url: string, init?: { method?: string; body?: string }) => {
+      seenUrl = url; seenMethod = init?.method ?? "GET"; seenBody = init?.body ?? "";
+      return { ok: true, status: 200 } as Response;
+    };
+    const r = await validateCredential(zp, fakeFetch as unknown as typeof fetch);
+    expect(r.ok).toBe(true);
+    expect(seenUrl).toBe("https://open.bigmodel.cn/api/coding/paas/v4/chat/completions");
+    expect(seenMethod).toBe("POST");
+    expect(JSON.parse(seenBody).model).toBe("glm-5.3"); // zhipu 端点没有 deepseek 系,不能沿用写死的 flash
+  });
+
+  it("reports invalid on 401 for zhipu", async () => {
+    const fakeFetch = async () => ({ ok: false, status: 401 } as Response);
+    expect(await validateCredential(zp, fakeFetch as unknown as typeof fetch)).toEqual({ ok: false, reason: "invalid" });
+  });
+
+  it("reports unreachable when the zhipu probe throws", async () => {
+    const fakeFetch = async () => { throw new Error("ENOTFOUND"); };
+    expect(await validateCredential(zp, fakeFetch as unknown as typeof fetch)).toEqual({ ok: false, reason: "unreachable" });
+  });
+});
+
 describe("validateCredential · custom gateway model probe", () => {
   const gw = { baseUrl: "http://llm-gw.jd.local/v1", key: "gw-x", provider: "deepseek" as const, model: "GLM-5.3-joybuilder" };
 

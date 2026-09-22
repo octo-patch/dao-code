@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### 新增
+- **智谱 GLM 编码套餐 provider(`zhipu`)**:OpenAI 兼容直连 Coding 专属端点
+  `https://open.bigmodel.cn/api/coding/paas/v4`(协议层零改动,与 volcengine/qianfan 同骨架)。
+  模型 `glm-5.3`(旗舰,1M 上下文,纯文本)+ `glm-5.3-flash`(多模态,已加入视觉模型集合)。
+  覆盖全部接入路径:首启 onboarding、`/account` 添加账户、headless `--provider zhipu`;
+  key 校验走最小 `chat/completions` 探针(探针模型改按 provider 默认取,智谱端点没有
+  deepseek 系模型)。智能判定分类器/WebFetch 提取/记忆蒸馏非 fork 档的便宜档模型改为
+  provider 感知:`glm-5.3` 主模型自动用同族 `glm-5.3-flash`,不再打端点上不存在的
+  `deepseek-v4-flash`。
+- **GLM 系列上下文窗口按渠道区分**:`contextWindowFor` 增加可选 `provider`/`baseUrl`
+  参数——zhipu/volcengine/qianfan 等官方渠道的 GLM 系列一律按智谱官方文档取 1M
+  (含 `glm-5.2`,不再按模型名一刀切 200K);自定义网关(provider 落盘记 deepseek、
+  baseUrl 非官方端点)上的 GLM 系列保守取 200K(网关转发窗口未知)。不传 provider
+  的旧调用按 1M。
+
 ## [0.5.9] - 2026-09-16
 
 ### 变更

@@ -704,6 +704,7 @@ export function App(deps: AppDeps) {
       { provider: "deepseek", label: t("ui.account.providerLabel.deepseek") },
       { provider: "qianfan", label: t("ui.account.providerLabel.qianfan") },
       { provider: "volcengine", label: t("ui.account.providerLabel.volcengine") },
+      { provider: "zhipu", label: t("ui.account.providerLabel.zhipu") },
       { provider: "custom", label: t("ui.account.providerLabel.custom") },
     ],
     idx: 0,

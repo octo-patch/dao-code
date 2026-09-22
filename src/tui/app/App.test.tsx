@@ -238,7 +238,7 @@ describe("App", () => {
     expect(seenProvider).toBe("qianfan");
   });
 
-  it("/account 添加账户:↓↓ + ⏎ 选到 volcengine(排最后)", async () => {
+  it("/account 添加账户:↓↓ + ⏎ 选到 volcengine", async () => {
     let seenProvider: string | undefined;
     const { stdin } = render(
       <App {...makeDeps({
@@ -265,6 +265,35 @@ describe("App", () => {
     expect(seenProvider).toBe("volcengine");
   });
 
+  it("/account 添加账户:↓↓↓ + ⏎ 选到 zhipu(排最后,custom 之前)", async () => {
+    let seenProvider: string | undefined;
+    const { stdin } = render(
+      <App {...makeDeps({
+        listAccounts: () => [],
+        addAccount: async (key, name, provider) => { seenProvider = provider; return { ok: true, name: name ?? "default" }; },
+      })} />,
+    );
+    for (const ch of "/account") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    stdin.write("\x1b[B"); // ↓ 到 qianfan
+    await delay();
+    stdin.write("\x1b[B"); // ↓ 到 volcengine
+    await delay();
+    stdin.write("\x1b[B"); // ↓ 到 zhipu
+    await delay();
+    stdin.write("\r"); // ⏎ 确认
+    await delay();
+    for (const ch of "zp-key") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    stdin.write("\r");
+    await delay();
+    expect(seenProvider).toBe("zhipu");
+  });
+
   it("/account 添加账户:选自定义网关 → baseUrl → token → 拉列表选 model → 起名,参数透传给 addAccount", async () => {
     let seen: { key?: string; name?: string; provider?: string; baseUrl?: string; model?: string } = {};
     let fetchedWith: { baseUrl?: string; key?: string } = {};
@@ -280,7 +309,7 @@ describe("App", () => {
     stdin.write("\r"); // 无账户,直接进添加
     await delay();
     expect(lastFrame()!).toContain("自定义网关"); // 选择器列出自定义网关项
-    stdin.write("4"); // 数字键选第 4 项:自定义网关
+    stdin.write("5"); // 数字键选第 5 项:自定义网关(zhipu 加入后 custom 顺延)
     await delay();
     for (const ch of "http://llm-gw.jd.local/v1") stdin.write(ch);
     await delay();
@@ -312,7 +341,7 @@ describe("App", () => {
     await delay();
     stdin.write("\r");
     await delay();
-    stdin.write("4"); // 自定义网关
+    stdin.write("5"); // 自定义网关(第 5 项)
     await delay();
     for (const ch of "http://gw/v1") stdin.write(ch);
     await delay();

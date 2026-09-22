@@ -89,6 +89,15 @@ describe("DEFAULTS.qianfan", () => {
   });
 });
 
+describe("DEFAULTS.zhipu", () => {
+  it("points at the coding-plan base url with glm-5.3 as default model", () => {
+    expect(DEFAULTS.zhipu).toEqual({
+      baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
+      model: "glm-5.3",
+    });
+  });
+});
+
 describe("MODELS_BY_PROVIDER", () => {
   it("qianfan 额外支持 glm-5.2/glm-5.1/kimi-k2.6/ernie-5.1(与 pro/flash 并列)", () => {
     expect(MODELS_BY_PROVIDER.qianfan).toEqual([
@@ -118,6 +127,9 @@ describe("MODELS_BY_PROVIDER", () => {
       "ark-code-latest",
     ]);
   });
+  it("zhipu coding plan 两档:glm-5.3 + glm-5.3-flash", () => {
+    expect(MODELS_BY_PROVIDER.zhipu).toEqual(["glm-5.3", "glm-5.3-flash"]);
+  });
 });
 
 describe("supportsVision", () => {
@@ -125,28 +137,43 @@ describe("supportsVision", () => {
     expect(supportsVision("kimi-k2.6")).toBe(true);
     expect(supportsVision("kimi-k2.7-code")).toBe(true);
   });
+  it("glm-5.3-flash(多模态)支持视觉", () => {
+    expect(supportsVision("glm-5.3-flash")).toBe(true);
+  });
   it("deepseek-v4-pro 等非视觉模型返回 false", () => {
     expect(supportsVision("deepseek-v4-pro")).toBe(false);
     expect(supportsVision("glm-5.2")).toBe(false);
+    expect(supportsVision("glm-5.3")).toBe(false);
     expect(supportsVision("unknown-model")).toBe(false);
   });
 });
 
 describe("contextWindowFor", () => {
-  it("glm-5.2 返回 200K", () => {
-    expect(contextWindowFor("glm-5.2")).toBe(200_000);
-  });
-  it("GLM-5.3-Flash 返回 200K(大小写不敏感)", () => {
-    expect(contextWindowFor("GLM-5.3-Flash")).toBe(200_000);
-    expect(contextWindowFor("glm-5.3-flash")).toBe(200_000);
-  });
-  it("glm-5.3(非 Flash)仍返回 1M", () => {
+  it("GLM 系列官方渠道一律 1M(zhipu/volcengine/qianfan 及无渠道信息调用)", () => {
+    expect(contextWindowFor("glm-5.2")).toBe(1_000_000);
+    expect(contextWindowFor("GLM-5.3-Flash")).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.3-flash")).toBe(1_000_000);
     expect(contextWindowFor("glm-5.3")).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.2", "volcengine", DEFAULTS.volcengine.baseUrl)).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.1", "qianfan", DEFAULTS.qianfan.baseUrl)).toBe(1_000_000);
+  });
+  it("GLM 系列按渠道区分:zhipu 官方 coding plan 按官方文档一律 1M", () => {
+    expect(contextWindowFor("glm-5.3", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.3-flash", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(1_000_000);
+    expect(contextWindowFor("GLM-5.3-Flash", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(1_000_000);
+  });
+  it("GLM 系列在自定义网关(provider 记 deepseek、baseUrl 非官方)上保守 200K", () => {
+    expect(contextWindowFor("glm-5.3", "deepseek", "http://llm-gw.jd.local/v1")).toBe(200_000);
+    expect(contextWindowFor("GLM-5.3-joybuilder", "deepseek", "http://llm-gw.jd.local/v1")).toBe(200_000);
+    expect(contextWindowFor("glm-5.3-flash", "deepseek", "https://gw.example.com/v1")).toBe(200_000);
+    expect(contextWindowFor("glm-5.2", "deepseek", "https://gw.example.com/v1")).toBe(200_000);
+  });
+  it("deepseek 官方 baseUrl 不触发网关保守值(GLM 系列按 1M)", () => {
+    expect(contextWindowFor("glm-5.3", "deepseek", DEFAULTS.deepseek.baseUrl)).toBe(1_000_000);
   });
   it("其他模型默认 1M", () => {
     expect(contextWindowFor("deepseek-v4-pro")).toBe(1_000_000);
     expect(contextWindowFor("deepseek-v4-flash")).toBe(1_000_000);
-    expect(contextWindowFor("glm-5.1")).toBe(1_000_000);
     expect(contextWindowFor("kimi-k2.6")).toBe(1_000_000);
     expect(contextWindowFor("unknown-model")).toBe(1_000_000);
   });

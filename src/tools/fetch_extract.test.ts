@@ -13,6 +13,10 @@ describe("resolveExtractModel", () => {
     expect(resolveExtractModel(undefined, "qianfan", "deepseek-v4-pro")).toBe("deepseek-v4-flash");
   });
 
+  it("zhipu 默认用同族便宜档 glm-5.3-flash(端点没有 deepseek 系模型)", () => {
+    expect(resolveExtractModel(undefined, "zhipu", "glm-5.3")).toBe("glm-5.3-flash");
+  });
+
   it("非 DeepSeek 系 provider(anthropic/openai)回退主模型", () => {
     expect(resolveExtractModel(undefined, "anthropic", "claude-opus-4-8")).toBe("claude-opus-4-8");
     expect(resolveExtractModel(undefined, "openai", "gpt-5")).toBe("gpt-5");
