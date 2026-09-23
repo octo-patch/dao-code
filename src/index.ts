@@ -86,6 +86,8 @@ import { loadMcpConfig, McpManager, type ElicitHandler } from "./mcp/mcp.js";
 import { loadLspConfig } from "./lsp/config.js";
 import { LspManager } from "./lsp/manager.js";
 import { lspTool } from "./tools/lsp.js";
+import { repoMapTool } from "./tools/repo_map.js";
+import { buildRepoMap, wrapRepoMapNotice, repoMapTokenBudget } from "./repomap/index.js";
 import { processManager } from "./tools/process_manager.js";
 import { agentTool } from "./tools/agent.js";
 import { loadAllMemories, upsertMemory, migrateLegacy, routeScope, projectIdOf, keepKnowledgeForProject } from "./memory/store.js";
@@ -642,6 +644,10 @@ async function main() {
   const lspManager = new LspManager(lspConfig, pathToFileURL(workspaceRoot).href);
   if (Object.keys(lspConfig.servers ?? {}).length > 0) registry.register(lspTool);
 
+  // 代码库地图(aider 风格 repo map):tree-sitter 提取符号 + PageRank 排序。无条件注册
+  // (shouldDefer,模型用 ToolSearch 才展开 schema);构建是否在后台跑见下方 repoMap 预算判断。
+  registry.register(repoMapTool);
+
   const lang = getLang();
   const toolSummaries = registry
     .toApiTools(undefined, lang)
@@ -879,6 +885,19 @@ async function main() {
     const formatted = wrapDelayedEnvNotice(formatEnvSnapshot(data, lang === "en"), lang === "en");
     if (formatted) envNoticeQueue.push(formatted);
   });
+
+  // 代码库地图:后台构建(不阻塞 Ink 挂载;实测 ~500 文件 <1s,大仓库靠 MAX_FILES 截断保护),
+  // 构建完作为尾部 system 消息走同一条 drainEnvNotices 通道注入——不进固定前缀,不破 prefix cache。
+  // DAO_REPO_MAP_TOKENS=0 显式禁用。失败静默(repo map 是增强,绝不能拖垮启动)。
+  // 不跟 --no-project-instructions/--eval 绑定:repo map 是产品内置能力(同 LSP 工具性质),
+  // 不是用户注入的内容;aider 的 benchmark 也全程开着 repo map。
+  const repoMapBudget = repoMapTokenBudget();
+  if (repoMapBudget > 0) {
+    void buildRepoMap(workspaceRoot, repoMapBudget).then((r) => {
+      const notice = r.text ? wrapRepoMapNotice(r.text, lang === "en", r.fileCount) : "";
+      if (notice) envNoticeQueue.push(notice);
+    }).catch(() => {});
+  }
 
   // Ink 交互态注册的审批/提问模态(App 挂载后填入);未填则回退 readline。
   let inkApprovalPrompt: ApprovalPrompt | null = null;

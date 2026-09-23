@@ -69,7 +69,9 @@
     "cli-highlight": "^2.1.11",
     "ink": "^7.0.5",
     "react": "^19.2.7",
+    "tree-sitter-wasms": "^0.1.13",
     "vscode-jsonrpc": "^9.0.1",
+    "web-tree-sitter": "^0.25.10",
     "zod": "^3.23.0",
     "zod-to-json-schema": "^3.23.0"
   },
