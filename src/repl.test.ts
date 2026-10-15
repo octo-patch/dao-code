@@ -236,3 +236,20 @@ describe("drainAndContinue 提供 waitForBackgroundChange → 事件驱动等待
     expect(runTurnCalls).toBe(1); // 没有卡住/漏读,正常续跑了
   });
 });
+
+describe('REPL shared scheduler', () => {
+  it('background completion wakes while retaining exactly one pending readLine', async () => {
+    const { BackgroundRuntime } = await import('./agent/background_runtime.js');
+    const { SessionScheduler } = await import('./agent/session_scheduler.js');
+    const { execution, deferred, tick } = await import('./agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const a = execution(runtime); const session = new Session('SYS', 'm');
+    const next = deferred<string | null>(); let reads = 0; let runs = 0;
+    const scheduler = new SessionScheduler({ runtime, session, save: () => {}, user: async (text) => { session.addUser(text); },
+      run: async () => ++runs === 1 ? { kind: 'waiting', wait: runtime.prepare({ ids: ['a'], mode: 'any' }).handle } : { kind: 'completed' } });
+    const repl = runRepl({ scheduler, session, readLine: async () => ++reads === 1 ? 'start' : next.promise,
+      runTurn: async () => { throw new Error('legacy path used'); }, compact: async () => {}, write: () => {} });
+    await tick(); expect(runs).toBe(1); expect(reads).toBe(2);
+    a.finish(); await scheduler.finished(); expect(runs).toBe(2); expect(reads).toBe(2);
+    next.resolve(null); await repl; scheduler.close();
+  });
+});

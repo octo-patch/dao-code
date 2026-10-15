@@ -97,8 +97,8 @@ describe("resumeAgentBackground", () => {
 
     // 生命周期是 fire-and-forget 启动的,等它跑完再断言结算结果
     await new Promise((r) => setTimeout(r, 20));
-    expect(taskManager.appendMessage).toHaveBeenCalledWith(agentId, { role: "assistant", content: "恢复后完成" });
-    expect(taskManager.update).toHaveBeenCalledWith(agentId, { status: "completed", result: "恢复后完成" });
+    expect(taskManager.appendMessage).toHaveBeenCalledWith(agentId, { role: "assistant", content: "恢复后完成" }, undefined);
+    expect(taskManager.update).toHaveBeenCalledWith(agentId, { status: "completed", result: "恢复后完成" }, undefined);
   });
 });
 

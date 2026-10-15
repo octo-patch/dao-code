@@ -68,9 +68,11 @@ export async function resumeAgentBackground(opts: {
     override?: { abortController?: AbortController; agentId?: string };
     worktreePath?: string;
     onCacheSafeParams?: (params: CacheSafeParams) => void;
+    messageParent?: (text: string, kind?: import("./background_types.js").MessageKind) => void;
   }) => AsyncGenerator<ChatMessage, void>;
-  registerAsyncAgent: (opts: { agentId: string; description: string }) => { agentId: string; abortController: AbortController };
+  registerAsyncAgent: (opts: { agentId: string; description: string }) => { agentId: string; runId?: string; abortController: AbortController };
   taskManager: AsyncAgentTaskManager;
+  messageParent?: (agentId: string, text: string, kind: import("./background_types.js").MessageKind | undefined, runId: string | undefined) => void;
 }): Promise<{ agentId: string; description: string; outputFile: string }> {
   const { agentId, prompt, subagentsDir, agentDefs, taskManager } = opts;
   const [transcript, meta] = await Promise.all([getAgentTranscript(subagentsDir, agentId), readAgentMetadata(subagentsDir, agentId)]);
@@ -86,7 +88,8 @@ export async function resumeAgentBackground(opts: {
   const bgTask = opts.registerAsyncAgent({ agentId, description });
 
   void runAsyncAgentLifecycle({
-    taskId: bgTask.agentId,
+    taskId: bgTask.agentId, runId: bgTask.runId,
+    abortSignal: bgTask.abortController.signal,
     agentId,
     agentType: meta?.agentType,
     isBuiltInAgent: agentDef.source === "built-in",
@@ -99,6 +102,7 @@ export async function resumeAgentBackground(opts: {
       override: { abortController: bgTask.abortController, agentId },
       worktreePath: meta?.worktreePath,
       onCacheSafeParams,
+      messageParent: (text, kind) => opts.messageParent?.(agentId, text, kind, bgTask.runId),
     }),
     taskManager,
   });

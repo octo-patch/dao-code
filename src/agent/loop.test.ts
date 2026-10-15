@@ -573,7 +573,7 @@ describe("runTurn", () => {
         executeToolCalls: async () => [],
         write: () => {},
       }),
-    ).rejects.toThrow(/限流|429/);
+    ).resolves.toMatchObject({ kind: "failed", error: expect.objectContaining({ message: expect.stringMatching(/限流|429/) }) });
     expect(call).toBe(1); // 没有换模型重试,只问了一次就中止
     expect(askedQuestion).toMatch(/限流/);
     expect(askedOptions.length).toBe(2);
@@ -653,7 +653,7 @@ describe("runTurn", () => {
         listOtherAccounts: () => [{ name: "work" }],
         switchAccountAndWait: async () => false, // 模拟凭据解析失败
       }),
-    ).rejects.toThrow(/限流|429/);
+    ).resolves.toMatchObject({ kind: "failed", error: expect.objectContaining({ message: expect.stringMatching(/限流|429/) }) });
     expect(noticed.some((t) => t.includes("切换到账号「work」失败"))).toBe(true);
   });
 
@@ -679,7 +679,7 @@ describe("runTurn", () => {
         executeToolCalls: async () => [],
         write: () => {},
       }),
-    ).rejects.toThrow(/限流|429/);
+    ).resolves.toMatchObject({ kind: "failed", error: expect.objectContaining({ message: expect.stringMatching(/限流|429/) }) });
     expect(askedOptions).toEqual(["等待后用当前模型重试", "中止本轮(稍后可用 /account 切换账号)"]);
   });
 
@@ -797,7 +797,7 @@ describe("runTurn", () => {
     });
     // 两次工具轮都落盘;最后纯文本收尾那轮走的是"直接 return"早退路径(没有新工具结果要保护),
     // 不额外触发——回合末外层的 persist() 已经会存一次完整最终状态,不依赖这里补。
-    expect(checkpoints).toBe(2);
+    expect(checkpoints).toBe(3);
   });
 
   it("§4 轮内主动压缩:shouldCompact=true 时在工具轮之间调 compact(不等回合末)", async () => {
@@ -1019,7 +1019,7 @@ describe("runTurn", () => {
     expect(written.join("")).not.toContain("进度提醒");
   });
 
-  it("还有后台子代理在跑时,连续用 BashOutput/TaskOutput 做 checkpoint 式轮询不算卡住(regex-chess 真实撞见:合规轮询被连续29次误判'卡住')", async () => {
+  it("查询不再隐式推断等待,仅 TaskWait 让出控制", async () => {
     const s = new Session("SYS", "m");
     s.addUser("go");
     const pollTurn = (name: string) => () => turn([], { role: "assistant", content: null, tool_calls: [{ id: "p", type: "function", function: { name, arguments: "{}" } }] })();
@@ -1029,17 +1029,54 @@ describe("runTurn", () => {
     ];
     let i = 0;
     const written: string[] = [];
-    const ctxWithRunningTask = { ...ctx, taskManager: { running: () => [{ id: "t1" }] } as any };
+    const ctxWithRunningTask = { ...ctx, taskManager: { running: () => [{ id: "t1", background: true }] } as any };
     await runTurn({
       session: s, config, registry: emptyReg(), ctx: ctxWithRunningTask, gate: stubGate,
       streamChat: (() => turns[i++]!()) as any,
       executeToolCalls: async () => [{ role: "tool", tool_call_id: "p", content: "仍在运行" }],
       write: (t) => written.push(t),
+      drainNotifications: () => [],
       maxTurns: 10,
       progressAdvice: true,
     });
     expect(s.messages.some((m) => m.role === "system" && String(m.content).includes("进度提醒"))).toBe(false);
     expect(written.join("")).not.toContain("进度提醒");
+    expect(i).toBe(6); // 查询保持读取语义,显式等待由 TaskWait 表达
+    expect(s.messages.filter((m) => m.role === "tool")).toHaveLength(5);
+    expect(written.join("")).not.toContain("等待通知后继续");
+    let notifications = ["后台任务完成:验证通过"];
+    await runTurn({
+      session: s, config, registry: emptyReg(), ctx, gate: stubGate,
+      drainNotifications: () => notifications.splice(0),
+      executeToolCalls: async () => [],
+      streamChat: (() => turn([], { role: "assistant", content: "已收到验证结果" })()) as any,
+      write: () => {},
+    });
+    expect(s.messages.some((m) => String(m.content).includes("后台任务完成:验证通过"))).toBe(true);
+    expect(s.messages.at(-1)?.content).toBe("已收到验证结果");
+  });
+
+  it.each([
+    { background: false, names: ["TaskOutput", "TaskGet", "TaskList"] },
+    { background: true, names: ["TaskOutput", "Read", "TaskGet"] },
+  ])("手动任务或穿插独立工作时不会提前暂停: %j", async ({ background, names }) => {
+    const s = new Session("SYS", "m");
+    s.addUser("go");
+    let calls = 0;
+    await runTurn({
+      session: s, config, registry: emptyReg(), gate: stubGate,
+      ctx: { ...ctx, taskManager: { running: () => [{ id: "task", background }] } as any },
+      drainNotifications: () => [],
+      streamChat: (() => {
+        const name = names[calls++];
+        return name ? turn([], { role: "assistant", content: null, tool_calls: [{ id: "p", type: "function", function: { name, arguments: "{}" } }] })()
+          : turn([], { role: "assistant", content: "done" })();
+      }) as any,
+      executeToolCalls: async () => [{ role: "tool", tool_call_id: "p", content: "running" }],
+      write: () => {}, maxTurns: 5,
+    });
+    expect(calls).toBe(4);
+    expect(s.messages.at(-1)?.content).toBe("done");
   });
 
   it("轮询但后台其实什么都没在跑 → 仍然算卡住(不能靠反复调用 BashOutput/TaskOutput 刷新计数器绕过反空转检测)", async () => {

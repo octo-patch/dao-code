@@ -1,5 +1,5 @@
 import React from "react";
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render } from "ink-testing-library";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -9,6 +9,11 @@ import type { AppDeps } from "./types.js";
 import type { ContentPart } from "../../client/types.js";
 import type { ApprovalDecision, ApprovalPrompt } from "../../approval/types.js";
 import { setLang } from "../../i18n/i18n.js";
+
+// UI language switching must not write the developer's real ~/.dao/settings.json.
+vi.mock("../../i18n/i18n.js", async (original) => ({
+  ...await original<typeof import("../../i18n/i18n.js")>(), switchLang: vi.fn(async () => {}),
+}));
 
 const delay = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
@@ -1418,5 +1423,27 @@ describe("App", () => {
     stdin.write("\r");
     for (let i = 0; i < 50 && !lastFrame()!.includes("压缩失败"); i++) await delay(20);
     expect(lastFrame()!).toContain("压缩失败");
+  });
+});
+
+describe('App shared scheduler', () => {
+  it('renders waiting, Esc pauses automatic wakeup, new user input resumes', async () => {
+    setLang('zh');
+    const { BackgroundRuntime } = await import('../../agent/background_runtime.js');
+    const { SessionScheduler } = await import('../../agent/session_scheduler.js');
+    const { Session } = await import('../../session/session.js');
+    const { execution } = await import('../../agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const a = execution(runtime); const session = new Session('', 'm'); let runs = 0;
+    const scheduler = new SessionScheduler({ runtime, session, save: () => {}, user: async (text) => { session.addUser(text); },
+      run: async () => ++runs === 1 ? { kind: 'waiting', wait: runtime.prepare({ ids: ['a'], mode: 'all' }).handle } : { kind: 'completed' } });
+    const ui = render(<App {...makeDeps({ scheduler })} />);
+    try {
+      scheduler.submit('start'); await scheduler.settled(); await delay();
+      expect(ui.lastFrame()).toContain('等待 1 个后台任务');
+      ui.stdin.write('\x1b'); await delay(); expect(ui.lastFrame()).toContain('自动续跑已暂停');
+      a.finish(); await delay(); expect(runs).toBe(1);
+      ui.stdin.write('continue'); await delay(); ui.stdin.write('\r'); await delay();
+      expect(runs).toBe(2); expect(runtime.events()).toEqual([]);
+    } finally { ui.unmount(); scheduler.close(); }
   });
 });

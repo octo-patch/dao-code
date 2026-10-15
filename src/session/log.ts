@@ -1,4 +1,4 @@
-import { appendFileSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync, realpathSync } from "node:fs";
+import { renameSync, appendFileSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 // 规范化路径(解符号链接,如 macOS /var→/private/var),失败则原样返回,用于 cwd 比较。
@@ -34,6 +34,7 @@ export interface PersistedState {
   usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number };
   updatedAt: number;
   done: boolean;
+  backgroundWait?: boolean;
 }
 
 // P3-29 Lite-Log:轻量元信息(不含 messages),供 /resume 秒列与可恢复扫描,不必解析整份 state.json。
@@ -84,7 +85,8 @@ export function createSessionStore(baseDir: string, id?: string): SessionStore {
   let last: PersistedState | null = null;
   const flush = () => {
     if (!last) return;
-    try { writeFileSync(statePath, JSON.stringify(last)); } catch {}
+    writeFileSync(statePath + ".tmp", JSON.stringify(last));
+    renameSync(statePath + ".tmp", statePath);
     // 同步写轻量 meta(秒列用):只含元信息,不含 messages。
     try {
       const meta: SessionMeta = {

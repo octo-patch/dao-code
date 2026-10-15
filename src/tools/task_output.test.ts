@@ -27,6 +27,18 @@ describe("TaskOutput", () => {
     expect(third).not.toContain("Grep"); // 上一条工具调用已经在 first 里读过了
   });
 
+  it("任务结束后重复读取不重放历史,同名新任务独立读取", async () => {
+    for (let n = 0; n < 2; n++) {
+      const taskManager = createTaskManager();
+      const { agentId } = taskManager.registerAsyncAgent({ agentId: "reused", description: "test" });
+      taskManager.appendMessage(agentId, { role: "assistant", content: "最终消息" });
+      taskManager.update(agentId, { status: "completed", result: "done" });
+      const ctx = { workspaceRoot: "/w", taskManager };
+      expect(await taskOutputTool.handler({ id: agentId }, ctx)).toContain("最终消息");
+      expect(await taskOutputTool.handler({ id: agentId }, ctx)).not.toContain("最终消息");
+    }
+  });
+
   it("不存在的 id → 提示未找到", async () => {
     const taskManager = createTaskManager();
     const out = await taskOutputTool.handler({ id: "task-999" }, { workspaceRoot: "/w", taskManager });

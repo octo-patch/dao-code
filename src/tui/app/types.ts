@@ -46,6 +46,8 @@ export interface StatusInfo {
 }
 
 export interface AppDeps {
+  scheduler?: import("../../agent/session_scheduler.js").SessionScheduler;
+  bindEvents?: (events: TurnEvents) => void;
   welcome: { info: WelcomeInfo; caps: Capabilities; bg: Background; maxim: Maxim };
   // 首启 onboarding 已自行展示过 banner;真→App 不再渲染 <Welcome>(避免重复)。
   skipBanner?: boolean;
@@ -72,7 +74,7 @@ export interface AppDeps {
   // 异步后台任务:取出待注入的 <task-notification>(空闲时自动作为新回合喂给模型)。
   drainNotifications?: () => string[];
   // 订阅后台任务状态变化(完成/失败/取消)→ 触发 UI 刷新与通知处理。
-  subscribeTasks?: (cb: () => void) => void;
+  subscribeTasks?: (cb: () => void) => void | (() => void);
   // 当前运行中的后台任务数(状态栏展示)。
   runningTasks?: () => number;
   // 当前运行中的后台 shell 数(状态栏展示)。

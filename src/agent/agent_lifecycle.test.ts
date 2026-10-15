@@ -33,8 +33,8 @@ describe("runAsyncAgentLifecycle", () => {
       taskManager,
     });
     expect(taskManager.appendMessage).toHaveBeenCalledTimes(2);
-    expect(taskManager.appendMessage).toHaveBeenNthCalledWith(1, "task-1", messages[0]);
-    expect(taskManager.appendMessage).toHaveBeenNthCalledWith(2, "task-1", messages[1]);
+    expect(taskManager.appendMessage).toHaveBeenNthCalledWith(1, "task-1", messages[0], undefined);
+    expect(taskManager.appendMessage).toHaveBeenNthCalledWith(2, "task-1", messages[1], undefined);
   });
 
   it("正常结束后用最后一条 assistant 文本结算 completed", async () => {
@@ -48,7 +48,7 @@ describe("runAsyncAgentLifecycle", () => {
       makeStream: () => fakeStream(messages),
       taskManager,
     });
-    expect(taskManager.update).toHaveBeenCalledWith("task-1", { status: "completed", result: "最终结论" });
+    expect(taskManager.update).toHaveBeenCalledWith("task-1", { status: "completed", result: "最终结论" }, undefined);
   });
 
   it("stream 抛错时结算 failed,并带上已产出的部分结果", async () => {

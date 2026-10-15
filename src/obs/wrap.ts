@@ -45,12 +45,12 @@ export function wrapStreamChat(inner: StreamFn): StreamFn {
   };
 }
 
-type RunTurnFn = (deps: any) => Promise<void>;
+type RunTurnFn<T> = (deps: any) => Promise<T>;
 
 /** turn span:普通 async,用 withActive 让本回合内的 llm/tool span 都挂它下面。 */
-export function wrapRunTurn(inner: RunTurnFn): RunTurnFn {
+export function wrapRunTurn<T>(inner: RunTurnFn<T>): RunTurnFn<T> {
   if (!getBackend()) return inner;
-  return async (deps: any): Promise<void> => {
+  return async (deps: any): Promise<T> => {
     const backend = getBackend();
     if (!backend) return inner(deps);
     const identity = deps?.identity ?? "main";
@@ -75,7 +75,7 @@ export function wrapRunTurn(inner: RunTurnFn): RunTurnFn {
         } }
       : deps;
     try {
-      await backend.withActive(span, () => inner(wrapped));
+      return await backend.withActive(span, () => inner(wrapped));
     } finally {
       span.end();
     }

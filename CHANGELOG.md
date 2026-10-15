@@ -4,7 +4,12 @@
 
 ## [Unreleased]
 
+### 修复
+- 自定义网关的智能判定默认使用当前主模型;分类器成功回退后在会话内复用,权限判定和子代理安全审查共享缓存,避免反复请求不存在的模型并刷屏。
+- 修复 TaskOutput 在任务结束后重复返回历史消息的问题;取消真实执行先进入 canceling,执行器确认退出后才标记 canceled。
+
 ### 新增
+- **后台等待与唤醒(第一期)**:主会话通过 `TaskWait(ids, mode=any|all)` 显式等待;TTY、REPL、一次性 CLI 共用事件驱动调度器。普通进度不触发模型请求,完成/失败/attention 在安全边界投递,保存成功后确认消费。支持用户插话、Esc 暂停自动续跑、runId 隔离旧执行及恢复会话时提示旧等待未恢复。
 - **智谱 GLM 编码套餐 provider(`zhipu`)**:OpenAI 兼容直连 Coding 专属端点
   `https://open.bigmodel.cn/api/coding/paas/v4`(协议层零改动,与 volcengine/qianfan 同骨架)。
   模型 `glm-5.3`(旗舰,1M 上下文,纯文本)+ `glm-5.3-flash`(多模态,已加入视觉模型集合)。

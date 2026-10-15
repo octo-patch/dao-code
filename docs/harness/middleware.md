@@ -29,11 +29,13 @@ dao-code 里没有一个模块直接叫"middleware"。这个词借自 AHE 论文
 `runTurn()` 每个模型回合(`for t<maxTurns`)依次做:
 
 1. 判断是否需要"轮内主动压缩"(`shouldCompact()→compact()`,171-176 行)
-2. 消费三类回合边界追加(SendMessage / 异步挑战者 advisory / 后台任务结果,178-197 行)
+2. 在安全边界由 SessionScheduler 注入用户补充及后台事件,再追加 SendMessage / 异步挑战者 advisory 等上下文
 3. 调模型拿 assistant + tool_calls(199 行)
 4. 按 plan/normal 模式派发执行(218-251 行,内部即触发 hooks)
-5. 编辑后诊断回灌(254-260 行)
+5. TaskWait 先保存配对工具结果,返回 waiting 交给调度器;其他工具继续编辑后诊断回灌
 6. 反思层健康评估:`assessTurn()` 判定卡住/漂移,决定是否 fork `deps.reflect(challenger|refocuser)`(274-295 行)
+
+`runTurn` 返回 completed/waiting/interrupted/failed。waiting 不触发回合完成通知或回合末反思;失败由调度器暂停,子代理执行器将 failed 传递为失败结算。
 
 `compact` 是被动注入的依赖(反应式压缩在 `requestAssistant` 里 144-149 行捕获"上下文超限"异常重试);`reflect` 只在这里被"决策"是否调用,真正的模型侧 fork 逻辑在 `index.ts`。
 

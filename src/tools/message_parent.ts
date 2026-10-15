@@ -8,7 +8,7 @@ export const messageParentTool = defineTool({
   name: "MessageParent",
   description:
     "(后台子代理用)给派发你的父代理发一条中途消息——进度、中间发现、或需要澄清的问题,不用等跑完才汇报。" +
-    "父代理空闲时(下个工具回合边界)会收到,不是立刻打断它。仅当你是后台子代理时有效;前台子代理调了也没用" +
+    "kind=progress 仅更新进度,不唤醒父代理;kind=attention(默认)用于需要处理的问题,由父代理在安全边界接收。仅当你是后台子代理时有效;前台子代理调了也没用" +
     "(结论会在完成时直接返回父代理,不需要这个中途通道)。这是子代理→父代理这个方向;反方向(父代理中途给你" +
     "追加指令)对应的是 TaskSend,不是这个。举例:被派去调查一个大仓库为什么构建变慢,查了一半发现是某个" +
     "依赖版本明显有问题,不确定要不要顺手升级它——这时候用它先汇报这个中间发现,而不是憋到最终结论里才提," +
@@ -16,7 +16,7 @@ export const messageParentTool = defineTool({
     "只是单向汇报,不会等父代理回应——需要它明确回话再决定下一步的话,就在消息里问清楚,然后继续做当下能做的部分,而不是原地卡住等答复。",
   descriptionEn:
     "(For background subagents) Sends a mid-run message to the parent agent that dispatched you — progress, intermediate findings, or clarifying questions — without " +
-    "waiting until you finish to report. The parent receives it when idle (at its next tool turn boundary), not as an immediate interrupt. Only effective when you " +
+    "waiting until you finish to report. Use kind=progress for ordinary progress (no parent model wake); attention (default) requests parent action at a safe boundary. Only effective when you " +
     "are a background subagent; calling it as a foreground subagent has no effect (your conclusion is returned directly upon completion, no need for this mid-run channel). " +
     "This is the subagent→parent direction; the reverse (parent sending you an instruction mid-run) is TaskSend, not this. Example: dispatched to investigate why a " +
     "large repo's build got slow, midway you find a dependency version is clearly wrong but aren't sure whether to go ahead and upgrade it — use this to report that " +
@@ -26,13 +26,14 @@ export const messageParentTool = defineTool({
   approval: "auto",
   shouldDefer: true,
   schema: z.object({
+    kind: z.enum(["progress", "attention"]).optional().describe("普通进展用 progress;需要父代理处理用 attention(默认)"),
     message: z.string().min(1).describe("发给父代理的中途消息(进度/发现/问题)"),
   }),
   handler: async (args, ctx) => {
     if (!ctx.messageParent) {
       return "你不是后台子代理(无父任务通道):你的结论会在完成时直接返回父代理,无需中途发送。";
     }
-    ctx.messageParent(args.message);
-    return msg("已发送给父代理(它空闲时会看到)。", "Sent to parent agent (it will see this when idle).");
+    ctx.messageParent(args.message, args.kind);
+    return args.kind === "progress" ? msg("进度已更新,不触发父代理续跑。", "Progress updated without waking the parent.") : msg("已发送给父代理(它在安全边界处理)。", "Sent to parent for handling at a safe boundary.");
   },
 });

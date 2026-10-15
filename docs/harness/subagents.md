@@ -52,15 +52,15 @@ interface AgentDef {
 - `fork` —— 继承父完整上下文、复用缓存前缀
 - `model`/`mode` —— 调用级覆盖,与 `fork` 互斥
 
-默认一次性派发(`runOne` 跑到底返回最终文本);单任务超 60s(`DAO_AUTO_BACKGROUND_MS`)自动转后台(110-120 行);显式 `background:true` 则立即返回 task id,经通知队列异步回灌。并行任务用 worker 池限流(126-141 行)。
+默认前台派发并返回最终文本;Ctrl+B 可将前台执行转后台。显式 `background:true` 立即返回 task id,结果由会话调度器异步投递。并行任务仍使用已有 worker 池限流。
 
 ## 父子通信:`task_send.ts` / `message_parent.ts` / `tasks.ts`
 
-`tasks.ts` 的 `TaskManager` 是后台任务/通知的核心状态机(`launch`/`adopt`/`send`/`emitFromTask`/`drainPending`/`drainNotifications`)。
+`tasks.ts` 的 `TaskManager` 管理任务及执行状态,通过可解除的 `subscribe` 发布结构化事件;`BackgroundRuntime` 聚合这些事件和 Shell 事件。每次执行或 resume 都有独立 runId。旧 `drainNotifications` 仅用于兼容未接入调度器的调用方,生产入口不消费它。
 
 - `task_send`(**父→子**):父代理调用 `task_send(id, message)` 追加指令,子代理在下一个工具回合边界通过 `drainPending` 消费(`subagent.ts:56`)。
-- `message_parent`(**子→父**):仅后台子代理可用,调用后走 `taskManager.emitFromTask`,以 `<task-message>` 形式进通知队列,父代理空闲时收到。
-- 子代理正常完成结果以 `<task-notification>` XML(`tasks.ts:40-52`)形式回灌主循环,主循环在 `index.ts:1079/1765` 处 `drainNotifications()` 消费。
+- `MessageParent`(**子→父**):`kind=progress` 更新进度,不唤醒主模型;`kind=attention`(默认)表示需要处理的问题,在安全边界投递。
+- 子代理结果经 `BackgroundDelivery` 作为带 eventId/taskId/runId 的数据消息追加,不经过 `UserPromptSubmit`。消息保存成功后才从收件箱确认消费;保存失败暂停会话,重试不会重复追加同批消息。
 
 ## 权限/审批模型
 
@@ -68,4 +68,26 @@ interface AgentDef {
 
 ## 后台并行 + 异步回灌
 
-已支持:`background`/`adoptBackground` 让子代理脱离主循环阻塞跑,`TaskManager` 维护运行列表(`tasks.ts:162-164`),完成/失败经 `notifications` 队列以 `<task-notification>` 注入,主循环(`index.ts:1079`、REPL 层 `1798`)在回合边界 `drainNotifications()` 拉取并喂给模型,配合 `onChange` 回调驱动 UI 刷新(`tasks.ts:172-174`)——即"异步任务 + 消息队列"模型已经落地。同时最多后台/并行数受 `DAO_MAX_PARALLEL_AGENTS` 限流(默认 10,`depth>=1` 时 3)。
+`SessionScheduler` 是 TTY、REPL 和一次性 CLI 启动主回合、消费后台结果的唯一入口。同一会话至多有一个主回合;执行期间到达的结果只在工具调用/结果配对完整后的安全边界注入。
+
+主会话做完独立工作后,单独调用 `TaskWait({ids:["agent-a","proc-1"],mode:"all"})`。`any` 等任一完成,`all` 等全部成功;任一失败、取消确认或 attention 可提前解除等待。非目标任务的普通成功结果在显式等待期间暂存。手动 TaskCreate 待办和前台任务不能等待;子代理不暴露 TaskWait。
+
+工具立即返回 ready 或 waiting,不会占用一个等待后台结束的工具 Promise。`runTurn` 先保存配对结果,再返回 `TurnOutcome.waiting`;调度器重新检查完成条件,避免保存期间发生完成导致漏唤醒。等待期间没有模型请求或结果查询定时器。未显式等待的一次性/非 TTY 入口在尚有后台执行时建立兼容性等待,维持进程存活。
+
+- 用户输入解除原等待,优先处理新意图;后台工作继续。
+- Esc 暂停自动续跑,保留未消费的结果;新输入恢复。暂停不等于取消后台任务。
+- TaskStop/KillShell 发出取消请求;真实执行先进入 canceling,执行器退出后才确认 canceled。无法取消的 adopt Promise 不伪报停止。
+- TaskUpdate 只允许手动待办改变终态;真实执行由生命周期结算。
+- 恢复转录不会接管旧后台执行。存档记录旧等待提示,恢复时明确要求重新确认状态;本期不支持跨进程执行恢复。
+
+主要实现位于 `src/agent/background_runtime.ts`、`background_delivery.ts`、`session_scheduler.ts` 和 `src/tools/task_wait.ts`。`--obs` 可记录等待登记/激活/解除、唤醒原因、投递和去重事件,不附带任务正文;Runtime diagnostics 提供请求数、等待期请求数、累计等待时长、队列及订阅数。
+
+确定性验收命令:
+
+```sh
+npx vitest run src/agent/background_runtime.test.ts src/agent/session_scheduler.test.ts src/agent/background_wait.integration.test.ts
+node scripts/verify-background-wait.mjs
+node scripts/verify-background-wait.mjs --repl
+```
+
+CLI 脚本使用脚本化模型响应及真实 Shell/FIFO,验证等待期零请求与一次唤醒,不访问模型服务。真实模型是否遵循 TaskWait 指引需另行回放验收。

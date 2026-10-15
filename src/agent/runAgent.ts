@@ -61,7 +61,7 @@ export interface RunAgentParams {
    *  agentDef.omitClaudeMd!==true 时拼进子代理 system prompt,省 token 的一次性 agent(explore/plan)不拼。 */
   projectInstructions?: string;
   /** 后台子代理给父发 mid-run 消息的出口(MessageParent 工具用);前台子代理不传 */
-  messageParent?: (message: string) => void;
+  messageParent?: (message: string, kind?: import("../agent/background_types.js").MessageKind) => void;
   /** 缓存安全参数回调(后台摘要用) */
   onCacheSafeParams?: (params: CacheSafeParams) => void;
   /** 每条消息回调(活性检测用) */
@@ -76,7 +76,7 @@ export interface RunAgentParams {
   /** 审批门 */
   gate?: TurnDeps["gate"];
   /** runTurn 函数 */
-  runTurn?: (deps: TurnDeps) => Promise<void>;
+  runTurn?: (deps: TurnDeps) => Promise<void | import("./background_types.js").TurnOutcome>;
   /** 输出函数 */
   write?: (s: string) => void;
   /** 转录写入回调 */
@@ -453,7 +453,7 @@ ${skill.body}` });
 
       // runTurn 在后台跑,往 sub.messages push 消息;push 时 withPushNotifier 同步唤醒下面的查询循环
       const runTurnPromise = (async () => {
-        await runTurn({
+        const outcome = await runTurn({
           session: sub,
           config,
           registry: resolvedTools,
@@ -470,6 +470,9 @@ ${skill.body}` });
           ...(agentDef.effort ? { reasoningEffort: agentDef.effort } : {}),
           ...(auditSink ? { auditSink, auditId: { agent: "sub" as const, subId: agentId, depth: subDepth } } : {}),
         });
+        if (outcome?.kind === "failed") throw outcome.error;
+        if (outcome?.kind === "waiting") throw new Error("子代理不支持嵌套等待");
+        if (outcome?.kind === "interrupted") throw new Error("子代理已中断");
       })();
 
       // 事件驱动:每轮先把已产出的消息 yield 完,再"睡到下一次 push 或 runTurn 结束"为止——

@@ -9,7 +9,7 @@ import type { Tool } from "../tools/types.js";
 export const ALL_AGENT_DISALLOWED_TOOLS = new Set([
   "Agent",
   "AskUserQuestion",
-  "TaskStop",
+  "TaskStop", "TaskWait",
 ]);
 
 export const CUSTOM_AGENT_DISALLOWED_TOOLS = new Set([

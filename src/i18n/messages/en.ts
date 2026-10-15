@@ -56,6 +56,8 @@ export const en: Record<string, string> = {
   "ui.hint.running": "Running — keep typing, Enter to queue",
   "ui.hint.ctrlcExit": "Press Ctrl+C again to exit",
   "ui.modeHint": "permission mode →",
+  "ui.waitingTasks": "⏳ Waiting for {0} background task(s) ({1}); Esc pauses auto-resume",
+  "ui.backgroundPaused": "⏸ Auto-resume paused; background work may continue. Send a message to resume",
   "ui.bgRunning": "∞ {0} background task(s) running…",
   "ui.status.longTask": "∞ Long task · ",
   "ui.status.planMode": "◇ plan (read-only) · ",

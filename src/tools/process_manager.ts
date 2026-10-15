@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import type { ExecutionEvent, ExecutionSnapshot } from "../agent/background_types.js";
 import { spawn, exec, type ChildProcess } from "node:child_process";
 import { openSync, closeSync, readSync, statSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import path from "node:path";
@@ -46,6 +48,8 @@ function killTree(child: ChildProcess, sig: NodeJS.Signals): void {
 
 interface BgProc {
   id: string;
+  runId: string;
+  cancelRequested?: boolean;
   command: string;
   child: ChildProcess;
   stdoutPath: string;
@@ -106,6 +110,22 @@ class ProcessManager {
   private notifications: string[] = [];
   private onChangeCb: (() => void) | undefined;
   private notify = () => this.onChangeCb?.();
+  private listeners = new Set<(event: ExecutionEvent) => void>();
+  subscribe(cb: (event: ExecutionEvent) => void) {
+    this.listeners.add(cb);
+    for (const p of this.procs.values()) if (p.status === "running") p.child.ref();
+    return () => {
+      this.listeners.delete(cb);
+      if (!this.listeners.size) for (const p of this.procs.values()) p.child.unref();
+    };
+  }
+  private publish(p: BgProc, type: "started" | "progress" | "completed" | "failed" | "canceled") {
+    const snapshot: ExecutionSnapshot = { taskId: p.id, runId: p.runId, kind: "shell", background: true,
+      description: p.command, status: p.status === "running" ? (p.cancelRequested ? "canceling" : "running") : (p.cancelRequested ? "canceled" : p.exitCode === 0 ? "completed" : "failed"),
+      result: p.status === "exited" ? `exit=${p.exitCode}, signal=${p.signal}; stdout: ${p.stdoutPath}; stderr: ${p.stderrPath}` : undefined };
+    for (const cb of this.listeners) cb({ type, snapshot });
+    this.notify();
+  }
 
   // 已退出进程保留供 BashOutput 查最终状态,但无限累积会泄漏内存。
   // 超过上限时删掉最老的已退出进程条目。
@@ -126,7 +146,8 @@ class ProcessManager {
 
   start(command: string, cwd: string): string {
     const id = `proc-${++this.counter}`;
-    const logDir = path.join(cwd, ".dao", "bg", id);
+    const runId = randomUUID();
+    const logDir = path.join(cwd, ".dao", "bg", `${id}-${runId}`);
     mkdirSync(logDir, { recursive: true });
     const stdoutPath = path.join(logDir, "stdout.log");
     const stderrPath = path.join(logDir, "stderr.log");
@@ -142,9 +163,9 @@ class ProcessManager {
       : spawn(command, { cwd, shell: true, detached: true, stdio: ["ignore", outFd, errFd], env: scrubbedEnv() }); // S5.2 env 脱敏
     closeSync(outFd);
     closeSync(errFd); // spawn 内部已 dup,父进程这两个 fd 用不上了,不关会泄漏
-    child.unref(); // 不让这个子进程的存在阻塞/牵制 DAO 自身进程退出
+    if (!this.listeners.size) child.unref(); // 有调度器时保持事件循环存活,解除订阅后才独立运行
     const proc: BgProc = {
-      id,
+      id, runId,
       command,
       child,
       stdoutPath,
@@ -156,22 +177,31 @@ class ProcessManager {
       signal: null,
       notified: false,
     };
-    child.on("exit", (code, signal) => {
+    child.once("error", (error) => {
+      if (proc.notified || this.procs.get(id) !== proc) return;
+      proc.status = "exited"; proc.exitCode = -1; proc.notified = true;
+      appendFileSync(proc.stderrPath, String(error) + "\n");
+      if (!this.listeners.size) this.notifications.push(shellNotificationXml(id, command, -1, null));
+      this.publish(proc, proc.cancelRequested ? "canceled" : "failed");
+    });
+    child.on("close", (code, signal) => {
       proc.status = "exited";
       proc.exitCode = code;
       proc.signal = signal;
       // 进程退出时自动入队通知 -- 模型在下一个回合边界收到,不需要手动轮询。
       // notified 标记防止 poll()/kill() 路径二次入队同一个退出事件。
       // reset() 会 clear procs 并赋值新 notifications 数组——此时 procs 里已没有这个 id,
-      // 不检查就会往新数组里 push 上一个会话残留进程的退出通知,污染下一轮。
-      if (!proc.notified && this.procs.has(id)) {
+      // 旧 XML 只通知当前条目;结构化事件带 runId,让仍等待旧执行的 Runtime 能确认取消,
+      // 而已 reset 的 Runtime 会丢弃旧 runId,不会污染下一轮。
+      if (!proc.notified) {
         proc.notified = true;
-        this.notifications.push(shellNotificationXml(id, command, code, signal));
-        this.notify();
+        if (!this.listeners.size && this.procs.get(id) === proc) this.notifications.push(shellNotificationXml(id, command, code, signal));
+        this.publish(proc, proc.cancelRequested ? "canceled" : code === 0 ? "completed" : "failed");
       }
       this.gcFinished();
     });
     this.procs.set(id, proc);
+    this.publish(proc, "started");
     return id;
   }
 
@@ -181,7 +211,8 @@ class ProcessManager {
   // 这样接管完成后这个进程在 poll()/kill()/退出通知上跟 start() 建的进程完全同构,不用改那些逻辑。
   adopt(child: ChildProcess, command: string, cwd: string, buffered: { stdout: string; stderr: string }): string {
     const id = `proc-${++this.counter}`;
-    const logDir = path.join(cwd, ".dao", "bg", id);
+    const runId = randomUUID();
+    const logDir = path.join(cwd, ".dao", "bg", `${id}-${runId}`);
     mkdirSync(logDir, { recursive: true });
     const stdoutPath = path.join(logDir, "stdout.log");
     const stderrPath = path.join(logDir, "stderr.log");
@@ -189,7 +220,7 @@ class ProcessManager {
     writeFileSync(stdoutPath, buffered.stdout);
     writeFileSync(stderrPath, buffered.stderr);
     const proc: BgProc = {
-      id, command, child, stdoutPath, stderrPath,
+      id, runId, command, child, stdoutPath, stderrPath,
       // offset 从 0 开始,不是引导内容的字节长度:接管前的输出只存在于调用方内存里,没人通过
       // BashOutput 读过它——第一次 poll() 就该把引导内容 + 后续新增内容一起读到,不能让它凭空消失。
       stdoutOffset: 0,
@@ -206,24 +237,26 @@ class ProcessManager {
     // adopt 的子进程用 pipe(不是文件 fd),exit 后 pipe 里可能还有未读完的 data。
     // 用 close(stdio 流完全关闭)而非 exit 标记 exited,确保 poll() 看到 exited 时
     // 文件里已包含全部输出——exit 先触发但 data 事件可能还在 flush pipe 残留。
-    let exitCode: number | null = null;
-    let exitSignal: NodeJS.Signals | null = null;
-    child.on("exit", (code, signal) => {
-      exitCode = code;
-      exitSignal = signal;
+    child.once("error", (error) => {
+      if (proc.notified || this.procs.get(id) !== proc) return;
+      proc.status = "exited"; proc.exitCode = -1; proc.notified = true;
+      appendFileSync(proc.stderrPath, String(error) + "\n");
+      if (!this.listeners.size) this.notifications.push(shellNotificationXml(id, command, -1, null));
+      this.publish(proc, proc.cancelRequested ? "canceled" : "failed");
     });
-    child.on("close", () => {
+    child.on("close", (exitCode, exitSignal) => {
       proc.status = "exited";
       proc.exitCode = exitCode;
       proc.signal = exitSignal;
-      if (!proc.notified && this.procs.has(id)) {
+      if (!proc.notified) {
         proc.notified = true;
-        this.notifications.push(shellNotificationXml(id, command, exitCode, exitSignal));
-        this.notify();
+        if (!this.listeners.size && this.procs.get(id) === proc) this.notifications.push(shellNotificationXml(id, command, exitCode, exitSignal));
+        this.publish(proc, proc.cancelRequested ? "canceled" : exitCode === 0 ? "completed" : "failed");
       }
       this.gcFinished();
     });
     this.procs.set(id, proc);
+    this.publish(proc, "started");
     return id;
   }
 
@@ -250,7 +283,10 @@ class ProcessManager {
   kill(id: string): Promise<string | undefined> {
     const p = this.procs.get(id);
     if (!p) throw new Error(`未知后台进程:${id}`);
+    if (p.status === "exited") return Promise.resolve(undefined);
+    p.cancelRequested = true;
     killTree(p.child, "SIGTERM");
+    this.publish(p, "progress");
     if (!PKG_MGR_TIMEOUT_RE.test(p.command)) return Promise.resolve(undefined);
     return attemptDpkgRecovery().then((fix) =>
       fix.ok
@@ -266,7 +302,12 @@ class ProcessManager {
   }
 
   reset(): void {
-    for (const p of this.procs.values()) killTree(p.child, "SIGKILL");
+    for (const p of this.procs.values()) {
+      if (p.status !== "running") continue;
+      p.cancelRequested = true;
+      killTree(p.child, "SIGKILL");
+      this.publish(p, "progress");
+    }
     this.procs.clear();
     this.counter = 0;
     this.notifications = [];

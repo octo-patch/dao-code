@@ -80,6 +80,7 @@ async function dispatchOne(
     }
     return { role: "tool", tool_call_id: tc.id, content };
   } catch (err) {
+    if (name === "TaskWait") ctx.rollbackTaskWait?.();
     const errMsg = `Error: ${(err as Error).message}`;
     audit(errMsg);
     return { role: "tool", tool_call_id: tc.id, content: errMsg };
@@ -102,6 +103,12 @@ export async function executeToolCalls(
   ctx: ToolContext,
   gate: ApprovalGate,
 ): Promise<ToolMessage[]> {
+  if (toolCalls.length > 1 && toolCalls.some((tc) => tc.function.name === "TaskWait")) {
+    const others = toolCalls.filter((tc) => tc.function.name !== "TaskWait");
+    const completed = others.length ? await executeToolCalls(others, registry, ctx, gate) : [];
+    const byId = new Map(completed.map((m) => [m.tool_call_id, m]));
+    return toolCalls.map((tc) => byId.get(tc.id) ?? rejectMsg(tc, "Error: TaskWait 必须单独调用,本批未登记等待。"));
+  }
   const results = new Map<string, ToolMessage>();
 
   // -1. headless 会话"第一步必须先用 TodoWrite"硬拦截(ctx.todoWriteRequired 字段背景见

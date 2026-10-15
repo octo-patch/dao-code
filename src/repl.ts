@@ -1,8 +1,10 @@
+import type { SessionScheduler } from "./agent/session_scheduler.js";
 import { dispatchCommand } from "./commands/commands.js";
 import type { Session } from "./session/session.js";
 import type { Provider } from "./config/profiles.js";
 
 export interface ReplDeps {
+  scheduler?: SessionScheduler;
   session: Session;
   // 读一行用户输入;EOF 返回 null。
   readLine: () => Promise<string | null>;
@@ -78,7 +80,13 @@ export async function drainAndContinue(deps: DrainAndContinueDeps): Promise<void
 export async function runRepl(deps: ReplDeps): Promise<void> {
   for (;;) {
     const line = await deps.readLine();
-    if (line === null) return; // EOF
+    if (line === null) { await deps.scheduler?.finished(); return; } // EOF
+    if (deps.scheduler && /^\/[a-z]/i.test(line)) {
+      // Mutating commands run only after the active model/tool batch has stopped.
+      deps.scheduler.pause();
+      await deps.scheduler.settled();
+      if (/^\/(clear|resume)\b/.test(line)) deps.scheduler.reset();
+    }
     const cmd = dispatchCommand(line, deps.session, deps.getProvider?.());
     if (cmd.handled) {
       if (cmd.compact) {
@@ -90,6 +98,7 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
       continue;
     }
     if (!line.trim()) continue;
+    if (deps.scheduler) { deps.scheduler.submit(line); continue; }
     if (deps.gateUserPrompt) {
       const up = await deps.gateUserPrompt(line);
       if (up.blocked) { deps.write(`[提交被 hook 阻止] ${up.reason || ""}\n`); continue; }

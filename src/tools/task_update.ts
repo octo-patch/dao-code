@@ -30,6 +30,7 @@ export const taskUpdateTool = defineTool({
   handler: async (args, ctx) => {
     if (!ctx.taskManager) return "当前环境不支持任务追踪。";
     if (!ctx.taskManager.get(args.id)) return `未找到任务 ${args.id}。`;
+    if (args.status && ctx.taskManager.get(args.id)?.kind !== "manual") return "执行任务由运行时结算,请用 TaskStop 请求取消。";
     const ok = ctx.taskManager.update(args.id, { status: args.status, result: args.result, description: args.description });
     if (!ok) return `任务 ${args.id} 已结束,状态不可再改(若本次同时改了 description,那部分已生效)。`;
     return `已更新任务 ${args.id}。`;
