@@ -78,28 +78,17 @@ export function supportsVision(model: string): boolean {
   return VISION_MODELS.has(model);
 }
 
-// 上下文窗口默认值(tok):一律按各厂商官方文档取 1M。唯一例外是自定义网关上的 GLM 系列
-// (见 contextWindowFor 内特判)——网关转发窗口实测受限,保守 200K。
-// 注意:volcengine/qianfan 等官方 coding-plan/token-plan 渠道的 GLM 系列同样按官方 1M,
-// 200K 只适用于自定义网关(OpenAI 兼容代理)场景,不要按模型名一刀切。
+// 上下文窗口默认值(tok):仅 glm-5.2 使用 200K,其他模型使用 1M。
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 
 /**
- * 模型默认上下文窗口(tok)。未显式列出的模型返回 1M。
+ * 模型默认上下文窗口(tok),不区分渠道。仅 glm-5.2 为 200K,其他模型为 1M。
  * 用于初始化 CONTEXT_WINDOW 和 /model 切换时联动(用户手动 /context-window 或
  * DAO_CONTEXT_WINDOW 覆盖时,手动值优先,不随模型切换改变)。
- * 按模型名小写匹配,兼容 GLM-5.3-Flash / glm-5.2 等不同大小写写法。
- * GLM 系列按渠道区分:zhipu/volcengine/qianfan 等官方渠道按智谱官方文档一律 1M;
- * 自定义网关(provider 落盘记 deepseek、baseUrl 非官方端点)按保守 200K——网关实际
- * 转发窗口未知,标 1M 会让压缩永不触发、直接撞网关上限报错。
+ * 模型名忽略大小写;保留可选渠道参数以兼容现有调用。
  */
-export function contextWindowFor(model: string, provider?: Provider, baseUrl?: string): number {
-  const key = model.toLowerCase();
-  // 自定义网关上的 GLM 系列:网关转发窗口未知,保守 200K(0.5.9 实测先例)。
-  if (/^glm-/.test(key) && provider === "deepseek" && baseUrl && baseUrl !== DEFAULTS.deepseek.baseUrl) {
-    return 200_000;
-  }
-  return DEFAULT_CONTEXT_WINDOW;
+export function contextWindowFor(model: string, _provider?: Provider, _baseUrl?: string): number {
+  return model.toLowerCase() === "glm-5.2" ? 200_000 : DEFAULT_CONTEXT_WINDOW;
 }
 
 function isV2(raw: unknown): raw is ProfilesConfig {

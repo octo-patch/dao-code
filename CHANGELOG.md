@@ -13,11 +13,9 @@
   deepseek 系模型)。智能判定分类器/WebFetch 提取/记忆蒸馏非 fork 档的便宜档模型改为
   provider 感知:`glm-5.3` 主模型自动用同族 `glm-5.3-flash`,不再打端点上不存在的
   `deepseek-v4-flash`。
-- **GLM 系列上下文窗口按渠道区分**:`contextWindowFor` 增加可选 `provider`/`baseUrl`
-  参数——zhipu/volcengine/qianfan 等官方渠道的 GLM 系列一律按智谱官方文档取 1M
-  (含 `glm-5.2`,不再按模型名一刀切 200K);自定义网关(provider 落盘记 deepseek、
-  baseUrl 非官方端点)上的 GLM 系列保守取 200K(网关转发窗口未知)。不传 provider
-  的旧调用按 1M。
+- **GLM 上下文窗口调整**:仅 `glm-5.2` 使用 200K(忽略大小写),其他模型统一使用
+  1M,包括自定义网关上的 `GLM-5.3-joybuilder`,不再按渠道限制 GLM 系列窗口。
+  `DAO_CONTEXT_WINDOW` 和 `/context-window` 手动覆盖仍然优先。
 
 ## [0.5.9] - 2026-09-16
 
