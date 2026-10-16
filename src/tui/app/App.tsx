@@ -536,7 +536,8 @@ export function App(deps: AppDeps) {
       if (name === "skills" && !text.trim().split(/\s+/)[1] && deps.listSkills) { openSkillPicker(); return; }
       // /model 无参 → 弹模型选择器(当前 provider 下可选模型);带参(如 /model deepseek-v4-flash)落到 runCommand 文本路径。
       if (name === "model" && !text.trim().split(/\s+/)[1] && deps.listModels) { openModelPicker(); return; }
-      const res = deps.runCommand(full);
+      let res: Awaited<ReturnType<typeof deps.runCommand>>;
+      try {res=await deps.runCommand(full);}catch(error){pushItem({id:nextId(),kind:"notice",text:String(error)});return;}
       if (res.exit) { exit(); return; }
       if (res.compact) {
         const compactingId = nextId();
@@ -715,8 +716,10 @@ export function App(deps: AppDeps) {
   }, [bgShells]);
 
   // 选中会话 → 委派 /resume <id>(载入逻辑在 index),并应用其结果(重置 transcript + 提示)。
-  const loadResume = (id: string) => {
-    const res = deps.runCommand("/resume " + id);
+  const loadResume = async (id: string) => {
+    try {
+    deps.scheduler?.pause(); await deps.scheduler?.settled();
+    const res = await deps.runCommand("/resume " + id);
     if (res.clearTranscript) {
       setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []);
       setStaticKey((k) => k + 1);
@@ -725,6 +728,7 @@ export function App(deps: AppDeps) {
     if (res.resumeItems?.length) for (const it of res.resumeItems) pushItem({ ...it, id: nextId() }); // 重放末段对话
     if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
     setStatus(deps.getStatus());
+    }catch(error){pushItem({id:nextId(),kind:"notice",text:String(error)});}
   };
 
   // 单行输入(复用 ask 覆盖层):粘贴 key / 起名都走它;回车提交,空 = 取消。
@@ -869,9 +873,10 @@ export function App(deps: AppDeps) {
         if (i < 0 || i >= n) return;
         const m = items[i]!.model;
         setModelPick(null);
-        const res = deps.runCommand("/model " + m);
+        void Promise.resolve(deps.runCommand("/model " + m)).then(res=>{
         if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
         setStatus(deps.getStatus());
+        }).catch(error=>pushItem({id:nextId(),kind:"notice",text:String(error)}));
         return;
       }
       return;
@@ -1645,6 +1650,7 @@ export function App(deps: AppDeps) {
         <Text color={c("jade")}>{"  "}{t("ui.modeHint")} {modeHint}</Text>
       ) : null}
       {schedulerStatus?.state === "waiting" ? <Text color={c("gold")}>{t("ui.waitingTasks", schedulerStatus.waiting?.count ?? 0, schedulerStatus.waiting?.mode ?? "any")}</Text> : null}
+      {schedulerStatus?.state === "recovering" ? <Text color={c("gold")}>{t("ui.backgroundRecovering")}</Text> : null}
       {schedulerStatus?.state === "paused" ? <Text color={c("gold")}>{t("ui.backgroundPaused")}</Text> : null}
       {bgRunning > 0 ? <Text color={c("gold")}>{t("ui.bgRunning", bgRunning)}</Text> : null}
       <StatusBar status={status} c={c} bgShells={bgShells} />

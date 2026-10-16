@@ -73,3 +73,12 @@ dao-code 里没有一个模块直接叫"middleware"。这个词借自 AHE 论文
 ## 7. 可观测性旁路(`src/obs/`)
 
 `init.ts`/`backend.ts`/`attrs.ts`/`wrap.ts`,对 Laminar 一类后端做 span 包装:`wrapStreamChat`/`wrapRunTurn`/`wrapToolExec`(`obs/wrap.ts`)分别包一层 LLM 调用、回合、工具执行,记录 token/cache 命中等属性。和上述模块是"旁路观测"关系——不参与控制流决策,只在 loop/execute 外面套一层 span 记录,`isObsOn()` 关闭时零开销直接透传。
+
+
+## 持久执行与恢复边界
+
+`DurableStore` 是 V2 唯一权威存储：工具意图先于 handler 和工具钩子副作用，结果逐工具提交；assistant 的调用消息先保存，崩溃后用已知结果补齐配对，未知操作保留阻塞记录。子代理使用各自 runId 作为工具 scope，可靠检查点不依赖尽力写入的 JSONL。
+
+`recoverBackground` 在启动调度器前获取 owner、装载事件、核实 runner 收据/存活身份、标记进程内代理中断、修复工具配对。只有核实后的等待可以激活；恢复错误和持久化错误均暂停。`BackgroundDelivery` 与 ready TaskWait 的消费 ID 和消息检查点在同一事务中保存，重启不按“最大 seq”跳过尚未投递事件。
+
+Shell runner 的 `manifest.json`、启动许可、不可重复的 `start.claim`、`terminal.json` 和 stdout/stderr 位于会话 runs 目录。控制连接使用随机能力令牌与 ownerEpoch；取消先持久化，再由 runner 观察真实 close 确认。运行时不使用模型轮询或无界重连。

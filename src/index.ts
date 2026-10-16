@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { recoverBackground, repairToolPairs } from "./session/recovery.js";
+import type { SessionStore } from "./session/log.js";
+import { runShellRunner } from "./tools/shell_runner.js";
 import { getBackend } from "./obs/backend.js";
 import { BackgroundRuntime } from "./agent/background_runtime.js";
 import { SessionScheduler } from "./agent/session_scheduler.js";
@@ -1209,10 +1212,10 @@ async function main() {
     // 未信任目录:不加载项目 hooks(hooks 会在事件时执行命令,是最危险的自动执行面)。
     ...(trustProject ? [{ path: path.join(workspaceRoot, ".dao", "hooks.json") }] : []),
   ]);
-  ctx.preToolHook = async (toolName, argsJson) => {
+  ctx.preToolHook = hooks.length ? async (toolName, argsJson) => {
     const o = await runHooks(hooks, "PreToolUse", { cwd: workspaceRoot, toolName, argsJson, payload: { tool: toolName, args: argsJson } });
     return { block: o.block, reason: o.reason, additionalContext: o.additionalContext, permissionDecision: o.permissionDecision, updatedInput: o.updatedInput };
-  };
+  } : undefined;
   ctx.postToolHook = async (toolName, argsJson, result) => {
     await runHooks(hooks, "PostToolUse", { cwd: workspaceRoot, toolName, argsJson, payload: { tool: toolName, args: argsJson, result } });
   };
@@ -1242,6 +1245,47 @@ async function main() {
   ctx.taskManager = taskManager; // TaskCreate/get/list/update/stop 用;同一个实例,不是第二套系统
   const backgroundRuntime = new BackgroundRuntime([taskManager, processManager], workspaceRoot, (name, fields) => getBackend()?.event(name, fields));
   let activeScheduler: SessionScheduler | undefined;
+  let activeStore: SessionStore | undefined;
+  let keepBackgroundOnExit = false;
+  const bindStore = async (store: SessionStore) => {
+    activeStore=store;ctx.durableStore=store.durable;ctx.toolScope="root";
+    if(store.durable?.state() && ctx.todoWriteRequired)ctx.todoWriteRequired.done=true;
+    setObsSession(store.id);cacheSink=createCacheAuditSink(store.dir);memoryAudit=createMemoryAuditSink(store.dir);
+    toolAudit=createToolAuditSink(store.dir);permAudit=createPermAuditSink(store.dir,getMode);skillSink=createSkillAuditSink(store.dir);
+    ctx.toolAudit=toolAudit;ctx.permAudit=permAudit;ctx.memoryAudit=memoryAudit;
+    await recoverBackground(store.durable!,backgroundRuntime,taskManager);
+    store.bindBackground?.(()=>backgroundRuntime.checkpoint());
+    session.messages=repairToolPairs(session.messages,store.durable!);
+    store.saveState({cwd:workspaceRoot,model:session.model,mode:session.mode,title:store.durable?.state()?.title,messages:session.messages,usage:{...session.usage}});
+  };
+  const recoveryCommand = async (line:string):Promise<string|undefined> => {
+    if(!/^\/recovery\b/.test(line))return;
+    const store=activeStore?.durable;if(!store)return "当前会话没有持久恢复存储。";
+    const [,verb,scope,id,...rest]=line.trim().split(/\s+/);
+    const recordDecision=(text:string)=>{
+      session.messages.push({role:"user",content:`[用户恢复决定] ${text}`});
+      activeStore!.saveState({cwd:workspaceRoot,model:session.model,mode:session.mode,title:store.state()?.title,messages:session.messages,usage:{...session.usage}});
+    };
+    if(verb==="resolve") {store.atomic(()=>{store.resolveTool(scope??"",id??"",rest.join(" "));recordDecision(line);});return "已记录核实决定；请发送下一条指令继续。";}
+    if(verb==="decide") {
+      const snapshot=backgroundRuntime.snapshot(scope??"");
+      if(!snapshot||snapshot.status!=="unknown"||!["completed","failed","canceled"].includes(id??"")||!rest.length)return "用法：/recovery decide <待核实 taskId> <completed|failed|canceled> <核实证据>";
+      store.atomic(()=>{store.setLaunch(snapshot.runId,{resolvedByUser:true});
+      backgroundRuntime.publish({type:id as "completed"|"failed"|"canceled",snapshot:{...snapshot,status:id as "completed"|"failed"|"canceled",result:`[用户核实] ${rest.join(" ")}`},eventId:`${snapshot.runId}:user-decision`});recordDecision(line);});
+      return "已记录该任务的核实结果；请发送下一条指令继续。";
+    }
+    if(verb==="continue") {
+      if(!scope||!id)return "用法：/recovery continue <taskId> <继续指令>";
+      if(store.unresolved().length)return "仍有未决操作，请先 /recovery resolve。";
+      recoveryAgentAuthorization=scope;
+      try {return JSON.stringify(await ctx.resumeAgent!(scope,[id,...rest].join(" ")));} finally {recoveryAgentAuthorization=undefined;}
+    }
+    return JSON.stringify({tasks:backgroundRuntime.snapshots(),unresolved:store.unresolved().map(r=>({scope:r.scope,id:r.id,tool:r.name,args:r.args}))},null,2)+"\n核实后：/recovery resolve <scope> <toolCallId> <核实决定>；继续代理：/recovery continue <taskId> <指令>";
+  };
+  let recoveryAgentAuthorization:string|undefined;
+  const preserveStop=()=>{try{backgroundRuntime.setState("paused",true);}catch{}};
+  process.once("SIGTERM",preserveStop);process.once("SIGINT",preserveStop);
+
   ctx.sendToTask = (id: string, message: string) => taskManager.send(id, message);
   // handoff 审查只在 auto 模式触发;用 getter 每次读最新值,/mode 或长任务切换 mode 时自动同步
   Object.defineProperty(ctx, 'permissionMode', { get: () => getMode(), enumerable: true });
@@ -1300,8 +1344,9 @@ async function main() {
   });
   ctx.forkMessages = session.messages;
   ctx.resumeAgent = async (agentId, prompt) => {
+    if(taskManager.get(agentId)?.status === "interrupted" && recoveryAgentAuthorization!==agentId) throw new Error("中断代理须由用户 /recovery continue 明确继续。");
     await resumeAgentBackground({
-      agentId, prompt,
+      agentId, prompt, durableStore:ctx.durableStore,
       subagentsDir: path.join(workspaceRoot, ".dao", "subagents"),
       agentDefs,
       runAgent: ctx.runAgent!,
@@ -1637,7 +1682,10 @@ async function main() {
       // (state.json 全量 messages + cache/tool/perm/memory/skill 各 trace jsonl)——之前这条路径完全没有落盘,
       // eval 只能拿到 stdout 文本,补上后 evals/run.mjs 才能把它跟 pass/fail 一起归档供事后分析。
       const sessionsDir = path.join(workspaceRoot, ".dao", "sessions");
-      const store = createSessionStore(sessionsDir);
+      const previous = continueFlag ? (cliResumeId ? loadState(sessionsDir,cliResumeId) : findResumable(sessionsDir,workspaceRoot)) : null;
+      if(previous) { session.messages=previous.storageVersion===2?previous.messages:sanitizeHistoryForResume(previous.messages); session.setModel(previous.model); session.mode=previous.mode;Object.assign(session.usage,previous.usage); }
+      const store = createSessionStore(sessionsDir,previous?.id,{cwd:workspaceRoot,durable:true});
+      await bindStore(store);
       setObsSession(store.id);
       cacheSink = createCacheAuditSink(store.dir);
       memoryAudit = createMemoryAuditSink(store.dir);
@@ -1659,6 +1707,7 @@ async function main() {
       activeScheduler = new SessionScheduler({ runtime: backgroundRuntime, session, save: argvCheckpoint,
         keepAlive: true, notice: write, user: async () => {},
         run: (signal, boundary) => runOneTurn(argvCheckpoint, signal, boundary) });
+      activeScheduler.recover();
       activeScheduler.submit(argvPrompt);
       await activeScheduler.finished();
       if (activeScheduler.lastError) throw activeScheduler.lastError;
@@ -1698,8 +1747,8 @@ async function main() {
           // 清洗一遍再装载:防止磁盘上的旧历史里混进过半截/非法 JSON 的 tool_call(真实撞见过——
           // 一个跑着旧代码、迟迟没重启的进程把这类坏消息存进了 state.json,续写时原样加载回来,
           // 下一轮请求又会撞上同一个 400 Invalid request body)。
-          session.messages = sanitizeHistoryForResume(prev.messages);
-          if (prev.backgroundWait) session.messages.push({ role: "system", content: "[旧等待未恢复] 上次会话等待的后台执行未被本进程接管,请重新确认任务状态。" });
+          session.messages = prev.storageVersion===2 ? prev.messages : sanitizeHistoryForResume(prev.messages);
+          if (prev.backgroundWait && prev.storageVersion!==2) session.messages.push({ role: "system", content: "[旧等待未恢复] 上次会话等待的后台执行未被本进程接管,请重新确认任务状态。" });
           session.setModel(prev.model);
           session.mode = prev.mode;
           session.usage.promptTokens += prev.usage.promptTokens;
@@ -1715,7 +1764,8 @@ async function main() {
           initialItems = [{ id: 0, kind: "notice", text: `[未找到会话 ${cliResumeId},本次将开始新会话]` }];
         }
       }
-      const store = createSessionStore(sessionsDir, resumeId);
+      let store = createSessionStore(sessionsDir, resumeId, {cwd:workspaceRoot,durable:true});
+      await bindStore(store);
       exitSessionId = store.id; // 记下,退出时给 resume 提示
       setObsSession(store.id); // obs:让 turn span 带上 session id,trace 可按 session 分组/查找
       // 缓存审计:主+子+fork+后台+三工具调用全写进 store.dir/cache.jsonl(常驻静默;DAO_CACHE_AUDIT=0 关)。
@@ -1740,7 +1790,7 @@ async function main() {
       );
       const ckpt = createCheckpointer(workspaceRoot, { enabled: checkpointEnabled });
       const turnCheckpoints: (string | null)[] = []; // 第 k 项 = 第 k 条用户消息【之前】的影子 git 快照 sha,供 /rewind 联动回滚文件
-      let sessionTitle: string | undefined; // /rename 设置
+      let sessionTitle: string | undefined = store.durable?.state()?.title; // /rename 设置
       if (longTask && !continueFlag) session.messages.push({ role: "system", content: lang === "en" ? LONG_TASK_DIRECTIVE_EN : LONG_TASK_DIRECTIVE });
       await injectSessionStart(); // SessionStart 注入(resume 替换后、首个回合前;幂等见 injectSessionStart)
       const persist = () =>
@@ -1818,6 +1868,7 @@ async function main() {
         },
       });
       activeScheduler = scheduler;
+      scheduler.recover();
       await runInkApp({
         welcome,
         skipBanner: firstRun,
@@ -1826,10 +1877,12 @@ async function main() {
         scheduler,
         bindEvents: (events) => { uiEvents = events; },
         submit: async (text) => { scheduler.submit(text); await scheduler.settled(); },
-        runCommand: (line) => {
+        runCommand: async (line) => {
           const name = line.trim().slice(1).split(/\s+/)[0] ?? "";
           // 防御：命令名含 / . 等非法字符（如 /Users/xxx/a.png）-> 不是命令，当普通文本。
           if (!/^[a-zA-Z0-9:_-]+$/.test(name)) return { handled: false };
+          if (name === "quit" && line.includes("--keep-background")) {keepBackgroundOnExit=true;return {handled:true,exit:true};}
+          if(name === "recovery") return {handled:true,output:await recoveryCommand(line)};
           if (name === "clear") scheduler.reset();
           if (name === "skills") {
             const rest = line.trim().split(/\s+/).slice(1);
@@ -2068,19 +2121,24 @@ async function main() {
             if (!id) return { handled: true, output: `历史会话(${metas.length}):\n` + metas.slice(0, 15).map((m) => `  ${m.id}${m.title ?? m.summary ? ` — ${m.title ?? m.summary}` : ""}${m.done ? "" : " ·未完成"}`).join("\n") + "\n用 /resume <会话id> 载入其上下文。" };
             const st = loadState(sessionsDir, id);
             if (!st) return { handled: true, output: `未找到会话:${id}(/resume 看列表)` };
-            // 整盘载入上下文(继续写入当前会话文件,不动原文件);先清洗一遍,防止磁盘上的旧历史
-            // 混进过半截/非法 JSON 的 tool_call(同 --continue/-c 启动时的续写防线)。
-            scheduler.reset();
-            session.messages = sanitizeHistoryForResume(st.messages);
-            if (st.backgroundWait) session.messages.push({ role: "system", content: "[旧等待未恢复] 后台执行未被本进程接管,请重新确认任务状态。" });
-            session.setModel(st.model);
+            // 恢复原会话身份；先保存当前会话，再转移 owner 与运行时。
+            if(id===store.id)return {handled:true,output:"当前已在此会话。"};
+            if(taskManager.running().length)return {handled:true,output:"仍有子代理运行，请先停止后再切换。"};
+            scheduler.pause(); await scheduler.settled(); persist();
+            const next=createSessionStore(sessionsDir,id,{cwd:workspaceRoot,durable:true});
+            processManager.detach(); taskManager.clearRestored();
+            scheduler.reset(); store.close?.(); store=next;
+            session.messages=st.storageVersion===2?st.messages:sanitizeHistoryForResume(st.messages);
+            session.setModel(st.model);session.mode=st.mode;Object.assign(session.usage,st.usage);sessionTitle=st.title;
+            await bindStore(store); exitSessionId=store.id;setObsSession(store.id);
+            persist();scheduler.recover();
             // 重放末段对话作回顾,让用户一眼看到"上次做到哪"(只取文本 user/assistant,末 6 条)。
             const recap = transcriptFromMessages(st.messages);
             const tail = recap.slice(-6);
             const resumeItems: TranscriptItem[] = tail.length
               ? [{ id: 0, kind: "notice", text: `── 会话 ${id} 最近对话(共 ${st.messages.length} 条消息,显示末 ${tail.length} 条)──` }, ...tail]
               : [];
-            return { handled: true, output: `✓ 已载入会话 ${id},继续写入当前会话。${st.backgroundWait ? "旧后台等待未恢复,请重新确认任务状态。" : ""}`, clearTranscript: true, resumeItems };
+            return { handled: true, output: `✓ 已恢复会话 ${id}，继续写入原会话。`, clearTranscript: true, resumeItems };
           }
           if (name === "branch") {
             const label = line.trim().split(/\s+/).slice(1).join(" ");
@@ -2486,8 +2544,8 @@ async function main() {
           // 清洗一遍再装载:防止磁盘上的旧历史里混进过半截/非法 JSON 的 tool_call(真实撞见过——
           // 一个跑着旧代码、迟迟没重启的进程把这类坏消息存进了 state.json,续写时原样加载回来,
           // 下一轮请求又会撞上同一个 400 Invalid request body)。
-          session.messages = sanitizeHistoryForResume(prev.messages);
-          if (prev.backgroundWait) session.messages.push({ role: "system", content: "[旧等待未恢复] 上次会话等待的后台执行未被本进程接管,请重新确认任务状态。" });
+          session.messages = prev.storageVersion===2 ? prev.messages : sanitizeHistoryForResume(prev.messages);
+          if (prev.backgroundWait && prev.storageVersion!==2) session.messages.push({ role: "system", content: "[旧等待未恢复] 上次会话等待的后台执行未被本进程接管,请重新确认任务状态。" });
           session.setModel(prev.model);
           session.mode = prev.mode;
           session.usage.promptTokens += prev.usage.promptTokens;
@@ -2500,7 +2558,8 @@ async function main() {
           write(`[未找到会话 ${cliResumeId},本次将开始新会话]\n`);
         }
       }
-      const store = createSessionStore(sessionsDir, resumeId);
+      let store = createSessionStore(sessionsDir, resumeId, {cwd:workspaceRoot,durable:true});
+      await bindStore(store);
       exitSessionId = store.id;
       setObsSession(store.id); // obs:session id 注入(同交互路径)
       cacheSink = createCacheAuditSink(store.dir);
@@ -2532,7 +2591,26 @@ async function main() {
         run: (signal, boundary) => runOneTurn(persistRepl, signal, boundary),
       });
       activeScheduler = scheduler;
-      await runRepl({ session, readLine, scheduler, runTurn: async () => {}, write, compact: runCompaction, getProvider: () => cfg.provider });
+      scheduler.recover();
+      await runRepl({ session, readLine, scheduler, runTurn: async () => {}, write, compact: runCompaction, getProvider: () => cfg.provider,
+        command: async(line)=>{
+          if(/^\/quit\s+--keep-background\s*$/.test(line)){keepBackgroundOnExit=true;return {handled:true,exit:true};}
+          const recovery=await recoveryCommand(line);if(recovery!==undefined)return {handled:true,output:recovery};
+          if(!/^\/resume\b/.test(line))return {handled:false};
+          const id=line.trim().split(/\s+/)[1];
+          if(!id)return {handled:true,output:listSessions(sessionsDir,workspaceRoot).map(m=>`${m.id} ${m.title??m.summary??""}`).join("\n")};
+          if(id===store.id)return {handled:true,output:"当前已在此会话。"};
+          const st=loadState(sessionsDir,id);if(!st)return {handled:true,output:"未找到会话。"};
+          if(taskManager.running().length)return {handled:true,output:"请先停止运行中的子代理。"};
+          persistRepl();
+          const next=createSessionStore(sessionsDir,id,{cwd:workspaceRoot,durable:true});
+          processManager.detach();taskManager.clearRestored();scheduler.reset();store.close?.();store=next;
+          session.messages=st.storageVersion===2?st.messages:sanitizeHistoryForResume(st.messages);
+          session.setModel(st.model);session.mode=st.mode;Object.assign(session.usage,st.usage);
+          await bindStore(store);exitSessionId=store.id;setObsSession(store.id);persistRepl();scheduler.recover();
+          return {handled:true,output:`已恢复会话 ${id}。`};
+        }
+      });
       if (scheduler.lastError) throw scheduler.lastError;
       scheduler.close();
       persistRepl(); // 干净退出前再存一次(覆盖最后一轮是"纯文本收尾早退"、没触发过 onCheckpoint 的情形)
@@ -2547,14 +2625,18 @@ async function main() {
     // 退出【不再】蒸馏:记忆已在各热回合边界增量捕获;退出时缓存已凉,全量蒸只会撞冷缓存全价。
   } finally {
     activeScheduler?.close();
+    taskManager.cancelAll();
     backgroundRuntime.dispose();
+    if(keepBackgroundOnExit) processManager.detach(); else processManager.reset();
+    activeStore?.close?.();
+    process.removeListener("SIGTERM",preserveStop);process.removeListener("SIGINT",preserveStop);
     closeRl();
   }
 }
 
 // 收尾后显式退出:distill 的 flash HTTP keep-alive socket 等滞留 handle 会让 Node 排不空事件循环、
 // 不自然退出(看起来卡在"✓ 记忆无需更新"那行)。要紧的 await(distill/upsert/mcp.close)都已在 main 内完成。
-main().then(
+(process.argv[2] === "--dao-shell-runner" && process.argv[3] ? runShellRunner(process.argv[3]) : main()).then(
   async () => { await flushObs(); process.exit(0); },
   (err) => {
     console.error("\n" + (err as Error).message);

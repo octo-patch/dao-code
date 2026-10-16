@@ -9,6 +9,7 @@
 - 修复 TaskOutput 在任务结束后重复返回历史消息的问题;取消真实执行先进入 canceling,执行器确认退出后才标记 canceled。
 
 ### 新增
+- **后台任务持久化与恢复(第二期)**：SQLite 事务保存等待、结果投递和逐工具检查点；独立 Shell runner 支持主进程崩溃后的接管与离线结果导入。`-c`、TTY/REPL `/resume` 恢复原会话，暂停与未知结果保持暂停；`/recovery` 核实未决操作并显式继续中断子代理，`/quit --keep-background` 保留后台 Shell。
 - **后台等待与唤醒(第一期)**:主会话通过 `TaskWait(ids, mode=any|all)` 显式等待;TTY、REPL、一次性 CLI 共用事件驱动调度器。普通进度不触发模型请求,完成/失败/attention 在安全边界投递,保存成功后确认消费。支持用户插话、Esc 暂停自动续跑、runId 隔离旧执行及恢复会话时提示旧等待未恢复。
 - **智谱 GLM 编码套餐 provider(`zhipu`)**:OpenAI 兼容直连 Coding 专属端点
   `https://open.bigmodel.cn/api/coding/paas/v4`(协议层零改动,与 volcengine/qianfan 同骨架)。

@@ -25,8 +25,10 @@ globalThis.fetch = async (_url, options) => {
   if (n === 1) {
     delta = { role: 'assistant', tool_calls: [{ index: 0, id: 'plan', type: 'function', function: { name: 'TodoWrite', arguments: JSON.stringify({ todos: [{ content: 'Verify shell completion', status: 'in_progress' }] }) } }, { index: 1, id: 'start', type: 'function', function: { name: 'Bash', arguments: JSON.stringify({ command: 'tee /dev/null < ' + root + '/gate', background: true }) } }] }; finish = 'tool_calls';
   } else if (n === 2) {
-    if (!body.messages.some(m => m.role === 'tool' && String(m.content).includes('proc-1'))) throw new Error('Missing Bash result: ' + JSON.stringify(body.messages.filter(m => m.role === 'tool')));
-    delta = { role: 'assistant', tool_calls: [{ index: 0, id: 'wait', type: 'function', function: { name: 'TaskWait', arguments: JSON.stringify({ ids: ['proc-1'], mode: 'all' }) } }] }; finish = 'tool_calls';
+    const shellResult = body.messages.find(m => m.role === 'tool' && /proc-[a-z0-9]+/.test(String(m.content)));
+    const shellId = String(shellResult?.content).match(/proc-[a-z0-9]+/)?.[0];
+    if (!shellId) throw new Error('Missing Bash result');
+    delta = { role: 'assistant', tool_calls: [{ index: 0, id: 'wait', type: 'function', function: { name: 'TaskWait', arguments: JSON.stringify({ ids: [shellId], mode: 'all' }) } }] }; finish = 'tool_calls';
     setTimeout(() => {
       if (requests !== 2) throw new Error('Model was polled while waiting');
       released = true;

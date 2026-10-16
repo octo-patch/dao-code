@@ -16,6 +16,7 @@ export class BackgroundDelivery {
       })).join("\n") });
     }
     if (!this.staged) return;
+    this.runtime.stageConsumed(this.staged);
     await this.save();
     this.runtime.acknowledge(this.staged);
     this.staged = undefined;

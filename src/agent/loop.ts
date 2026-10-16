@@ -614,6 +614,7 @@ async function runTurnInner(deps: TurnDeps, control?: WaitControl): Promise<Turn
     }
     // 执行仍用原始 assistant/toolCalls(dispatch 报错信息不受影响);落库换成清洗过的版本。
     session.messages.push(sanitizeForHistory(assistant));
+    if (deps.ctx.durableStore && toolCalls.length) await deps.onCheckpoint?.();
     if (toolCalls.length === 0) {
       await deps.onCheckpoint?.();
       return signal?.aborted ? { kind: "interrupted", reason: "user" } : { kind: "completed" }; // 纯文本回合(含被打断只剩 content):直接结束

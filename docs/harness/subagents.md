@@ -78,7 +78,12 @@ interface AgentDef {
 - Esc 暂停自动续跑,保留未消费的结果;新输入恢复。暂停不等于取消后台任务。
 - TaskStop/KillShell 发出取消请求;真实执行先进入 canceling,执行器退出后才确认 canceled。无法取消的 adopt Promise 不伪报停止。
 - TaskUpdate 只允许手动待办改变终态;真实执行由生命周期结算。
-- 恢复转录不会接管旧后台执行。存档记录旧等待提示,恢复时明确要求重新确认状态;本期不支持跨进程执行恢复。
+- V2 会话通过 `dao -c [id]`、TTY/REPL `/resume <id>` 恢复原 sessionId。SQLite WAL/FULL 保存任务、事件、等待和工具检查点；消息追加与事件确认同事务提交。已有活 owner 时拒绝并发恢复。
+- 显式后台 Bash 由独立 runner 执行。DAO 被 SIGKILL 后命令继续，重启可认证接回；离线完成依靠持久终态收据导入，不重跑命令。普通退出/SIGTERM 请求取消；`/quit --keep-background` 保留 runner。Ctrl+B 接管的旧式进程标记 `legacy-adopted`，不承诺跨进程恢复。
+- 有效 waiting 自动恢复；paused、运行中的中断回合、unknown 和未决工具保持暂停。暂停不是终态，不产生自动模型请求。连接断开只做有限次数本地 I/O 重连，耗尽后需核实。
+- 子代理仍在 DAO 进程内执行。崩溃后显示 interrupted，检查点按 run 保存；`/recovery continue <taskId> <指令>` 显式创建新 run。旧运行的工具不自动重放。
+- `/recovery` 展示未决操作和任务。先只读核实，再由用户 `/recovery resolve <scope> <toolCallId> <具体核实决定>` 处理工具结果；未知 Shell 用 `/recovery decide <taskId> <completed|failed|canceled> <证据>`。普通“继续”不解除副作用阻塞。
+- JSON 旧存档只迁移历史，不能接回旧任务；V2 JSON 导出标记为历史快照，SQLite 损坏、版本不兼容不静默回退。新恢复机制支持本地 macOS/Linux，Windows 和网络文件系统不支持。
 
 主要实现位于 `src/agent/background_runtime.ts`、`background_delivery.ts`、`session_scheduler.ts` 和 `src/tools/task_wait.ts`。`--obs` 可记录等待登记/激活/解除、唤醒原因、投递和去重事件,不附带任务正文;Runtime diagnostics 提供请求数、等待期请求数、累计等待时长、队列及订阅数。
 
@@ -91,3 +96,17 @@ node scripts/verify-background-wait.mjs --repl
 ```
 
 CLI 脚本使用脚本化模型响应及真实 Shell/FIFO,验证等待期零请求与一次唤醒,不访问模型服务。真实模型是否遵循 TaskWait 指引需另行回放验收。
+
+
+第二期验收入口（真实进程测试需要本机子进程、文件通知与本地 socket 权限）：
+
+```sh
+npx vitest run src/session/durable_store.test.ts src/tools/managed_shell.test.ts
+node --import tsx scripts/verify-background-recovery.ts
+bun build src/index.ts --compile --outfile /tmp/dao-recovery
+DAO_RECOVERY_TEST_BINARY=/tmp/dao-recovery node --import tsx scripts/verify-background-recovery.ts
+node --import tsx scripts/verify-background-recovery-live.mjs running
+# 其他真实 GLM 场景：offline、all、paused、agent、unknown
+```
+
+真实模型验收脚本使用当前 GLM-5.3-joybuilder 配置，创建隔离临时工作区；记录请求计数、稳定 runId、启动次数和恢复状态，不记录 API 密钥。`running/offline/all` 应正常处理结果，`paused/agent/unknown` 恢复后保持暂停且主模型请求为零。

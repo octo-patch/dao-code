@@ -1,3 +1,5 @@
+import { ManagedShell } from "./managed_shell.js";
+import type { DurableStore } from "../session/durable_store.js";
 import { randomUUID } from "node:crypto";
 import type { ExecutionEvent, ExecutionSnapshot } from "../agent/background_types.js";
 import { spawn, exec, type ChildProcess } from "node:child_process";
@@ -105,6 +107,22 @@ function readNewBytes(filePath: string, offset: number): { text: string; newOffs
 }
 
 class ProcessManager {
+  private durable?: DurableStore;
+  private managed = new Map<string, ManagedShell>();
+  private managedOffsets = new Map<string, {out:number;err:number}>();
+  bindStore(store: DurableStore) { this.durable=store; }
+  private emitManaged = (event: ExecutionEvent) => { for(const cb of this.listeners) cb(event); this.notify(); };
+  async startManaged(command:string,cwd:string) {
+    if(!this.durable) return this.start(command,cwd);
+    const shell=await ManagedShell.start(this.durable,command,cwd,this.emitManaged);
+    this.managed.set(shell.snapshot.taskId,shell);return shell.snapshot.taskId;
+  }
+  async recover(snapshot:ExecutionSnapshot) {
+    if(!this.durable)throw new Error("持久会话未绑定。");
+    const shell=new ManagedShell(this.durable,snapshot,this.emitManaged);this.managed.set(snapshot.taskId,shell);
+    await shell.connect();
+  }
+  detach() { for(const shell of this.managed.values())shell.disconnect(); this.managed.clear();this.managedOffsets.clear();this.durable=undefined; }
   private procs = new Map<string, BgProc>();
   private counter = 0;
   private notifications: string[] = [];
@@ -121,7 +139,7 @@ class ProcessManager {
   }
   private publish(p: BgProc, type: "started" | "progress" | "completed" | "failed" | "canceled") {
     const snapshot: ExecutionSnapshot = { taskId: p.id, runId: p.runId, kind: "shell", background: true,
-      description: p.command, status: p.status === "running" ? (p.cancelRequested ? "canceling" : "running") : (p.cancelRequested ? "canceled" : p.exitCode === 0 ? "completed" : "failed"),
+      recovery:"legacy-adopted", description: p.command, status: p.status === "running" ? (p.cancelRequested ? "canceling" : "running") : (p.cancelRequested ? "canceled" : p.exitCode === 0 ? "completed" : "failed"),
       result: p.status === "exited" ? `exit=${p.exitCode}, signal=${p.signal}; stdout: ${p.stdoutPath}; stderr: ${p.stderrPath}` : undefined };
     for (const cb of this.listeners) cb({ type, snapshot });
     this.notify();
@@ -261,6 +279,14 @@ class ProcessManager {
   }
 
   poll(id: string): PollResult {
+    const managed=this.managed.get(id);
+    if(managed) {
+      if(managed.snapshot.status==="unknown")throw new Error("后台执行状态待核实；请使用 /recovery，不要持续查询结果。");
+      const offset=this.managedOffsets.get(id)??{out:0,err:0};
+      const out=readNewBytes(path.join(managed.dir,"stdout.log"),offset.out),err=readNewBytes(path.join(managed.dir,"stderr.log"),offset.err);
+      this.managedOffsets.set(id,{out:out.newOffset,err:err.newOffset});
+      return {status:["running","canceling"].includes(managed.snapshot.status)?"running":"exited",stdout:out.text,stderr:err.text,exitCode:managed.state?.exitCode??null,signal:managed.state?.signal??null};
+    }
     const p = this.procs.get(id);
     if (!p) throw new Error(`未知后台进程:${id}`);
     const out = readNewBytes(p.stdoutPath, p.stdoutOffset);
@@ -281,6 +307,7 @@ class ProcessManager {
   // 不是 async function,throw 发生在返回 Promise 之前,调用方 expect(() => kill(...)).toThrow()
   // 这类同步断言不受影响。
   kill(id: string): Promise<string | undefined> {
+    const managed=this.managed.get(id);if(managed){managed.cancel();return Promise.resolve(undefined);}
     const p = this.procs.get(id);
     if (!p) throw new Error(`未知后台进程:${id}`);
     if (p.status === "exited") return Promise.resolve(undefined);
@@ -296,12 +323,14 @@ class ProcessManager {
   }
 
   runningCount(): number {
-    let n = 0;
+    let n = [...this.managed.values()].filter(s=>["running","canceling"].includes(s.snapshot.status)).length;
     for (const p of this.procs.values()) if (p.status === "running") n++;
     return n;
   }
 
   reset(): void {
+    for(const shell of this.managed.values()) { try {shell.cancel();} catch {} shell.disconnect(); }
+    this.managed.clear();this.managedOffsets.clear();
     for (const p of this.procs.values()) {
       if (p.status !== "running") continue;
       p.cancelRequested = true;

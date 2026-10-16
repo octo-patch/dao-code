@@ -79,7 +79,7 @@ Dao Code(命令 `dao`)是终端原生的 AI 编码助手:在你的终端里读�
 
 ### 🪢 长任务稳健
 
-会话日志 + 崩溃恢复(`dao -c`);**影子 git 检查点**(`/restore` `/rewind`,独立快照、不碰你的 `.git`);todo 穿越压缩防目标漂移;DoD 验收(`/dod` + `verify_done`);卡死检测止损;并行 / 后台 / worktree 隔离子代理 + 子↔父双向通信;`--goal` 长任务自主模式。
+会话日志 + 崩溃恢复(`dao -c`，支持后台 Shell 接回、离线结果导入、持久等待；`/recovery` 核实未知结果);**影子 git 检查点**(`/restore` `/rewind`,独立快照、不碰你的 `.git`);todo 穿越压缩防目标漂移;DoD 验收(`/dod` + `verify_done`);卡死检测止损;并行 / 后台 / worktree 隔离子代理 + 子↔父双向通信;`--goal` 长任务自主模式。
 
 ### 🎐 道家美学的终端体验
 

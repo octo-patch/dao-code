@@ -1,3 +1,5 @@
+import type { DurableStore } from "../session/durable_store.js";
+import { repairToolPairs } from "../session/recovery.js";
 // src/agent/resume_agent.ts
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -57,11 +59,13 @@ export function filterIncompleteToolCalls(messages: ChatMessage[]): ChatMessage[
 
 /** 恢复已结束的子代理(参考 resumeAgentBackground) */
 export async function resumeAgentBackground(opts: {
+  durableStore?: DurableStore;
   agentId: string;
   prompt: string;
   subagentsDir: string;
   agentDefs: AgentDef[];
   runAgent: (params: {
+    model?: string;
     agentDef: AgentDef;
     promptMessages: ChatMessage[];
     isAsync: boolean;
@@ -75,12 +79,19 @@ export async function resumeAgentBackground(opts: {
   messageParent?: (agentId: string, text: string, kind: import("./background_types.js").MessageKind | undefined, runId: string | undefined) => void;
 }): Promise<{ agentId: string; description: string; outputFile: string }> {
   const { agentId, prompt, subagentsDir, agentDefs, taskManager } = opts;
-  const [transcript, meta] = await Promise.all([getAgentTranscript(subagentsDir, agentId), readAgentMetadata(subagentsDir, agentId)]);
+  const saved=opts.durableStore?.agents().filter(a=>a.taskId===agentId).at(-1);
+  if(opts.durableStore && !saved)throw new Error("缺少持久代理检查点，不能自动使用旧转录恢复。");
+  const [transcript, meta] = saved ? [{messages:saved.messages},saved.metadata as {agentType:string;description?:string;worktreePath?:string;model?:string}] : await Promise.all([getAgentTranscript(subagentsDir, agentId), readAgentMetadata(subagentsDir, agentId)]);
+  if(saved) {
+    if(!meta?.model||!meta.agentType||!agentDefs.some(a=>a.agentType===meta.agentType))throw new Error("原代理定义或模型信息缺失，恢复已停止。");
+    if(meta.worktreePath)await fs.access(meta.worktreePath);
+    if(opts.durableStore!.unresolved().length)throw new Error("存在未决操作，须先明确核实决定。");
+  }
   if (!transcript) throw new Error(`未找到子代理转录:${agentId}`);
   if (meta?.agentType && ONE_SHOT_AGENT_TYPES.has(meta.agentType)) {
     throw new Error(`${meta.agentType} 是一次性 agent,不支持恢复。`);
   }
-  const resumedMessages = filterIncompleteToolCalls(transcript.messages);
+  const resumedMessages = saved ? repairToolPairs(transcript.messages,opts.durableStore!,saved.runId) : filterIncompleteToolCalls(transcript.messages);
   const { GENERAL_PURPOSE_AGENT } = await import("./bundled_agents.js");
   const agentDef = meta?.agentType ? (agentDefs.find((a) => a.agentType === meta.agentType) ?? GENERAL_PURPOSE_AGENT) : GENERAL_PURPOSE_AGENT;
   const promptMessages: ChatMessage[] = [...resumedMessages, { role: "user", content: prompt }];
@@ -97,6 +108,7 @@ export async function resumeAgentBackground(opts: {
     model: meta?.model ?? "deepseek-v4-pro",
     makeStream: (onCacheSafeParams) => opts.runAgent({
       agentDef,
+      model: meta?.model,
       promptMessages,
       isAsync: true,
       override: { abortController: bgTask.abortController, agentId },

@@ -1,4 +1,4 @@
-export type ExecutionStatus = "running" | "canceling" | "completed" | "failed" | "canceled";
+export type ExecutionStatus = "running" | "canceling" | "completed" | "failed" | "canceled" | "interrupted" | "unknown";
 export type MessageKind = "progress" | "attention";
 export interface ExecutionSnapshot {
   taskId: string;
@@ -8,13 +8,16 @@ export interface ExecutionSnapshot {
   description: string;
   status: ExecutionStatus;
   result?: string;
+  recovery?: "runner" | "in-process" | "legacy-adopted";
+  runnerDir?: string;
   progress?: string;
 }
 export interface ExecutionEvent {
-  type: "started" | "progress" | "completed" | "failed" | "canceled" | "message";
+  type: "started" | "progress" | "completed" | "failed" | "canceled" | "message" | "interrupted" | "unknown";
   snapshot: ExecutionSnapshot;
   message?: string;
   requiresAttention?: boolean;
+  eventId?: string;
 }
 export interface BackgroundEvent extends ExecutionEvent {
   sessionId: string;
@@ -34,8 +37,8 @@ export type TurnOutcome =
   | { kind: "waiting"; wait: WaitHandle }
   | { kind: "interrupted"; reason: "user" | "shutdown" }
   | { kind: "failed"; error: Error };
-export type SessionState = "idle" | "running" | "waiting" | "paused" | "closed";
-export const isTerminal = (status: ExecutionStatus) => status !== "running" && status !== "canceling";
+export type SessionState = "idle" | "running" | "waiting" | "paused" | "closed" | "recovering";
+export const isTerminal = (status: ExecutionStatus) => ["completed", "failed", "canceled", "interrupted"].includes(status);
 export interface ExecutionSource {
   subscribe(listener: (event: ExecutionEvent) => void): () => void;
 }

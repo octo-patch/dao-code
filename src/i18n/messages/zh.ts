@@ -57,6 +57,7 @@ export const zh: Record<string, string> = {
   "ui.hint.ctrlcExit": "再按一次 Ctrl+C 退出",
   "ui.modeHint": "权限模式 →",
   "ui.waitingTasks": "⏳ 等待 {0} 个后台任务 ({1}),完成后自动继续;Esc 暂停自动续跑",
+  "ui.backgroundRecovering": "恢复核实中，请稍候",
   "ui.backgroundPaused": "⏸ 自动续跑已暂停;后台任务仍可运行,输入新消息继续",
   "ui.bgRunning": "∞ {0} 个后台任务运行中…",
   "ui.status.longTask": "∞ 长任务 · ",

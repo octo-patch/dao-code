@@ -30,8 +30,25 @@ export class SessionScheduler {
   lastError?: Error;
   readonly counters = { runCalls: 0, failures: 0 };
   constructor(private deps: SchedulerDeps) {
+    if(deps.runtime.store) this.state="recovering";
     this.delivery = new BackgroundDelivery(deps.session, deps.runtime, deps.save);
-    this.unsubscribe = deps.runtime.subscribe(() => { this.notify(); this.schedule(); });
+    this.unsubscribe = deps.runtime.subscribe(() => {
+      if(deps.runtime.fault){this.pause();this.lastError=deps.runtime.fault;deps.notice?.(`[持久化失败，已暂停] ${this.lastError.message}`);}
+      this.notify(); this.schedule();
+    });
+  }
+  recover() {
+    this.state="recovering";
+    const b=this.deps.runtime.store?.background();
+    if(!b) {this.state="idle";this.notify();return;}
+    const unsafe=this.deps.runtime.snapshots().some(s=>s.status==="unknown"||s.status==="interrupted") || !!this.deps.runtime.store?.unresolved().length;
+    if(b.state==="waiting" && b.wait && !unsafe) {
+      this.wait=b.wait;
+      try {this.deps.runtime.ready(b.wait);this.state="waiting";this.deps.runtime.activate(b.wait);}
+      catch(error){this.state="paused";this.deps.notice?.(`[等待恢复失败] ${String(error)}`);}
+    } else this.state=b.state==="paused"||b.state==="running"||unsafe||this.deps.runtime.events().length?"paused":"idle";
+    if(this.state==="paused") {this.wait??=b.wait;this.release();this.deps.runtime.setState("paused",true);this.deps.notice?.("[恢复已暂停] 请查看任务和未决操作后明确继续。\n");}
+    this.notify();this.schedule();
   }
   status(): SchedulerStatus { return { state: this.state, waiting: this.wait ? { count: this.wait.targets.length, mode: this.wait.mode } : undefined, runningTasks: this.deps.runtime.running().length }; }
   subscribe(cb: (status: SchedulerStatus) => void) { this.listeners.add(cb); cb(this.status()); return () => { this.listeners.delete(cb); }; }
@@ -45,18 +62,22 @@ export class SessionScheduler {
     if (!this.active || this.state === "paused") this.state = "idle";
     this.schedule();
   }
-  pause() {
+  pause(persist = true) {
     if (this.state === "closed") return;
-    this.state = "paused"; this.inputs = []; this.release(); this.controller?.abort(); this.notify();
+    this.state = "paused"; this.inputs = []; this.release(); this.controller?.abort();
+    this.deps.runtime.setState("paused");
+    if(persist) {try {this.deps.runtime.setState("paused",true);} catch(error) {this.lastError=error as Error;this.deps.notice?.(`[暂停未能保存] ${this.lastError.message}`);}}
+    this.notify();
   }
-  reset() { this.pause(); this.epoch++; this.deps.runtime.reset(); this.delivery.reset(); this.lastError = undefined; this.state = "idle"; this.notify(); }
+  reset() { this.pause(); this.epoch++; if(!this.deps.runtime.store)this.deps.runtime.reset(); this.delivery.reset(); this.lastError = undefined; this.state = "idle"; this.notify(); }
   close() {
     if (this.state === "closed") return;
-    this.pause(); this.state = "closed"; this.unsubscribe(); this.deps.runtime.dispose(); this.notify();
+    this.controller?.abort(); this.inputs=[]; this.state = "closed"; this.unsubscribe(); this.deps.runtime.dispose(); this.notify();
     if (!this.active) this.listeners.clear();
   }
   private canRun() {
-    if (this.state === "paused" || this.state === "closed") return false;
+    if (this.state === "paused" || this.state === "closed" || this.state === "recovering") return false;
+    if(this.deps.runtime.fault) return true;
     if (this.inputs.length) return true;
     if (this.wait) return this.deps.runtime.ready(this.wait);
     return this.deps.runtime.events().length > 0;
@@ -87,11 +108,16 @@ export class SessionScheduler {
   }
   private async pump() {
     if (this.active || !this.canRun()) return;
+    if(!this.inputs.length && (this.deps.runtime.snapshots().some(s=>s.status==="unknown"||s.status==="interrupted") || this.deps.runtime.store?.unresolved().length)) {
+      this.pause(); this.deps.notice?.("[恢复需核实] 后台执行或工具结果不确定，请用 /recovery 查看。\n");return;
+    }
     this.active = true;
     const epoch = this.epoch;
     this.release(); this.state = "running";
     this.controller = new AbortController(); this.notify();
     try {
+      if(this.deps.runtime.fault)throw this.deps.runtime.fault;
+      this.deps.runtime.setState("running");
       const work = await this.boundary();
       const result = this.controller.signal.aborted ? { kind: "interrupted" as const, reason: "user" as const } : !work ? { kind: "completed" as const } : await this.run();
       if (epoch !== this.epoch || this.status().state === "closed" || this.status().state === "paused") {
@@ -100,9 +126,9 @@ export class SessionScheduler {
       }
       if (result.kind === "failed") throw result.error;
       if (result.kind === "interrupted") this.state = this.inputs.length ? "idle" : "paused";
-      else if (result.kind === "waiting") { this.wait = result.wait; this.state = "waiting"; this.deps.runtime.activate(result.wait); }
+      else if (result.kind === "waiting") { this.wait = result.wait; this.state = "waiting"; this.deps.runtime.setState("waiting"); this.deps.runtime.activate(result.wait); }
       else {
-        this.state = "idle";
+        this.state = "idle";this.deps.runtime.setState("idle",true);
         const running = this.deps.runtime.running();
         if (this.deps.keepAlive && running.length) {
           this.wait = this.deps.runtime.prepare({ ids: running.slice(0, 32).map((s) => s.taskId), mode: "any" }).handle;
@@ -116,7 +142,7 @@ export class SessionScheduler {
       if (epoch !== this.epoch || this.status().state === "closed") return;
       this.counters.failures++;
       this.release(); this.lastError = error instanceof Error ? error : new Error(String(error));
-      if (this.status().state !== "closed") { this.state = "paused"; this.deps.notice?.(`[会话已暂停] ${this.lastError.message}`); }
+      if (this.status().state !== "closed") { this.state = "paused"; try {this.deps.runtime.setState("paused",true);}catch{} this.deps.notice?.(`[会话已暂停] ${this.lastError.message}`); }
     } finally {
       this.active = false; this.controller = undefined; this.schedule(); this.notify();
       if (this.status().state === "closed") this.listeners.clear();

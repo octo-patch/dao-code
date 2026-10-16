@@ -2,7 +2,7 @@
 // <task-notification> 入队,主循环在后续回合注入给模型(CC 的异步任务 + 消息队列模型)。
 
 import { randomUUID } from "node:crypto";
-import { isTerminal, type ExecutionEvent, type MessageKind } from "./background_types.js";
+import { isTerminal, type ExecutionEvent, type ExecutionSnapshot, type ExecutionStatus, type MessageKind } from "./background_types.js";
 import type { ChatMessage } from "../client/types.js";
 
 export interface BgTask {
@@ -10,7 +10,7 @@ export interface BgTask {
   runId: string;
   kind: "manual" | "agent" | "promise";
   description: string;
-  status: "running" | "canceling" | "completed" | "failed" | "canceled";
+  status: ExecutionStatus;
   result?: string;
   error?: string;
   startedAt: number;
@@ -23,6 +23,8 @@ export interface BgTask {
 }
 
 export interface TaskManager {
+  restore(snapshot: ExecutionSnapshot, messages?: ChatMessage[]): void;
+  clearRestored(): void;
   // 后台启动一个任务(run 收到 signal 与自身 id),立即返回 task id。
   launch(description: string, run: (signal: AbortSignal, id: string) => Promise<string>): string;
   // 接管一个已在运行的 promise,交给 TaskManager 追踪:完成/失败时入队通知。不可取消。
@@ -162,6 +164,8 @@ export function createTaskManager(): TaskManager {
   };
 
   return {
+    clearRestored() { if(controllers.size) throw new Error("仍有子代理运行，不能切换会话。"); tasks.clear();pending.clear();notifications.length=0; },
+    restore(s,messages) { tasks.set(s.taskId,{id:s.taskId,runId:s.runId,kind:"agent",description:s.description,status:s.status,result:s.result,background:true,startedAt:Date.now(),messages}); },
     launch(description, run) {
       const id = `task-${++counter}`;
       const ac = new AbortController();

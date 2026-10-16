@@ -374,7 +374,7 @@ export const execShellTool = defineTool({
       // python-inline 小文件拦截提前返回、命令根本没跑,那种情况不该白白备份一次)。
       const dbBackupNotice = backupDbFilesBeforeExec(args.command, ctx.cwd ?? ctx.workspaceRoot);
       ctx.pendingUnverifiedWrites?.clear(); // 真实发起了一次执行——不判定是否针对某个具体文件,任何一次执行都算已有反馈
-      const id = processManager.start(args.command, (ctx.cwd ?? ctx.workspaceRoot));
+      const id = await processManager.startManaged(args.command, (ctx.cwd ?? ctx.workspaceRoot));
       const started = `已在后台启动(id=${id})。进程完成后会自动通知你--先做其他独立工作,无独立工作时主会话单独调用 TaskWait 等待此 id。BashOutput 仅用于具体进度查询。`;
       return dbBackupNotice ? `${dbBackupNotice}\n${started}` : started;
     }

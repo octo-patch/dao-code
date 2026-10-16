@@ -54,7 +54,7 @@ export interface AppDeps {
   // 跑一个用户回合:由 index 绑定真实 session/registry/gate;App 提供 events(喂 state)与 signal(ESC 取消)。
   submit: (text: string | ContentPart[], hooks: { events: TurnEvents; signal: AbortSignal }) => Promise<void>;
   // 斜杠命令(/model /plan /clear /compact /help /exit;以及自定义命令展开成 prompt)。
-  runCommand: (line: string) => { handled: boolean; output?: string; exit?: boolean; compact?: boolean; prompt?: string; clearTranscript?: boolean; resumeItems?: TranscriptItem[] };
+  runCommand: (line: string) => { handled: boolean; output?: string; exit?: boolean; compact?: boolean; prompt?: string; clearTranscript?: boolean; resumeItems?: TranscriptItem[] } | Promise<{ handled: boolean; output?: string; exit?: boolean; compact?: boolean; prompt?: string; clearTranscript?: boolean; resumeItems?: TranscriptItem[] }>;
   compact: () => Promise<{ before: number; after: number }>;
   getStatus: () => StatusInfo;
   // verbose/debug 模式:展示工具原样参数、工具结果全量、思考全量(默认显意图 + 截断)。

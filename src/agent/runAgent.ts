@@ -415,9 +415,13 @@ ${skill.body}` });
 
   // 子代理 ToolContext:独立 readFiles/readMeta(不污染父);worktreePath 存在时覆盖工作区根
   const subDepth = (toolUseContext.subagentDepth ?? 0) + 1;
+  const durableRunId = toolUseContext.taskManager?.get(agentId)?.runId ?? agentId;
+  const saveAgent = () => toolUseContext.durableStore?.saveAgent({taskId:agentId,runId:durableRunId,messages:sub.messages,metadata:{agentType:agentDef.agentType,description,worktreePath,model:resolvedModel}});
+  saveAgent();
   const subCtx: ToolContext = {
     ...toolUseContext,
     subagentDepth: subDepth,
+    toolScope: durableRunId,
     readFiles: new Set<string>(),
     readMeta: new Map<string, { mtime: number; size: number }>(),
     pendingUnverifiedWrites: new Set<string>(),
@@ -455,6 +459,7 @@ ${skill.body}` });
       const runTurnPromise = (async () => {
         const outcome = await runTurn({
           session: sub,
+          onCheckpoint: saveAgent,
           config,
           registry: resolvedTools,
           ctx: subCtx,

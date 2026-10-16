@@ -1,3 +1,4 @@
+import { toolExecution } from "../session/tool_execution.js";
 import type { ToolCall, ToolMessage } from "../client/types.js";
 import type { Capability, ToolContext } from "./types.js";
 import type { ToolRegistry } from "./registry.js";
@@ -46,7 +47,7 @@ function applyUpdatedInput(argsJson: string, outcome: PreHookOutcome | undefined
   return outcome?.updatedInput ? JSON.stringify(outcome.updatedInput) : argsJson;
 }
 
-async function dispatchOne(
+async function dispatchUnjournaled(
   tc: ToolCall,
   registry: ToolRegistry,
   ctx: ToolContext,
@@ -85,6 +86,17 @@ async function dispatchOne(
     audit(errMsg);
     return { role: "tool", tool_call_id: tc.id, content: errMsg };
   }
+}
+
+async function dispatchOne(tc: ToolCall, registry: ToolRegistry, ctx: ToolContext, preOutcome?: PreHookOutcome, effectiveArgs?: string): Promise<ToolMessage> {
+  const store=ctx.durableStore;
+  if(!store)return dispatchUnjournaled(tc,registry,ctx,preOutcome,effectiveArgs);
+  const scope=ctx.toolScope??"root";
+  const cached=store.beforeTool({scope,id:tc.id,name:tc.function.name,args:effectiveArgs??tc.function.arguments},registry.get(tc.function.name)?.capability!=="read");
+  if(cached)return cached;
+  const result=await toolExecution.run({scope,id:tc.id},()=>dispatchUnjournaled(tc,registry,ctx,preOutcome,effectiveArgs));
+  store.afterTool(scope,tc.id,result);
+  return result;
 }
 
 const rejectMsg = (tc: ToolCall, content: string): ToolMessage => ({
@@ -132,7 +144,16 @@ export async function executeToolCalls(
   const preHooks = new Map<string, PreHookOutcome>();
   const effArgs = new Map<string, string>(); // tc.id → updatedInput apply 后的最终入参
   for (const tc of runnable) {
-    const outcome = ctx.preToolHook ? await ctx.preToolHook(tc.function.name, tc.function.arguments) : undefined;
+    let outcome: PreHookOutcome | undefined;
+    if(ctx.preToolHook) {
+      const store=ctx.durableStore,scope=ctx.toolScope??"root",id=`${tc.id}:prehook`;
+      const cached=store?.beforeTool({scope,id,name:`PreToolUse:${tc.function.name}`,args:tc.function.arguments},true);
+      if(cached)outcome=JSON.parse(String(cached.content));
+      else {
+        outcome=await ctx.preToolHook(tc.function.name,tc.function.arguments);
+        store?.afterTool(scope,id,{role:"tool",tool_call_id:id,content:JSON.stringify(outcome??{})});
+      }
+    }
     if (outcome) preHooks.set(tc.id, outcome);
     effArgs.set(tc.id, applyUpdatedInput(tc.function.arguments, outcome));
   }

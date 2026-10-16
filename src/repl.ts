@@ -4,6 +4,7 @@ import type { Session } from "./session/session.js";
 import type { Provider } from "./config/profiles.js";
 
 export interface ReplDeps {
+  command?: (line:string)=>Promise<{handled:boolean;output?:string;exit?:boolean}>;
   scheduler?: SessionScheduler;
   session: Session;
   // 读一行用户输入;EOF 返回 null。
@@ -85,11 +86,13 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
       // Mutating commands run only after the active model/tool batch has stopped.
       deps.scheduler.pause();
       await deps.scheduler.settled();
-      if (/^\/(clear|resume)\b/.test(line)) deps.scheduler.reset();
+      if (/^\/clear\b/.test(line)) deps.scheduler.reset();
     }
-    const cmd = dispatchCommand(line, deps.session, deps.getProvider?.());
+    let custom: Awaited<ReturnType<NonNullable<ReplDeps["command"]>>> | undefined;
+    try {custom=await deps.command?.(line);}catch(error){deps.write(String(error)+"\n");continue;}
+    const cmd = custom?.handled ? custom : dispatchCommand(line, deps.session, deps.getProvider?.());
     if (cmd.handled) {
-      if (cmd.compact) {
+      if ("compact" in cmd && cmd.compact) {
         await deps.compact();
         continue;
       }

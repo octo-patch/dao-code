@@ -8,6 +8,8 @@ export type Capability = "read" | "write" | "exec" | "network" | "plan";
 export type Approval = "auto" | "suggest" | "required";
 
 export interface ToolContext {
+  durableStore?: import("../session/durable_store.js").DurableStore;
+  toolScope?: string;
   rollbackTaskWait?: () => void;
   requestTaskWait?: (request: import("../agent/background_types.js").WaitRequest) => string;
   // 项目身份根目录:memory/MCP/LSP/skills/settings/审计日志 等子系统都按它定位,启动时定一次,
