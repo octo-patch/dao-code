@@ -239,7 +239,7 @@ export const agentTool = defineTool({
 
       const promptMessages: ChatMessage[] = fork ? [] : [{ role: "user", content: t }];
       const forkContextMessages = fork
-        ? buildForkContextMessages(ctx.forkMessages ?? [], `[fork 子任务:只做这件事并返回结论,不要改动主任务状态] ${t}`)
+        ? buildForkContextMessages(ctx.getForkMessages?.() ?? ctx.forkMessages ?? [], `[fork 子任务:只做这件事并返回结论,不要改动主任务状态] ${t}`)
         : undefined;
       const resolvedModelForDisplay = reqModel ?? agentDef.model ?? "deepseek-v4-pro";
       const isBuiltInAgent = agentDef.source === "built-in";

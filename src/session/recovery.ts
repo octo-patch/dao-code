@@ -4,8 +4,9 @@ import type { TaskManager } from "../agent/tasks.js";
 import type { DurableStore } from "./durable_store.js";
 import { processManager } from "../tools/process_manager.js";
 /** Preserve the assistant and every known result; missing outcomes are explicit, never replayed. */
-export function repairToolPairs(messages: ChatMessage[], store: DurableStore, scope = "root"): ChatMessage[] {
-    const records = new Map(store.toolRecords().filter(r => r.scope === scope).map(r => [r.id, r]));
+export function repairToolPairs(messages: ChatMessage[], store?: DurableStore, scope = "root"): ChatMessage[] {
+    // Without a readable journal, absence of a record cannot prove non-execution.
+    const records = new Map((store?.toolRecords() ?? []).filter(r => r.scope === scope).map(r => [r.id, r]));
     const out: ChatMessage[] = [];
     for (let i = 0; i < messages.length; i++) {
         const m = messages[i]!;
@@ -20,7 +21,7 @@ export function repairToolPairs(messages: ChatMessage[], store: DurableStore, sc
         }
         for (const call of m.tool_calls) {
             const record = records.get(call.id);
-            out.push(results.get(call.id) ?? record?.result ?? { role: "tool", tool_call_id: call.id, content: record ? "[恢复：结果未知] 操作可能已执行；必须先核实，禁止自动重试。" : "[恢复：未执行] 此工具没有执行意图记录，未自动重放。" });
+            out.push(results.get(call.id) ?? record?.result ?? { role: "tool", tool_call_id: call.id, content: record || !store ? "[恢复：结果未知] 操作可能已执行；必须先核实，禁止自动重试。" : "[恢复：未执行] 此工具没有执行意图记录，未自动重放。" });
         }
     }
     return out;

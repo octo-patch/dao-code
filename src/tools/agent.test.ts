@@ -75,6 +75,21 @@ function mkCtx(over: Record<string, unknown> = {}) {
 }
 
 describe("agent tool", () => {
+  it("fork reads the current parent history after its message array is replaced", async () => {
+    const { Session } = await import("../session/session.js");
+    const session = new Session("SYS", "m");
+    const { fn, calls } = fakeRunAgent("OK");
+    const ctx = mkCtx({ runAgent: fn, forkMessages: session.messages, getForkMessages: () => session.messages });
+    session.messages = [{ role: "system", content: "restored system" }, { role: "user", content: "restored task" }];
+    session.addUser("latest constraint");
+    await agentTool.handler({ task: "verify", fork: true }, ctx);
+    expect(calls[0].forkContextMessages.slice(0, 3)).toEqual(session.messages);
+    session.clear(); session.addUser("new task");
+    await agentTool.handler({ task: "verify again", fork: true }, ctx);
+    expect(calls[1].forkContextMessages.slice(0, 2)).toEqual(session.messages);
+    expect(JSON.stringify(calls[1].forkContextMessages)).not.toContain("restored task");
+  });
+
   it("declares plan capability and auto approval", () => {
     expect(agentTool.capability).toBe("plan");
     expect(agentTool.approval).toBe("auto");

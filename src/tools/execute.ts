@@ -239,13 +239,22 @@ export async function executeToolCalls(
     const group = batch;
     batch = [];
     let i = 0;
+    let failed = false;
     const worker = async () => {
-      while (i < group.length) {
+      while (!failed && i < group.length) {
         const tc = group[i++]!;
-        results.set(tc.id, await dispatchOne(tc, registry, ctx, preHooks.get(tc.id), effArgs.get(tc.id)));
+        try {
+          results.set(tc.id, await dispatchOne(tc, registry, ctx, preHooks.get(tc.id), effArgs.get(tc.id)));
+        } catch (error) {
+          failed = true;
+          throw error;
+        }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENCY, group.length) }, worker));
+    // Finish in-flight tools before the caller repairs history and pauses the turn.
+    const settled = await Promise.allSettled(Array.from({ length: Math.min(MAX_CONCURRENCY, group.length) }, worker));
+    const failure = settled.find((r) => r.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   };
   for (const tc of toolCalls) {
     if (!toRun.has(tc.id)) continue; // deny / 被拒的已有结果

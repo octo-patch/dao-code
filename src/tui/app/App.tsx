@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { commandNeedsPause } from "../../commands/scheduling.js";
 import { Box, Text, Static, useApp, useInput, usePaste, useStdout } from "ink";
 import { highlight } from "cli-highlight";
 import { promises as fs } from "node:fs";
@@ -466,9 +467,11 @@ export function App(deps: AppDeps) {
     // 内容直接落到下面当普通文本发送,让模型看到原文自己判断,而不是被命令分发拦在半路报错。
     const looksLikeSlashCommand = /^\/[^\s/]+(\s|$)/.test(text);
     if (typeof full === "string" && looksLikeSlashCommand) {
-      // Commands may replace/compact history; prevent background delivery during their awaits.
-      deps.scheduler?.pause();
-      await deps.scheduler?.settled();
+      // Only commands that may mutate execution/history need to stop the turn.
+      if (commandNeedsPause(full)) {
+        deps.scheduler?.pause();
+        await deps.scheduler?.settled();
+      }
       const name = text.slice(1).split(/\s+/)[0];
       if (name === "theme") {
         const next = bg === "dark" ? "light" : "dark";

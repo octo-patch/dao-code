@@ -1,5 +1,6 @@
 import type { SessionScheduler } from "./agent/session_scheduler.js";
 import { dispatchCommand } from "./commands/commands.js";
+import { commandNeedsPause } from "./commands/scheduling.js";
 import type { Session } from "./session/session.js";
 import type { Provider } from "./config/profiles.js";
 
@@ -82,7 +83,7 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
   for (;;) {
     const line = await deps.readLine();
     if (line === null) { await deps.scheduler?.finished(); return; } // EOF
-    if (deps.scheduler && /^\/[a-z]/i.test(line)) {
+    if (deps.scheduler && commandNeedsPause(line)) {
       // Mutating commands run only after the active model/tool batch has stopped.
       deps.scheduler.pause();
       await deps.scheduler.settled();

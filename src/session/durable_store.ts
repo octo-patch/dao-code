@@ -206,9 +206,9 @@ export class DurableStore {
     }
     toolRecords(): ToolRecord[] { return this.db.prepare("SELECT json FROM tools").all().map(r => decode<ToolRecord>(r)!); }
     unresolved() { return this.toolRecords().filter(r => r.state === "outcome_unknown"); }
-    markInterruptedTools() {
+    markInterruptedTools(scope?: string) {
         this.atomic(() => { for (const r of this.toolRecords())
-            if (r.state === "started")
+            if (r.state === "started" && (scope === undefined || r.scope === scope))
                 this.db.prepare("UPDATE tools SET json=? WHERE scope=? AND id=?").run(JSON.stringify({ ...r, state: "outcome_unknown" }), r.scope, r.id); });
     }
     resolveTool(scope: string, id: string, explanation: string) {

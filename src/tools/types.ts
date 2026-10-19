@@ -94,6 +94,8 @@ export interface ToolContext {
   agentDefinitions?: import("../agent/agent_defs.js").AgentDef[];
   // fork 时父消息
   forkMessages?: import("../client/types.js").ChatMessage[];
+  /** Live parent history; survives resume, compaction and recovery replacing the array. */
+  getForkMessages?: () => import("../client/types.js").ChatMessage[];
   // 给运行中的后台子代理追加指令(SendMessage);返回是否送达(任务在跑)。
   sendToTask?: (id: string, message: string) => boolean;
   // (后台子代理用)给父代理发 mid-run 消息;由 runAgent 的 messageParent 参数绑定到本任务 id。前台子代理为 undefined。

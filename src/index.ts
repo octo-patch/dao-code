@@ -1342,7 +1342,7 @@ async function main() {
     subagentsDir: path.join(workspaceRoot, ".dao", "subagents"),
     mcpConfig,
   });
-  ctx.forkMessages = session.messages;
+  ctx.getForkMessages = () => session.messages;
   ctx.resumeAgent = async (agentId, prompt) => {
     if(taskManager.get(agentId)?.status === "interrupted" && recoveryAgentAuthorization!==agentId) throw new Error("中断代理须由用户 /recovery continue 明确继续。");
     await resumeAgentBackground({

@@ -1427,6 +1427,26 @@ describe("App", () => {
 });
 
 describe('App shared scheduler', () => {
+  it.each(['/cost', '/tasks', '/status', '/theme'])('%s preserves background waiting and automatic completion', async (command) => {
+    setLang('zh');
+    const { BackgroundRuntime } = await import('../../agent/background_runtime.js');
+    const { SessionScheduler } = await import('../../agent/session_scheduler.js');
+    const { Session } = await import('../../session/session.js');
+    const { execution } = await import('../../agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const task = execution(runtime); const session = new Session('', 'm'); let runs = 0;
+    const scheduler = new SessionScheduler({ runtime, session, save: () => {}, user: async () => {},
+      run: async () => ++runs === 1 ? { kind: 'waiting', wait: runtime.prepare({ ids: ['a'], mode: 'all' }).handle } : { kind: 'completed' } });
+    const runCommand = vi.fn(() => ({ handled: true, output: 'status result' }));
+    const ui = render(<App {...makeDeps({ scheduler, runCommand })} />);
+    try {
+      scheduler.submit('start'); await scheduler.settled(); await delay();
+      ui.stdin.write(command); await delay(); ui.stdin.write('\r'); await delay();
+      expect(scheduler.status().state).toBe('waiting'); expect(runtime.activeWaits).toBe(1);
+      if (command !== '/theme') expect(runCommand).toHaveBeenCalledWith(command);
+      task.finish(); await scheduler.finished(); expect(runs).toBe(2); expect(runtime.events()).toEqual([]);
+    } finally { ui.unmount(); scheduler.close(); }
+  });
+
   it('renders waiting, Esc pauses automatic wakeup, new user input resumes', async () => {
     setLang('zh');
     const { BackgroundRuntime } = await import('../../agent/background_runtime.js');

@@ -1,4 +1,5 @@
 import { WaitControl, type BackgroundRuntime } from "./background_runtime.js";
+import { repairToolPairs } from "../session/recovery.js";
 import type { TurnOutcome } from "./background_types.js";
 import type {
   AssistantMessage,
@@ -153,6 +154,18 @@ export async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
   const control = deps.backgroundRuntime && !deps.background ? new WaitControl(deps.backgroundRuntime) : undefined;
   try { return await runTurnInner(deps, control); }
   catch (error) {
+    control?.rollback();
+    if (deps.ctx.durableStore) {
+      const scope = deps.ctx.toolScope ?? "root";
+      try {
+        deps.session.messages = repairToolPairs(deps.session.messages, deps.ctx.durableStore, scope);
+      } catch {
+        deps.session.messages = repairToolPairs(deps.session.messages);
+      }
+      // Only this turn has stopped; background agents may still be executing tools.
+      try { deps.ctx.durableStore.markInterruptedTools(scope); } catch { /* retain the original failure */ }
+      try { await deps.onCheckpoint?.(); } catch { /* keep repaired history in memory if storage is unavailable */ }
+    }
     return deps.signal?.aborted
       ? { kind: "interrupted", reason: "user" }
       : { kind: "failed", error: error instanceof Error ? error : new Error(String(error)) };
