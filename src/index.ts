@@ -1326,7 +1326,7 @@ async function main() {
   // ---- 子代理引擎装配(对齐 CC:runAgent 统一入口)----
   ctx.runAgent = (params) => runAgent({
     ...params,
-    toolUseContext: ctx,
+    toolUseContext: { ...ctx, sessionModel: session.model },
     availableTools: registry,
     projectInstructions: systemPrompt, // CLAUDE.md/DAO.md/gitStatus 等;omitClaudeMd 的 agent(explore/plan)自己会跳过
     config: { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey },

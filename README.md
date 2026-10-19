@@ -303,6 +303,7 @@ The remaining failures are triaged into named root-cause categories (real engine
 | `DAO_REASONING_EFFORT` | Reasoning effort | `max` |
 | `DAO_MAX_TURNS` | Max model iterations per main-session turn | Unlimited |
 | `DAO_SUBAGENT_MAX_TURNS` | Max subagent model iterations (positive integer; call override > agent definition `maxTurns` > environment) | `500` |
+| `DAO_EXPLORE_MODEL` | Explore model; use an exact gateway-supported ID, or inherit the current main model | `inherit` |
 | `DAO_AUTO_APPROVE` | Skip all approvals (**sandbox/eval only**) | off |
 | `DAO_REFOCUS_EVERY` | Refocuser: re-check direction every N turns on long tasks (`0`=off; only in `--goal` long-task mode) | `3` |
 | `DAO_FAIL_STREAK` | Challenger: review progress after this many consecutive failed turns (interactive only) | `3` |

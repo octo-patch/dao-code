@@ -10,14 +10,18 @@ describe("normalizeModel — 子代理模型名兜底", () => {
     expect(normalizeModel("deepseek-v4-pro")).toBe("deepseek-v4-pro");
     expect(normalizeModel("deepseek-v4-flash")).toBe("deepseek-v4-flash");
   });
-  it("含 flash/pro 的归一", () => {
-    expect(normalizeModel("flash")).toBe("deepseek-v4-flash");
-    expect(normalizeModel("Pro")).toBe("deepseek-v4-pro");
+  it("DeepSeek 父模型下的完整简称可归一", () => {
+    expect(normalizeModel("flash", "deepseek-v4-pro")).toBe("deepseek-v4-flash");
+    expect(normalizeModel("Pro", "deepseek-v4-flash")).toBe("deepseek-v4-pro");
   });
-  it("无法识别(裸 deepseek-v4 / 乱写)-> undefined 继承父模型,不透传无效名", () => {
-    expect(normalizeModel("deepseek-v4")).toBeUndefined();
-    expect(normalizeModel("gpt-4")).toBeUndefined();
+  it("缺少完整模型 ID 的简称在自定义网关继承主模型", () => {
+    expect(normalizeModel("deepseek-v4")).toBe("inherit");
+    expect(normalizeModel("flash", "GLM-5.3-joybuilder")).toBe("inherit");
+    expect(normalizeModel("pro", "gateway-model")).toBe("inherit");
     expect(normalizeModel(undefined)).toBeUndefined();
+  });
+  it.each(["GLM-5.3-Flash-joybuilder", "Claude-Opus-4.8-joybuilder", "gateway-pro", "gpt-4"])("完整模型 ID %s 原样保留", (model) => {
+    expect(normalizeModel(` ${model} `)).toBe(model);
   });
   it("多 provider 模型名原样保留(不归一化成 undefined)", () => {
     expect(normalizeModel("kimi-k2.6")).toBe("kimi-k2.6");

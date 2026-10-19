@@ -305,6 +305,7 @@ EVAL_RUNS=1 node evals/run.mjs # 冒烟
 | `DAO_REASONING_EFFORT` | 思考强度 | `max` |
 | `DAO_MAX_TURNS` | 主会话单回合最大模型轮数 | 不限 |
 | `DAO_SUBAGENT_MAX_TURNS` | 子 agent 最大模型轮数(正整数;调用级覆盖 > agent 定义 `maxTurns` > 此变量) | `500` |
+| `DAO_EXPLORE_MODEL` | 探查子代理模型;填写网关支持的完整模型 ID，不配置则跟随当前主模型 | `inherit` |
 | `DAO_AUTO_APPROVE` | 跳过所有审批(**仅限沙箱/eval**) | 关 |
 | `DAO_REFOCUS_EVERY` | 纠偏者:长任务每 N 轮复核方向(`0`=关;仅 `--goal` 长任务生效) | `3` |
 | `DAO_FAIL_STREAK` | 挑战者:连续失败达此轮数 → 审视进展(交互式生效) | `3` |

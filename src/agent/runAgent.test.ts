@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { getAgentModel, filterIncompleteToolCalls, runAgent, type RunAgentParams } from "./runAgent.js";
+import { EXPLORE_AGENT } from "./bundled_agents.js";
 import { getAgentTranscript } from "./resume_agent.js";
 import { ToolRegistry } from "../tools/registry.js";
 import type { Tool } from "../tools/types.js";
@@ -15,6 +16,10 @@ import { PermissionGate } from "../permissions/gate.js";
 import { emptyPermissions } from "../permissions/settings.js";
 
 describe("getAgentModel", () => {
+  it("调用级 inherit 优先于 agent 的显式模型，保持主模型完整 ID", () => {
+    expect(getAgentModel("deepseek-v4-flash", "GLM-5.3-joybuilder", " INHERIT ")).toBe("GLM-5.3-joybuilder");
+    expect(getAgentModel("INHERIT", "gateway-pro", undefined)).toBe("gateway-pro");
+  });
   it("agent 定义无 model -> inherit(返回父模型)", () => {
     expect(getAgentModel(undefined, "deepseek-v4-pro", undefined)).toBe("deepseek-v4-pro");
   });
@@ -125,6 +130,31 @@ async function drain(gen: AsyncGenerator<ChatMessage, void>): Promise<ChatMessag
 }
 
 describe("runAgent 阶段接线", () => {
+  it("explore 在网关中跟随当前主模型，切换模型后新任务使用新模型且保留只读工具限制", async () => {
+    const previous = process.env.DAO_EXPLORE_MODEL;
+    delete process.env.DAO_EXPLORE_MODEL;
+    try {
+      const pool = new ToolRegistry();
+      for (const name of ["Read", "Grep", "Write", "Edit", "Agent"]) pool.register(mkTool(name));
+      for (const model of ["GLM-5.3-joybuilder", "Claude-Opus-4.8-joybuilder"]) {
+        await drain(runAgent(baseParams({
+          agentDef: EXPLORE_AGENT,
+          toolUseContext: { workspaceRoot: "/tmp", sessionModel: model },
+          availableTools: pool,
+          runTurn: async (deps) => {
+            expect(deps.session.model).toBe(model);
+            expect(deps.ctx.sessionModel).toBe(model);
+            expect(deps.registry.get("Read")).toBeDefined();
+            for (const name of ["Write", "Edit", "Agent"]) expect(deps.registry.get(name)).toBeUndefined();
+            deps.session.messages.push({ role: "assistant", content: "审查完成" });
+          },
+        })));
+      }
+    } finally {
+      if (previous === undefined) delete process.env.DAO_EXPLORE_MODEL;
+      else process.env.DAO_EXPLORE_MODEL = previous;
+    }
+  });
   it("passes the resolved subagent budget to the query loop", async () => {
     const previous = process.env.DAO_SUBAGENT_MAX_TURNS;
     process.env.DAO_SUBAGENT_MAX_TURNS = "800";

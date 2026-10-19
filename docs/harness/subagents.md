@@ -24,7 +24,7 @@ interface AgentDef {
 
 | 名字 | 用途 | 工具/模型限制 |
 |---|---|---|
-| `explore` | 只读彻底探查 | 限定 read/grep/list/search/fetch 等只读工具;默认模型 `deepseek-v4-flash`(省成本) |
+| `explore` | 只读彻底探查 | 限定 read/grep/list/search/fetch 等只读工具;默认继承当前主模型;`DAO_EXPLORE_MODEL` 可显式指定网关支持的完整模型 ID |
 | `verify` | 对抗性验证 | 允许 `exec_shell*`;严格要求"判定:通过/不通过/部分"格式 |
 | `general-purpose` | 通用兜底 | 不设 model(跟随主会话)、不设 tools(继承全部);`agent_type` 省略时的默认值(`tools/agent.ts:848`) |
 | `plan` | 架构规划 | `toolsExclude` 排除写/执行类工具,不设 model |

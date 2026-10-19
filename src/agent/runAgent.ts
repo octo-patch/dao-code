@@ -107,12 +107,9 @@ export function getAgentModel(
   parentModel: string,
   overrideModel: string | undefined,
 ): string {
-  // 调用级覆盖优先
-  if (overrideModel) return overrideModel;
-  // agent 定义指定了模型(且不是 inherit)
-  if (agentModel && agentModel !== "inherit") return agentModel;
-  // 默认继承父模型
-  return parentModel;
+  // 调用级 inherit 也覆盖 agent 定义；网关模型 ID 只去除首尾空白，不改大小写或后缀。
+  const selected = overrideModel?.trim() || agentModel?.trim();
+  return !selected || selected.toLowerCase() === "inherit" ? parentModel : selected;
 }
 
 // ---- 子代理上下文 ----

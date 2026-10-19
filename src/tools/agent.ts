@@ -7,22 +7,20 @@ import { finalizeAgentTool } from "../agent/agent_tools.js";
 import { runAsyncAgentLifecycle, type AsyncAgentTaskManager } from "../agent/agent_lifecycle.js";
 import { classifyHandoffIfNeeded } from "../agent/agent_handoff.js";
 import type { ForegroundRegistry } from "../tui/foreground_registry.js";
+import { getAgentModel } from "../agent/runAgent.js";
 
-// 子代理模型名归一化:模型常把 "deepseek-v4-pro" 写成 "deepseek-v4"/"pro"/"flash" -> raw 传 API 会失败。
-// 已知模型名(含 kimi-k2.6/glm-5.2 等多 provider)原样保留;deepseek 简称归一;无法识别 -> undefined(继承父模型)。
-import { MODELS_BY_PROVIDER } from "../config/profiles.js";
-
-const ALL_KNOWN_MODELS = new Set(
-  Object.values(MODELS_BY_PROVIDER).flat().map((m) => m.toLowerCase()),
-);
-
-export function normalizeModel(m: string | undefined): string | undefined {
+// 自定义网关的模型 ID 不受内置模型表限制，也不能按 flash/pro 子串改写。
+// 旧简称仅在父模型为官方 DeepSeek ID 时展开，其他场景显式继承当前主模型。
+export function normalizeModel(m: string | undefined, parentModel?: string): string | undefined {
   if (!m) return undefined;
   const s = m.trim().toLowerCase();
-  if (ALL_KNOWN_MODELS.has(s)) return m.trim();
-  if (s.includes("flash")) return "deepseek-v4-flash";
-  if (s.includes("pro")) return "deepseek-v4-pro";
-  return undefined;
+  if (!s) return undefined;
+  if (s === "inherit" || s === "deepseek-v4") return "inherit";
+  if (s === "flash" || s === "pro") {
+    return parentModel && /^deepseek-v4-(pro|flash)$/i.test(parentModel)
+      ? `deepseek-v4-${s}` : "inherit";
+  }
+  return m.trim();
 }
 
 function randomAgentId(): string {
@@ -39,7 +37,7 @@ const AGENT_TOOL_PROMPT_ZH =
   "耗时长被自动转后台);跟下一步没有依赖才用 background:true。并行最多 10 个同时跑、其余排队。\n" +
   "四个可选调用方式互斥:isolate(git worktree 隔离改文件)、fork(继承完整上下文+复用前缀缓存,近乎免费)、" +
   "model(临时换模型省钱,但会让前缀缓存失效)、mode=plan(只读规划)。fork 与 model/mode 天生冲突。" +
-  "agent_type 指定子代理类型(见系统 prompt 的'可用子代理类型');省略则用通用子代理。\n" +
+  "agent_type 指定子代理类型(见系统 prompt 的'可用子代理类型');省略则用通用子代理。explore 默认继承主模型，不要猜测或改写网关模型 ID。\n" +
   "拿到结果后留个心眼:子代理返回的是它自称做了什么,不是你亲眼确认过的事实。" +
   "涉及代码改动的子任务,回来后亲自复核关键结论,不要原样转述子代理的自述。" +
   "别重复子代理正在做的工作:如果你把一项调查派给了子代理,就不要自己也去跑同样的搜索。\n" +
@@ -66,7 +64,7 @@ const AGENT_TOOL_PROMPT_EN =
   "background:true only when the result has no bearing on your next step. At most 10 parallel, the rest queue.\n" +
   "Four optional modes are mutually exclusive: isolate (git worktree isolation), fork (inherits full context + reuses prefix cache, nearly free), " +
   "model (temporarily switch models - invalidates prefix cache), mode=plan (read-only planning). fork conflicts with model/mode. " +
-  "agent_type selects a subagent type (see 'Available Subagent Types' in system prompt); omit for generic subagent.\n" +
+  "agent_type selects a subagent type (see 'Available Subagent Types' in system prompt); omit for generic subagent. Explore inherits the main model by default; do not guess or rewrite gateway model IDs.\n" +
   "Trust but verify: a subagent's summary describes what it claims it did, not what you've confirmed. " +
   "For code-change subtasks, verify key results yourself before reporting. " +
   "Don't duplicate work that subagents are already doing - if you delegate research to a subagent, do not also perform the same searches yourself.\n" +
@@ -167,7 +165,7 @@ export const agentTool = defineTool({
     model: z
       .string()
       .optional()
-      .describe("调用级模型覆盖(如 deepseek-v4-flash 省钱跑廉价子任务)。注意:换模型会让前缀缓存失效——只在任务足够廉价时才划算。与 fork 互斥。"),
+      .describe("调用级模型覆盖:填写当前网关支持的完整模型 ID，不能猜测模型名。inherit 表示使用当前主模型。省略则使用 agent 定义(explore 默认继承主模型)。与 fork 互斥，换模型会让前缀缓存失效。"),
     mode: z
       .enum(["normal", "plan"])
       .optional()
@@ -213,7 +211,7 @@ export const agentTool = defineTool({
     const isolationMode = args.isolation ?? (args.isolate ? "worktree" : undefined) ?? agentDef.isolation;
     const isolate = !fork && isolationMode === "worktree" && !!ctx.createWorktree;
     const isRemote = !fork && isolationMode === "remote";
-    const reqModel = normalizeModel(args.model); // 归一化/兜底:无效模型名不透传给 API
+    const reqModel = normalizeModel(args.model, ctx.sessionModel);
     const reqMode = args.mode;
 
     const taskManagerAdapter: AsyncAgentTaskManager | undefined = ctx.taskManager
@@ -241,7 +239,7 @@ export const agentTool = defineTool({
       const forkContextMessages = fork
         ? buildForkContextMessages(ctx.getForkMessages?.() ?? ctx.forkMessages ?? [], `[fork 子任务:只做这件事并返回结论,不要改动主任务状态] ${t}`)
         : undefined;
-      const resolvedModelForDisplay = reqModel ?? agentDef.model ?? "deepseek-v4-pro";
+      const resolvedModelForDisplay = getAgentModel(agentDef.model, ctx.sessionModel ?? "deepseek-v4-pro", reqModel);
       const isBuiltInAgent = agentDef.source === "built-in";
 
       // ---- 异步(后台)路径 ----

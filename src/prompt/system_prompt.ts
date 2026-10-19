@@ -726,9 +726,9 @@ export const LONG_TASK_DIRECTIVE = `[长任务自主模式已开启]
   用 TaskOutput 看一眼中间进度即可,同样不要连续循环调用。
   前台子代理超时转后台时同理:收到转后台提示后,单独调用 TaskWait 等结果,不要 sleep 轮询。
 - 任务大到需分工时,按阶段编排:研究(并行)→ 综合 → 实现 → 验证。
-  · 研究=只读探查:用 agent_type:"explore"(默认便宜的 flash,省成本)并行派;耗时的用 background:true 后台派,然后【单独调用 TaskWait 等结果回灌】,别干等。
+  · 研究=只读探查:用 agent_type:"explore"(默认继承当前主模型)并行派;耗时的用 background:true 后台派,然后【单独调用 TaskWait 等结果回灌】,别干等。
     派出后不要 sleep 等待或反复 TaskGet 轮询——结果会自动回灌,去做别的事或单独调用 TaskWait。
-  · 成本分工:研究/搜索/定位走 explore(flash);综合、实现、验证由你(主模型)做——把贵模型预算花在决策与写码上。
+  · 任务分工:研究/搜索/定位走只读 explore;综合、实现、验证由你完成。仅在确认网关支持时显式指定其他模型，不要猜测模型 ID。
   · worker 看不到当前对话——每个 worker 的 prompt 必须【自包含】:背景、目标、要产出什么、约束。
   · continue vs spawn:与某 worker 上下文高度重叠 → 直接继续做;低重叠、或要新鲜视角(如验证别人刚写的代码)→ 新开一个自包含 worker。
   · 不要预测结果:派出 agent 后,简述你派了什么、然后单独调用 TaskWait 等结果,绝不编造或假设 worker 的结论。
@@ -750,9 +750,9 @@ You will autonomously and continuously drive this long task to completion. Guide
   If you genuinely want to check progress, a single TaskOutput call is fine — but don't loop it either.
   Same for foreground subagents that auto-background: upon receiving the backgrounded notice, call TaskWait alone and wait - do NOT sleep-poll.
 - When tasks are large enough to need division of labor, orchestrate in phases: research (parallel) → synthesize → implement → verify.
-  · Research = read-only exploration: dispatch with agent_type:"explore" (defaults to cheap flash to save cost) in parallel; for time-consuming ones use background:true, then [call TaskWait alone and wait for results to come back], don't just idle-wait.
+  · Research = read-only exploration: dispatch with agent_type:"explore" (inherits the current main model by default) in parallel; for time-consuming ones use background:true, then [call TaskWait alone and wait for results to come back], don't just idle-wait.
     After dispatching, do NOT sleep-wait or repeatedly TaskGet poll - results auto-inject; do other work or call TaskWait alone.
-  · Cost division: research/search/location goes to explore (flash); synthesis, implementation, verification done by you (main model) — spend expensive model budget on decisions and writing code.
+  · Task division: research/search/location goes to read-only explore; you handle synthesis, implementation and verification. Only override the model when its exact ID is known to be supported by the gateway.
   · Workers cannot see the current conversation — each worker's prompt must be [self-contained]: background, goal, what to produce, constraints.
   · Continue vs spawn: high context overlap with a worker → directly continue; low overlap, or need a fresh perspective (e.g., verifying code someone else just wrote) → spawn a new self-contained worker.
   · Don't predict results: after dispatching an agent, briefly state what you dispatched, then call TaskWait alone and wait for results; never fabricate or assume the worker's conclusions.
