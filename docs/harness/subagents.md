@@ -112,3 +112,12 @@ node --import tsx scripts/verify-background-recovery-live.mjs running
 真实模型验收脚本使用当前 GLM-5.3-joybuilder 配置，创建隔离临时工作区；记录请求计数、稳定 runId、启动次数和恢复状态，不记录 API 密钥。`running/offline/all` 应正常处理结果，`paused/agent/unknown` 恢复后保持暂停且主模型请求为零。
 
 交互模式按 `Ctrl+T` 查看已登记子代理的本地实时记录,`↑/↓` 选任务、`PgUp/PgDn` 翻历史、`Esc` 关闭且不中断任务;面板不消费通知或 TaskOutput 游标。
+
+## 模型选择与网关
+
+- 内置 general-purpose / explore / plan / verify 和 fork 默认继承当前主模型；explore 的 `DAO_EXPLORE_MODEL` 属于显式配置。
+- 自定义与插件定义的 `model` 保留完整 ID。优先级为调用级 `model` > agent 定义 > 当前主模型；调用级 `inherit` 可覆盖定义。缺少可继承模型时明确报配置错误，不猜测 DeepSeek。
+- 前台、后台和 worktree 使用同一模型解析。后台支持调用级 `model` / `mode`；fork 仍禁止调用级换模型。remote 当前复用 worktree 路径，没有独立的模型配置链路。
+- 恢复持久任务时保留已保存的模型 ID。旧转录缺少模型时，按 agent 定义与当前主模型解析；显示和执行使用同一结果。
+- WebFetch 提取、分类器、技能转换与非 fork 反思只在已知官方端点且主模型属于对应模型族时选择便宜档；自定义端点默认沿用主模型。压缩摘要和网页提取每次调用读取当前模型，避免切换账号后沿用旧值。
+- 技能转换不再将外来模型档固定映射到 DeepSeek，旧适配缓存通过新的缓存键失效。

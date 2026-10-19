@@ -19,6 +19,7 @@ import { loadProfiles, saveProfiles, setActive, removeProfile } from "./config/p
 import { DEFAULTS, MODELS_BY_PROVIDER, contextWindowFor, type Provider, type ResolvedCredential } from "./config/profiles.js";
 import { createClassifierRunner, defaultClassifierModel } from "./permissions/classifier_model.js";
 import { resolveExtractModel } from "./tools/fetch_extract.js";
+import { getAgentModel } from "./config/model_selection.js";
 import { resolveCredential, persistKey } from "./config/credential.js";
 import { validateCredential, fetchModels } from "./config/validate_key.js";
 import { runtimeKeychain, noopKeychain, keychainAvailable, keychainDelete } from "./config/keychain.js";
@@ -684,7 +685,7 @@ async function main() {
   // 审计:onAudit 直接写 memoryAudit;后台合并在 sink 建好(下方创建)之后才完成,触发时 sink 已就绪。
   // 并发:maybeConsolidate 内部自载记忆快照;与反思器每回合写入极少撞同一文件,撞了 last-write-wins、下轮自愈。
   if (!noMemory && !argvPrompt) {
-    const consolModel = process.env.DAO_CONSOLIDATE_MODEL || cfg.model;
+    const consolModel = getAgentModel(process.env.DAO_CONSOLIDATE_MODEL, cfg.model);
     const consolNow = Date.now();
     const consolCommon = {
       today, now: consolNow, streamChat,
@@ -1066,12 +1067,11 @@ async function main() {
   // default/auto 由 getMode 读 loadedPerms.defaultMode 处理,无需在此设置。
   if (loadedPerms.defaultMode === "plan") session.mode = "plan";
   else if (loadedPerms.defaultMode === "bypassPermissions") yolo = true;
-  // WebFetch 智能提取(prompt 参数)用模型:DeepSeek 系 provider 默认 flash 档,其余(anthropic/openai
-  // 当前未配置便宜档)回退主模型,同 SUMMARY_MODEL 的既有降级方式。DAO_FETCH_EXTRACT_MODEL 可覆盖。
-  const EXTRACT_MODEL = resolveExtractModel(process.env.DAO_FETCH_EXTRACT_MODEL, cfg.provider, session.model);
+  // WebFetch 每次调用读取当前账号/模型，自定义网关默认继承主模型。
   const EXTRACT_INSTRUCTION = "下面是一个网页的纯文本内容,请严格按照<提取要求>从中提取相关信息,只输出提取结果," +
     "不要复述原文、不要寒暄、不要输出提取要求之外的内容。如果页面里确实没有<提取要求>要的信息,明确说明没有,不要编造。";
   const extractFromPage = async (text: string, prompt: string): Promise<string> => {
+    const EXTRACT_MODEL = resolveExtractModel(process.env.DAO_FETCH_EXTRACT_MODEL, cfg.provider, session.model, cfg.baseUrl);
     const gen = streamChat({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
@@ -1187,7 +1187,7 @@ async function main() {
       }
     } catch { /* 激活失败不影响文件操作 */ }
   };
-  // 外来技能适配(无翻译字典):检测为他者所写时,用 flash 按用途转换工具名,目标词表=dao 工具注册表,按 hash 缓存。
+  // 外来技能适配：按当前端点选择辅助模型，转换指令默认继承主模型。
   const apiTools = registry.toApiTools(undefined, lang);
   const daoTools = new Set(apiTools.map((t) => t.function.name));
   const toolCatalog = apiTools.map((t) => `${t.function.name} — ${t.function.description.split(/[。\n]/)[0]!.slice(0, 60)}`).join("\n");
@@ -1346,6 +1346,7 @@ async function main() {
   ctx.resumeAgent = async (agentId, prompt) => {
     if(taskManager.get(agentId)?.status === "interrupted" && recoveryAgentAuthorization!==agentId) throw new Error("中断代理须由用户 /recovery continue 明确继续。");
     await resumeAgentBackground({
+      parentModel: session.model,
       agentId, prompt, durableStore:ctx.durableStore,
       subagentsDir: path.join(workspaceRoot, ".dao", "subagents"),
       agentDefs,
@@ -1443,8 +1444,8 @@ async function main() {
 
 只输出 <分析> 和 <摘要> 两个块的纯文本,不要寒暄。`;
   // 默认主模型(命中热缓存);DAO_SUMMARY_MODEL 可覆盖为 flash 等(会冷发、不命中缓存,省单价但失缓存)。
-  const SUMMARY_MODEL = process.env.DAO_SUMMARY_MODEL || session.model;
   const summarize = async (msgs: ChatMessage[]): Promise<string> => {
+    const SUMMARY_MODEL = getAgentModel(process.env.DAO_SUMMARY_MODEL, session.model);
     const gen = streamChat({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
@@ -1580,6 +1581,7 @@ async function main() {
     try {
       const fork = process.env.DAO_DISTILL_FORK !== "0";
       const model = fork ? session.model : defaultClassifierModel(classifierContext());
+      const reflectConfig = { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey };
       const tools = fork ? apiToolsForMode(registry, session.mode, lang) : undefined;
       // 只发上次主请求已缓存的前缀(slice 到 lastSentLength)→ 前缀字节一致、命中热缓存。
       const msgs = fork && session.lastSentLength > 0 ? session.messages.slice(0, session.lastSentLength) : session.messages;
@@ -1588,7 +1590,7 @@ async function main() {
       // 200 条安全上限防极端;正文只取前 N(见 unified_reflect.buildTail)。
       const candidates = existing.filter((m) => m.title).sort((a, b) => b.importance - a.importance).slice(0, 200).map((m) => ({ title: m.title!, text: m.text }));
       const result = await unifiedReflect({
-        streamChat, config: { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey }, model, messages: msgs, today,
+        streamChat, config: reflectConfig, model, messages: msgs, today,
         existing: candidates, fork, tools, reasoningEffort: process.env.DAO_REASONING_EFFORT || "max",
         onUsage: (u) => {
           session.addUsage(u as never, model);

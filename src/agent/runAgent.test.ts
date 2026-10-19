@@ -1,10 +1,12 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { getAgentModel, filterIncompleteToolCalls, runAgent, type RunAgentParams } from "./runAgent.js";
-import { EXPLORE_AGENT } from "./bundled_agents.js";
+import { EXPLORE_AGENT, BUNDLED_AGENTS } from "./bundled_agents.js";
+import { FORK_AGENT } from "./fork_agent.js";
+import type { AgentDef } from "./agent_defs.js";
 import { getAgentTranscript } from "./resume_agent.js";
 import { ToolRegistry } from "../tools/registry.js";
 import type { Tool } from "../tools/types.js";
@@ -111,7 +113,7 @@ function baseParams(overrides: Partial<RunAgentParams>): RunAgentParams {
   return {
     agentDef: { agentType: "t", whenToUse: "", source: "built-in", getSystemPrompt: () => "SYS" } as BuiltInAgentDef,
     promptMessages: [{ role: "user", content: "do it" }],
-    toolUseContext: { workspaceRoot: "/tmp" },
+    toolUseContext: { workspaceRoot: "/tmp", sessionModel: "deepseek-v4-pro" },
     isAsync: false,
     config: { baseUrl: "", apiKey: "" },
     streamChat: (() => {}) as unknown as TurnDeps["streamChat"],
@@ -130,6 +132,32 @@ async function drain(gen: AsyncGenerator<ChatMessage, void>): Promise<ChatMessag
 }
 
 describe("runAgent 阶段接线", () => {
+  const definitions: AgentDef[] = [
+    ...BUNDLED_AGENTS, FORK_AGENT,
+    { agentType: "custom", whenToUse: "", source: "projectSettings", model: "Custom-Pro-joybuilder", getSystemPrompt: () => "SYS" },
+    { agentType: "plugin-review", whenToUse: "", source: "plugin", plugin: "test", model: "inherit", getSystemPrompt: () => "SYS" },
+  ];
+  it.each(definitions.flatMap((agentDef) => [false, true].map((isAsync) => ({ agentDef, isAsync }))))(
+    "$agentDef.agentType 的前台/后台模型选择一致 (isAsync=$isAsync)", async ({ agentDef, isAsync }) => {
+      vi.stubEnv("DAO_EXPLORE_MODEL", "");
+      try {
+        for (const override of [undefined, "inherit", "Override-Flash-Channel"]) {
+          const parent = "Main-Gateway-CaseSensitive";
+          const expected = override === "inherit" ? parent : override ?? (agentDef.agentType === "custom" ? "Custom-Pro-joybuilder" : parent);
+          let actual: string | undefined;
+          await drain(runAgent(baseParams({ agentDef, isAsync, model: override,
+            toolUseContext: { workspaceRoot: "/tmp", sessionModel: parent },
+            runTurn: async (deps) => { actual = deps.session.model; expect(deps.ctx.sessionModel).toBe(expected); },
+          })));
+          expect(actual).toBe(expected);
+        }
+      } finally { vi.unstubAllEnvs(); }
+    });
+  it("缺少主模型时在请求模型前报配置错误", async () => {
+    const query = vi.fn(async () => {});
+    await expect(drain(runAgent(baseParams({ toolUseContext: { workspaceRoot: "/tmp" }, runTurn: query })))).rejects.toThrow("缺少可继承的主模型");
+    expect(query).not.toHaveBeenCalled();
+  });
   it("explore 在网关中跟随当前主模型，切换模型后新任务使用新模型且保留只读工具限制", async () => {
     const previous = process.env.DAO_EXPLORE_MODEL;
     delete process.env.DAO_EXPLORE_MODEL;
@@ -424,7 +452,7 @@ describe("runAgent 阶段接线", () => {
     let observedAbortDuringRun = false;
     const params = baseParams({
       isAsync: false,
-      toolUseContext: { workspaceRoot: "/tmp", signal: parentAbort.signal },
+      toolUseContext: { workspaceRoot: "/tmp", sessionModel: "deepseek-v4-pro", signal: parentAbort.signal },
       runTurn: async (deps) => {
         expect(deps.signal!.aborted).toBe(false);
         parentAbort.abort();
@@ -441,7 +469,7 @@ describe("runAgent 阶段接线", () => {
     let capturedSignal: AbortSignal | undefined;
     const params = baseParams({
       isAsync: false,
-      toolUseContext: { workspaceRoot: "/tmp", signal: parentAbort.signal },
+      toolUseContext: { workspaceRoot: "/tmp", sessionModel: "deepseek-v4-pro", signal: parentAbort.signal },
       runTurn: async (deps) => {
         capturedSignal = deps.signal;
         deps.session.messages.push({ role: "assistant", content: "done" });
@@ -458,7 +486,7 @@ describe("runAgent 阶段接线", () => {
     let capturedSignal: AbortSignal | undefined;
     const params = baseParams({
       isAsync: false,
-      toolUseContext: { workspaceRoot: "/tmp", signal: parentAbort.signal },
+      toolUseContext: { workspaceRoot: "/tmp", sessionModel: "deepseek-v4-pro", signal: parentAbort.signal },
       override: { abortController: ownController },
       runTurn: async (deps) => {
         capturedSignal = deps.signal;

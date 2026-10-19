@@ -39,6 +39,21 @@ describe("resumeAgentBackground", () => {
       update: vi.fn(() => true),
     };
   }
+  it("旧转录缺模型时继承当前主模型，不猜测 DeepSeek 模型", async () => {
+    const agentId = "legacy-without-model";
+    await recordSidechainMessage(tmpDir, agentId, { role: "user", content: "继续" });
+    await writeAgentMetadata(tmpDir, agentId, { agentType: "general-purpose" });
+    const runAgent = vi.fn(() => (async function* () { yield { role: "assistant", content: "完成" } as ChatMessage; })());
+    const taskManager = mkTaskManager();
+    const registerAsyncAgent = vi.fn((o: { agentId: string; description: string }) => ({ agentId: o.agentId, abortController: new AbortController() }));
+    const opts = { agentId, prompt: "继续", subagentsDir: tmpDir, agentDefs: [], runAgent, taskManager, registerAsyncAgent };
+    await expect(resumeAgentBackground(opts)).rejects.toThrow("缺少可继承的主模型");
+    expect(registerAsyncAgent).not.toHaveBeenCalled();
+    await resumeAgentBackground({ ...opts, parentModel: "Current-GLM-Channel" });
+    expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({ model: "Current-GLM-Channel" }));
+    await new Promise((r) => setImmediate(r));
+    expect(taskManager.update).toHaveBeenCalledWith(agentId, { status: "completed", result: "完成" }, undefined);
+  });
 
   it("找不到转录时抛错", async () => {
     await expect(resumeAgentBackground({

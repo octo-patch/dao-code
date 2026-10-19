@@ -7,20 +7,12 @@ import { finalizeAgentTool } from "../agent/agent_tools.js";
 import { runAsyncAgentLifecycle, type AsyncAgentTaskManager } from "../agent/agent_lifecycle.js";
 import { classifyHandoffIfNeeded } from "../agent/agent_handoff.js";
 import type { ForegroundRegistry } from "../tui/foreground_registry.js";
-import { getAgentModel } from "../agent/runAgent.js";
+import { getAgentModel } from "../config/model_selection.js";
 
-// 自定义网关的模型 ID 不受内置模型表限制，也不能按 flash/pro 子串改写。
-// 旧简称仅在父模型为官方 DeepSeek ID 时展开，其他场景显式继承当前主模型。
-export function normalizeModel(m: string | undefined, parentModel?: string): string | undefined {
-  if (!m) return undefined;
-  const s = m.trim().toLowerCase();
-  if (!s) return undefined;
-  if (s === "inherit" || s === "deepseek-v4") return "inherit";
-  if (s === "flash" || s === "pro") {
-    return parentModel && /^deepseek-v4-(pro|flash)$/i.test(parentModel)
-      ? `deepseek-v4-${s}` : "inherit";
-  }
-  return m.trim();
+// 模型 ID 只去除首尾空白；不根据父模型或简称猜测网关支持的其他模型。
+export function normalizeModel(m: string | undefined): string | undefined {
+  const selected = m?.trim();
+  return selected?.toLowerCase() === "inherit" ? "inherit" : selected || undefined;
 }
 
 function randomAgentId(): string {
@@ -197,9 +189,6 @@ export const agentTool = defineTool({
     if (args.fork && (args.model || args.mode)) {
       return "fork 与 model/mode 覆盖互斥:fork 的价值是复用父代理的前缀缓存,而换模型/改模式会让该缓存失效、fork 失去意义。请去掉 model/mode,或改用普通子代理(去掉 fork)。";
     }
-    if (args.background && (args.model || args.mode)) {
-      return "后台子代理暂不支持 model/mode 覆盖(后续版本补)。若要换模型跑后台:去掉 model/mode,或为该用途定义一个带 model 的 agent_type 再用 background。";
-    }
 
     const runAgent = ctx.runAgent;
     const fork = !!args.fork;
@@ -211,7 +200,7 @@ export const agentTool = defineTool({
     const isolationMode = args.isolation ?? (args.isolate ? "worktree" : undefined) ?? agentDef.isolation;
     const isolate = !fork && isolationMode === "worktree" && !!ctx.createWorktree;
     const isRemote = !fork && isolationMode === "remote";
-    const reqModel = normalizeModel(args.model, ctx.sessionModel);
+    const reqModel = normalizeModel(args.model);
     const reqMode = args.mode;
 
     const taskManagerAdapter: AsyncAgentTaskManager | undefined = ctx.taskManager
@@ -226,6 +215,7 @@ export const agentTool = defineTool({
     const runOne = async (t: string): Promise<string> => {
       const agentId = randomAgentId();
       const shouldRunAsync = !!args.background || !!agentDef.background;
+      const resolvedModelForDisplay = getAgentModel(agentDef.model, ctx.sessionModel, reqModel);
 
       let worktree: { root: string; branch: string; cleanup: () => void; hasChanges: () => boolean; hasUnpushedCommits: () => boolean } | undefined;
       // isolation: worktree 和 remote 都创建 git worktree(隔离的工作副本)。
@@ -239,7 +229,6 @@ export const agentTool = defineTool({
       const forkContextMessages = fork
         ? buildForkContextMessages(ctx.getForkMessages?.() ?? ctx.forkMessages ?? [], `[fork 子任务:只做这件事并返回结论,不要改动主任务状态] ${t}`)
         : undefined;
-      const resolvedModelForDisplay = getAgentModel(agentDef.model, ctx.sessionModel ?? "deepseek-v4-pro", reqModel);
       const isBuiltInAgent = agentDef.source === "built-in";
 
       // ---- 异步(后台)路径 ----

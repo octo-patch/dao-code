@@ -10,14 +10,11 @@ describe("normalizeModel — 子代理模型名兜底", () => {
     expect(normalizeModel("deepseek-v4-pro")).toBe("deepseek-v4-pro");
     expect(normalizeModel("deepseek-v4-flash")).toBe("deepseek-v4-flash");
   });
-  it("DeepSeek 父模型下的完整简称可归一", () => {
-    expect(normalizeModel("flash", "deepseek-v4-pro")).toBe("deepseek-v4-flash");
-    expect(normalizeModel("Pro", "deepseek-v4-flash")).toBe("deepseek-v4-pro");
-  });
-  it("缺少完整模型 ID 的简称在自定义网关继承主模型", () => {
-    expect(normalizeModel("deepseek-v4")).toBe("inherit");
-    expect(normalizeModel("flash", "GLM-5.3-joybuilder")).toBe("inherit");
-    expect(normalizeModel("pro", "gateway-model")).toBe("inherit");
+  it("显式 ID 不按简称猜测其他供应商模型", () => {
+    expect(normalizeModel("flash")).toBe("flash");
+    expect(normalizeModel("Pro")).toBe("Pro");
+    expect(normalizeModel("deepseek-v4")).toBe("deepseek-v4");
+    expect(normalizeModel(" INHERIT ")).toBe("inherit");
     expect(normalizeModel(undefined)).toBeUndefined();
   });
   it.each(["GLM-5.3-Flash-joybuilder", "Claude-Opus-4.8-joybuilder", "gateway-pro", "gpt-4"])("完整模型 ID %s 原样保留", (model) => {
@@ -70,6 +67,7 @@ function mkCtx(over: Record<string, unknown> = {}) {
   const { fn } = fakeRunAgent("OK");
   return {
     workspaceRoot: "/tmp",
+    sessionModel: "deepseek-v4-pro",
     readFiles: new Set<string>(),
     subagentDepth: 0,
     agentDefinitions: [GENERAL_PURPOSE],
@@ -205,10 +203,20 @@ describe("agent tool", () => {
     expect(taskManager.drainNotifications().join("\n")).toContain("跑到一半了");
   });
 
-  it("background + model → 显式拒绝(不静默丢)", async () => {
-    const ctx = mkCtx();
-    const out = await agentTool.handler({ task: "x", background: true, model: "deepseek-v4-flash" } as any, ctx);
-    expect(out).toContain("background");
+  it("后台调用保留显式网关模型及只读模式，并正常结算任务", async () => {
+    const { fn, calls } = fakeRunAgent("后台完成");
+    const taskManager = createTaskManager();
+    const done = new Promise<void>((resolve) => {
+      const unsubscribe = taskManager.subscribe((event) => {
+        if (event.type === "completed") { unsubscribe(); resolve(); }
+      });
+    });
+    const ctx = mkCtx({ runAgent: fn, taskManager, sessionModel: "Main-Gateway" });
+    const out = await agentTool.handler({ task: "x", background: true, model: "GLM-5.3-Flash-joybuilder", mode: "plan" } as any, ctx);
+    expect(out).toContain("已后台启动");
+    await done;
+    expect(calls[0]).toMatchObject({ model: "GLM-5.3-Flash-joybuilder", mode: "plan", isAsync: true });
+    expect(taskManager.all()[0]?.status).toBe("completed");
   });
 
   it("父 abort → 直接中止还在跑的前台子代理(没有自动转后台这条路,ESC 立刻生效,不用等超时)", async () => {

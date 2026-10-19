@@ -4,6 +4,16 @@ import { DEFAULTS } from "../config/profiles.js";
 
 const context = { model: "GLM-5.3-joybuilder", provider: "deepseek" as const, baseUrl: "http://llm-gw.jd.local/v1", apiKey: "test" };
 describe("classifier model selection and fallback", () => {
+  it("非 DeepSeek 官方 provider 不请求 DeepSeek，inherit 显式配置跟随当前模型", async () => {
+    const runner = createClassifierRunner(vi.fn());
+    const run = vi.fn(async (model: string) => model);
+    for (const provider of ["anthropic", "openai"] as const) {
+      const c = { ...context, provider, ...DEFAULTS[provider] };
+      expect(await runner(c, run)).toBe(c.model);
+      expect(run.mock.calls.at(-1)).toEqual([c.model]);
+    }
+    expect(await runner({ ...context, provider: "zhipu", ...DEFAULTS.zhipu, override: " inherit " }, run)).toBe(DEFAULTS.zhipu.model);
+  });
   it("custom gateway uses selected model directly, official GLM retains flash default", () => {
     expect(defaultClassifierModel(context)).toBe(context.model);
     expect(defaultClassifierModel({ ...context, provider: "zhipu", model: "glm-5.3", baseUrl: DEFAULTS.zhipu.baseUrl })).toBe("glm-5.3-flash");

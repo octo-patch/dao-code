@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { subagentMaxTurns } from "./turn_budget.js";
+import { getAgentModel } from "../config/model_selection.js";
+export { getAgentModel } from "../config/model_selection.js";
 import path from "node:path";
 import type { ChatMessage } from "../client/types.js";
 import type { ToolContext, Tool } from "../tools/types.js";
@@ -96,22 +98,6 @@ export interface CacheSafeParams {
   forkContextMessages: ChatMessage[];
 }
 
-// ---- 模型解析 ----
-
-/**
- * 解析 agent 模型(参考 getAgentModel)。
- * 优先级:调用级 model > agent 定义 model > inherit(父模型)
- */
-export function getAgentModel(
-  agentModel: string | undefined,
-  parentModel: string,
-  overrideModel: string | undefined,
-): string {
-  // 调用级 inherit 也覆盖 agent 定义；网关模型 ID 只去除首尾空白，不改大小写或后缀。
-  const selected = overrideModel?.trim() || agentModel?.trim();
-  return !selected || selected.toLowerCase() === "inherit" ? parentModel : selected;
-}
-
 // ---- 子代理上下文 ----
 // 消息过滤(filterIncompleteToolCalls)、转录持久化(recordSidechainMessage/writeAgentMetadata)
 // 与 resume_agent.ts 共用同一份实现(此前两处各写一份,写读目录拼法还不一致,resume 时会
@@ -190,7 +176,7 @@ export async function* runAgent(params: RunAgentParams): AsyncGenerator<ChatMess
 
   // ---- 阶段 1:参数解析 ----
 
-  const parentModel = toolUseContext.sessionModel ?? "deepseek-v4-pro";
+  const parentModel = toolUseContext.sessionModel;
   const resolvedModel = getAgentModel(agentDef.model, parentModel, modelOverride);
   const agentId = override?.agentId ?? createAgentId();
 

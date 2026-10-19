@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { makeSkillAdapter, convertSystemPrompt } from "./convert.js";
+import { contentHash } from "../memory/hash.js";
 
 const DAO = new Set(["Read", "Edit", "Bash"]);
 const catalog = "Read — 读文件\nEdit — 改文件\nBash — 跑命令";
@@ -13,9 +14,10 @@ afterEach(async () => { await fs.rm(home, { recursive: true, force: true }); });
 
 describe("convertSystemPrompt 模型档/子代理映射", () => {
   const sys = convertSystemPrompt("Read — 读文件");
-  it("把外来模型档映射到 dao 的 flash/pro", () => {
-    expect(sys).toContain("deepseek-v4-flash");
-    expect(sys).toContain("deepseek-v4-pro");
+  it("外来模型档默认继承主模型，不硬编码供应商模型", () => {
+    expect(sys).not.toContain("deepseek-v4-flash");
+    expect(sys).not.toContain("deepseek-v4-pro");
+    expect(sys).toContain("继承当前主模型");
     expect(sys.toLowerCase()).toMatch(/haiku|sonnet|opus/);
   });
   it("把'换便宜模型/独立上下文'重写成 dao 的 agent 子代理模式", () => {
@@ -31,6 +33,14 @@ describe("convertSystemPrompt 模型档/子代理映射", () => {
 });
 
 describe("makeSkillAdapter", () => {
+  it("旧缓存中的固定模型指令不再被复用", async () => {
+    const body = "use the `WebFetch` tool then `MultiEdit`";
+    const dir = path.join(home, ".dao", "skill-adapted");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, `${contentHash(body)}.md`), "model: deepseek-v4-flash");
+    const adapt = makeSkillAdapter({ daoTools: DAO, catalog, homeDir: home, callFlash: async () => "使用 agent 并继承主模型" });
+    expect(await adapt(body)).toBe("使用 agent 并继承主模型");
+  });
   it("dao 原生技能:不调 flash,原样返回", async () => {
     let called = 0;
     const adapt = makeSkillAdapter({ daoTools: DAO, catalog, homeDir: home, callFlash: async () => { called++; return "X"; } });
@@ -53,5 +63,6 @@ describe("makeSkillAdapter", () => {
     const out = await adapt("call `WebFetch` tool");
     expect(out).toContain("本平台适配");
     expect(out).toContain("call `WebFetch` tool");
+    expect(out).not.toContain("deepseek-v4");
   });
 });

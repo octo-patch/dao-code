@@ -8,6 +8,7 @@ import { ONE_SHOT_AGENT_TYPES } from "./agent_tools.js";
 import type { AgentDef } from "./agent_defs.js";
 import type { CacheSafeParams } from "./runAgent.js";
 import { runAsyncAgentLifecycle, type AsyncAgentTaskManager } from "./agent_lifecycle.js";
+import { getAgentModel } from "../config/model_selection.js";
 
 /** 逐条写入 sidechain 转录(fire-and-forget) */
 export async function recordSidechainMessage(subagentsDir: string, agentId: string, message: ChatMessage): Promise<void> {
@@ -59,6 +60,7 @@ export function filterIncompleteToolCalls(messages: ChatMessage[]): ChatMessage[
 
 /** 恢复已结束的子代理(参考 resumeAgentBackground) */
 export async function resumeAgentBackground(opts: {
+  parentModel?: string;
   durableStore?: DurableStore;
   agentId: string;
   prompt: string;
@@ -96,6 +98,8 @@ export async function resumeAgentBackground(opts: {
   const agentDef = meta?.agentType ? (agentDefs.find((a) => a.agentType === meta.agentType) ?? GENERAL_PURPOSE_AGENT) : GENERAL_PURPOSE_AGENT;
   const promptMessages: ChatMessage[] = [...resumedMessages, { role: "user", content: prompt }];
   const description = meta?.description ?? "(恢复)";
+  // 有历史模型时保持原样；旧转录缺模型时才解析定义/当前主模型，展示与请求使用同一结果。
+  const model = getAgentModel(agentDef.model, opts.parentModel, meta?.model);
   const bgTask = opts.registerAsyncAgent({ agentId, description });
 
   void runAsyncAgentLifecycle({
@@ -105,10 +109,10 @@ export async function resumeAgentBackground(opts: {
     agentType: meta?.agentType,
     isBuiltInAgent: agentDef.source === "built-in",
     prompt,
-    model: meta?.model ?? "deepseek-v4-pro",
+    model,
     makeStream: (onCacheSafeParams) => opts.runAgent({
       agentDef,
-      model: meta?.model,
+      model,
       promptMessages,
       isAsync: true,
       override: { abortController: bgTask.abortController, agentId },
