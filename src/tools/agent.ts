@@ -314,6 +314,7 @@ export const agentTool = defineTool({
             if (outcome.kind === "convert") { converted = true; break; }
             if (outcome.r.done) break;
             messages.push(outcome.r.value);
+            ctx.taskManager.appendMessage(fg.taskId, outcome.r.value);
           }
           registry?.unregister(agentId);
 

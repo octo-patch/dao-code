@@ -1044,7 +1044,7 @@ describe("runTurn", () => {
     expect(i).toBe(6); // 查询保持读取语义,显式等待由 TaskWait 表达
     expect(s.messages.filter((m) => m.role === "tool")).toHaveLength(5);
     expect(written.join("")).not.toContain("等待通知后继续");
-    let notifications = ["后台任务完成:验证通过"];
+    const notifications = ["后台任务完成:验证通过"];
     await runTurn({
       session: s, config, registry: emptyReg(), ctx, gate: stubGate,
       drainNotifications: () => notifications.splice(0),

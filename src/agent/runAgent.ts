@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { subagentMaxTurns } from "./turn_budget.js";
 import path from "node:path";
 import type { ChatMessage } from "../client/types.js";
 import type { ToolContext, Tool } from "../tools/types.js";
@@ -471,7 +472,7 @@ ${skill.body}` });
           drainPending,
           background: true, // 子代理:遇 529 不重试/不回退
           selfChallenge: true, // 子代理跑确定性卡住检测
-          maxTurns: maxTurnsOverride ?? agentDef.maxTurns ?? 200,
+          maxTurns: subagentMaxTurns(maxTurnsOverride, agentDef.maxTurns),
           ...(agentDef.effort ? { reasoningEffort: agentDef.effort } : {}),
           ...(auditSink ? { auditSink, auditId: { agent: "sub" as const, subId: agentId, depth: subDepth } } : {}),
         });

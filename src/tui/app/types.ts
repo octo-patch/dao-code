@@ -46,6 +46,8 @@ export interface StatusInfo {
 }
 
 export interface AppDeps {
+  // 只读实时快照；查看时不消费 TaskOutput 游标或通知。
+  listAgentTasks?: () => import("../../agent/tasks.js").BgTask[];
   scheduler?: import("../../agent/session_scheduler.js").SessionScheduler;
   bindEvents?: (events: TurnEvents) => void;
   welcome: { info: WelcomeInfo; caps: Capabilities; bg: Background; maxim: Maxim };

@@ -39,7 +39,7 @@ interface AgentDef {
 
 **防递归**:`subagentDepth = ctx.subagentDepth+1`(44 行),`tools/agent.ts:64` 硬限制 `subagentDepth>=2` 时拒绝再派发(最多两层嵌套);且 `depth>=1` 时并行度从 10 收紧到 3(`agent.ts:126-127`),防指数爆炸。
 
-子代理跑在 `background:true` 模式(不重试 529)、`maxTurns:200` 硬上限,完成后转录写入 `.dao/subagents/*.jsonl`(`index.ts:873-880`)。
+子代理跑在 `background:true` 模式(不重试 529)、默认 500 轮模型调用上限(调用级 `maxTurns` > agent 定义 `maxTurns` > `DAO_SUBAGENT_MAX_TURNS` > 500,与主会话 `DAO_MAX_TURNS` 独立),完成后转录写入 `.dao/subagents/*.jsonl`(`index.ts:873-880`)。
 
 ## `src/tools/agent.ts`(派发入口)
 
@@ -110,3 +110,5 @@ node --import tsx scripts/verify-background-recovery-live.mjs running
 ```
 
 真实模型验收脚本使用当前 GLM-5.3-joybuilder 配置，创建隔离临时工作区；记录请求计数、稳定 runId、启动次数和恢复状态，不记录 API 密钥。`running/offline/all` 应正常处理结果，`paused/agent/unknown` 恢复后保持暂停且主模型请求为零。
+
+交互模式按 `Ctrl+T` 查看已登记子代理的本地实时记录,`↑/↓` 选任务、`PgUp/PgDn` 翻历史、`Esc` 关闭且不中断任务;面板不消费通知或 TaskOutput 游标。

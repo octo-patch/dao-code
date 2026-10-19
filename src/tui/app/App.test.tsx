@@ -38,6 +38,54 @@ function makeDeps(over: Partial<AppDeps> = {}): AppDeps {
 }
 
 describe("App", () => {
+  it("Ctrl+T inspects running agents, refreshes local output and closes without aborting or losing the draft", async () => {
+    let signal: AbortSignal | undefined;
+    let finish!: () => void;
+    const submit = vi.fn(async (_text, hooks) => {
+      signal = hooks.signal;
+      await new Promise<void>((resolve) => { finish = resolve; });
+    });
+    const task: import("../../agent/tasks.js").BgTask = {
+      id: "agent-review", runId: "run", kind: "agent", status: "running",
+      description: "Review docs", startedAt: Date.now(), messages: [],
+    };
+    const { stdin, lastFrame, unmount } = render(<App {...makeDeps({ submit, listAgentTasks: () => [task] })} />);
+    try {
+      stdin.write("review"); await delay(); stdin.write("\r"); await delay();
+      stdin.write("draft"); await delay();
+      stdin.write("\x14"); await delay();
+      expect(lastFrame()).toContain("子 agent 执行情况");
+      expect(lastFrame()).toContain("agent-review");
+      task.messages!.push({ role: "assistant", content: null, tool_calls: [{ id: "call", type: "function", function: { name: "Read", arguments: "README.md" } }] });
+      await delay(1100);
+      expect(lastFrame()).toContain("Read README.md");
+      expect(lastFrame()).toContain("1 次工具调用");
+      stdin.write("\x1b"); await delay();
+      expect(lastFrame()).not.toContain("子 agent 执行情况");
+      expect(lastFrame()).toContain("draft");
+      expect(signal?.aborted).toBe(false);
+      expect(submit).toHaveBeenCalledTimes(1);
+    } finally { finish?.(); unmount(); }
+  });
+
+  it("Ctrl+T selects failed tasks and toggles closed without submitting input", async () => {
+    const submit = vi.fn();
+    const tasks: import("../../agent/tasks.js").BgTask[] = [
+      { id: "a", runId: "1", kind: "agent", status: "running", description: "first", startedAt: Date.now() },
+      { id: "b", runId: "2", kind: "agent", status: "failed", description: "second", startedAt: Date.now(), error: "round limit reached" },
+    ];
+    const { stdin, lastFrame, unmount } = render(<App {...makeDeps({ submit, listAgentTasks: () => tasks })} />);
+    try {
+      await delay(); stdin.write("\x14"); await delay();
+      stdin.write("\x1b[B"); await delay();
+      expect(lastFrame()).toContain("round limit reached");
+      stdin.write("\r"); await delay();
+      expect(submit).not.toHaveBeenCalled();
+      stdin.write("\x14"); await delay();
+      expect(lastFrame()).not.toContain("子 agent 执行情况");
+    } finally { unmount(); }
+  });
+
   // 默认跑中文(断言中文文案的用例据此);需要英文的用例在自身内 setLang("en")。
   beforeEach(() => setLang("zh"));
 

@@ -2500,6 +2500,7 @@ async function main() {
             label: `${m.id}${m.title ?? m.summary ? ` — ${m.title ?? m.summary}` : ""}${m.done ? "" : " ·未完成"}`,
           })),
         initialItems,
+        listAgentTasks: () => taskManager.all().filter((task) => task.kind === "agent"),
         subscribeTasks: (cb) => backgroundRuntime.subscribe(cb),
         runningTasks: () => backgroundRuntime.running().filter((s) => s.kind === "agent").length,
         runningShells: () => processManager.runningCount(),

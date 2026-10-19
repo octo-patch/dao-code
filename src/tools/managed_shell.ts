@@ -181,8 +181,14 @@ export class ManagedShell {
                 const watcher = watch(dir, () => { if (existsSync(path.join(dir, "runner-state.json")))
                     finish(); });
                 const timer = setTimeout(() => finish(new Error("runner 启动超时，未重复执行。")), 10000);
-                const finish = (error?: Error) => { if (finished)
-                    return; finished = true; clearTimeout(timer); watcher.close(); error ? reject(error) : resolve(); };
+                const finish = (error?: Error) => {
+                    if (finished) return;
+                    finished = true;
+                    clearTimeout(timer);
+                    watcher.close();
+                    if (error) reject(error);
+                    else resolve();
+                };
                 child.once("error", finish);
                 child.once("exit", () => { if (!existsSync(path.join(dir, "runner-state.json")))
                     finish(new Error("runner 启动失败。")); });

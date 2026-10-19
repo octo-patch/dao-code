@@ -240,6 +240,7 @@ describe("agent tool", () => {
     const all = taskManager.all();
     expect(all).toHaveLength(1);
     expect(all[0]!.status).toBe("completed");
+    expect(all[0]!.messages).toContainEqual(expect.objectContaining({ role: "assistant", content: "单任务结果" }));
   });
 
   it("前台任务抛错 → taskManager 结算为 failed(不留 running),错误照常抛给调用方", async () => {

@@ -125,6 +125,18 @@ async function drain(gen: AsyncGenerator<ChatMessage, void>): Promise<ChatMessag
 }
 
 describe("runAgent 阶段接线", () => {
+  it("passes the resolved subagent budget to the query loop", async () => {
+    const previous = process.env.DAO_SUBAGENT_MAX_TURNS;
+    process.env.DAO_SUBAGENT_MAX_TURNS = "800";
+    try {
+      let limit: number | undefined;
+      await drain(runAgent(baseParams({ runTurn: async (deps) => { limit = deps.maxTurns; } })));
+      expect(limit).toBe(800);
+    } finally {
+      if (previous === undefined) delete process.env.DAO_SUBAGENT_MAX_TURNS;
+      else process.env.DAO_SUBAGENT_MAX_TURNS = previous;
+    }
+  });
   it("非 fork 路径:system 消息不再从 session.messages 里丢失(旧 bug:整体替换丢了 Session 构造函数塞的 system)", async () => {
     let capturedMessages: ChatMessage[] | undefined;
     const params = baseParams({

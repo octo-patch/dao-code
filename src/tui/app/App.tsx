@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { AgentTasksPanel } from "./AgentTasksPanel.js";
 import { commandNeedsPause } from "../../commands/scheduling.js";
 import { Box, Text, Static, useApp, useInput, usePaste, useStdout } from "ink";
 import { highlight } from "cli-highlight";
@@ -307,6 +308,7 @@ export function App(deps: AppDeps) {
   const busyRef = useRef(false);
   useEffect(() => { busyRef.current = busy; }, [busy]);
   const [taskTick, setTaskTick] = useState(0); // 后台任务状态变化计数(驱动通知处理/计数刷新)
+  const [agentTasksOpen, setAgentTasksOpen] = useState(false);
   const [schedulerStatus, setSchedulerStatus] = useState(deps.scheduler?.status());
   const [bgRunning, setBgRunning] = useState(0);
   const [bgShells, setBgShells] = useState(0);
@@ -1039,6 +1041,15 @@ export function App(deps: AppDeps) {
       else if (ch && !key.ctrl && !key.meta) setAskInput((s) => s + ch);
       return;
     }
+    // 模型运行或等待期间也可只读查看任务。
+    if (key.ctrl && ch === "t" && deps.listAgentTasks) {
+      setAgentTasksOpen((open) => !open);
+      return;
+    }
+    if (agentTasksOpen && !(key.ctrl && ch === "c")) {
+      if (key.escape) setAgentTasksOpen(false);
+      return;
+    }
     if (key.escape && (busy || schedulerStatus?.state === "waiting")) {
       // 有还没被消费的排队输入:先只取消这些排队输入,不打断正在跑的回合——第二次 ESC 才真正中断。
       // 取消的内容不回填输入框(和下面"中断当前回合"的回填语义不一样,避免和用户当前草稿混在一起)。
@@ -1237,6 +1248,7 @@ export function App(deps: AppDeps) {
     if (approval) return;
     if (choice) { if (choiceIdx === choice.options.length + (choice.multi ? 1 : 0)) setAskInput((s) => s + text); return; } // 焦点在"自己输入"行才接受粘贴
     if (ask) { setAskInput((s) => s + text); return; }
+    if (agentTasksOpen) return;
     // macOS 空粘贴:剪贴板里有图片(终端发空 bracketed paste 序列)。检测到后读取 PNG → base64 → 存占位符。
     if (process.platform === "darwin" && text.length === 0) {
       void getImageFromClipboard().then(img => {
@@ -1317,7 +1329,7 @@ export function App(deps: AppDeps) {
   return (
     <Box flexDirection="column">
       {/* 会话开始前:欢迎屏在动态区,随终端 resize 实时重排(useTermWidth 订阅)。 */}
-      {items.length === 0 && !deps.skipBanner ? (
+      {items.length === 0 && !deps.skipBanner && !agentTasksOpen ? (
         <Welcome info={deps.welcome.info} caps={deps.welcome.caps} bg={bg} maxim={deps.welcome.maxim} />
       ) : null}
       <Static key={staticKey} items={items}>
@@ -1330,7 +1342,11 @@ export function App(deps: AppDeps) {
         }
       </Static>
 
-      {reviewMode && (
+      {agentTasksOpen && deps.listAgentTasks && !approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick && (
+        <AgentTasksPanel listTasks={deps.listAgentTasks} />
+      )}
+
+      {reviewMode && !agentTasksOpen && (
         <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={c("gold")} paddingX={1}>
           <Text color={c("gold")}>↻ 回看历史对话(共 {reviewMode.length} 条记录)· Esc 返回当前对话</Text>
           {reviewMode.map((it) => (
@@ -1340,7 +1356,7 @@ export function App(deps: AppDeps) {
         </Box>
       )}
 
-      {live && (
+      {live && !agentTasksOpen && (
         <Box flexDirection="column" marginTop={1}>
           {/* 推理预览:只显示思考文本(spinner/动词/耗时统一放下方状态行,避免重复)。 */}
           {live.reasoning && !live.content ? (
@@ -1589,7 +1605,7 @@ export function App(deps: AppDeps) {
         </Box>
       )}
 
-      {!approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick && (
+      {!agentTasksOpen && !approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick && (
         <Box flexDirection="column" marginTop={1}>
           {/* 输入行加圆角边框,交互时清晰可辨(活跃=青玉,运行中=暗);补全/提示行在框外。 */}
           <Box borderStyle="round" borderColor={busy ? c("dim") : c("jade")} paddingX={1}>
@@ -1655,7 +1671,7 @@ export function App(deps: AppDeps) {
       {schedulerStatus?.state === "waiting" ? <Text color={c("gold")}>{t("ui.waitingTasks", schedulerStatus.waiting?.count ?? 0, schedulerStatus.waiting?.mode ?? "any")}</Text> : null}
       {schedulerStatus?.state === "recovering" ? <Text color={c("gold")}>{t("ui.backgroundRecovering")}</Text> : null}
       {schedulerStatus?.state === "paused" ? <Text color={c("gold")}>{t("ui.backgroundPaused")}</Text> : null}
-      {bgRunning > 0 ? <Text color={c("gold")}>{t("ui.bgRunning", bgRunning)}</Text> : null}
+      {bgRunning > 0 ? <Text color={c("gold")}>{t("ui.bgRunning", bgRunning)}{deps.listAgentTasks ? " · Ctrl+T" : ""}</Text> : null}
       <StatusBar status={status} c={c} bgShells={bgShells} />
     </Box>
   );
