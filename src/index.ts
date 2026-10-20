@@ -1280,7 +1280,7 @@ async function main() {
       recoveryAgentAuthorization=scope;
       try {return JSON.stringify(await ctx.resumeAgent!(scope,[id,...rest].join(" ")));} finally {recoveryAgentAuthorization=undefined;}
     }
-    return JSON.stringify({tasks:backgroundRuntime.snapshots(),unresolved:store.unresolved().map(r=>({scope:r.scope,id:r.id,tool:r.name,args:r.args}))},null,2)+"\n核实后：/recovery resolve <scope> <toolCallId> <核实决定>；继续代理：/recovery continue <taskId> <指令>";
+    return JSON.stringify({tasks:backgroundRuntime.snapshots(),unresolved:store.unresolved().map(r=>({scope:r.scope,id:r.id,tool:r.name,args:r.args}))},null,2)+"\n核实未决工具：/recovery resolve <scope> <toolCallId> <核实决定>；核实 unknown 后台任务：/recovery decide <taskId> <completed|failed|canceled> <核实证据>；继续代理：/recovery continue <taskId> <指令>";
   };
   let recoveryAgentAuthorization:string|undefined;
   const preserveStop=()=>{try{backgroundRuntime.setState("paused",true);}catch{}};

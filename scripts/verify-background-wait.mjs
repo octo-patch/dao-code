@@ -1,17 +1,20 @@
 // Deterministic CLI wiring smoke: fake model responses, real Bash/FIFO/process exit.
 // No credentials or network requests. This is not a live-model acceptance test.
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 const replMode = process.argv.includes('--repl');
+// Exercise the installed Bun executable (including its self-spawn path) when supplied.
+const binary = process.env.DAO_WAIT_TEST_BINARY;
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = mkdtempSync(path.join(tmpdir(), 'dao-wait-cli-'));
 try {
   execFileSync('mkfifo', [path.join(fixture, 'gate')]);
   const preload = path.join(fixture, 'model.mjs');
+  if (binary) assert(!/\s/.test(preload), 'BUN_OPTIONS requires a preload path without whitespace');
   writeFileSync(preload, `
 import { writeFileSync } from 'node:fs';
 const root = ${JSON.stringify(fixture)};
@@ -46,9 +49,12 @@ globalThis.fetch = async (_url, options) => {
 };
 `);
   const result = await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['--import', path.join(repo, 'node_modules/tsx/dist/loader.mjs'), '--import', preload,
-      path.join(repo, 'src/index.ts'), '--api-key', 'test-only-no-credentials', '--provider', 'deepseek', '--eval', '--no-skills', '--no-hooks', '--yolo', ...(replMode ? [] : ['verify background wait'])],
-      { cwd: fixture, env: { ...process.env, DAO_NO_CHECKPOINT: '1', DAO_REFLECT: '0' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const entryArgs = binary ? [] : ['--import', path.join(repo, 'node_modules/tsx/dist/loader.mjs'), '--import', preload, path.join(repo, 'src/index.ts')];
+    const child = spawn(binary || process.execPath, [...entryArgs,
+      '--api-key', 'test-only-no-credentials', '--provider', 'deepseek', '--eval', '--no-skills', '--no-hooks', '--yolo', ...(replMode ? [] : ['verify background wait'])],
+      { cwd: fixture, env: { ...process.env, DAO_NO_CHECKPOINT: '1', DAO_REFLECT: '0',
+        ...(process.env.DAO_WAIT_TEST_TMPDIR ? { TMPDIR: process.env.DAO_WAIT_TEST_TMPDIR } : {}),
+        ...(binary ? { BUN_OPTIONS: `--preload ${preload}` } : {}) }, stdio: ['pipe', 'pipe', 'pipe'] });
     child.stdin.end(replMode ? 'verify background wait\n' : '');
     let output = ''; child.stdout.on('data', d => { output += d; }); child.stderr.on('data', d => { output += d; });
     const timeout = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('CLI smoke timed out\n' + output)); }, 15000);
@@ -57,5 +63,20 @@ globalThis.fetch = async (_url, options) => {
   assert.equal(result.code, 0, result.output);
   assert.match(result.output, /CLI_WAIT_OK/);
   assert.deepEqual(JSON.parse(readFileSync(path.join(fixture, 'requests.json'), 'utf8')), { requests: 3, released: true });
-  console.log((replMode ? 'REPL' : 'argv') + ' CLI wait smoke passed: 3 model requests total; 0 during waiting; real shell completion resumed once.');
+  const sessions = path.join(fixture, '.dao', 'sessions');
+  const runs = readdirSync(sessions).flatMap(id => {
+    const dir = path.join(sessions, id, 'runs');
+    return existsSync(dir) ? readdirSync(dir).map(run => path.join(dir, run)) : [];
+  });
+  assert.equal(runs.length, 1, 'Expected exactly one runner');
+  const receipt = JSON.parse(readFileSync(path.join(runs[0], 'terminal.json'), 'utf8'));
+  assert.equal(receipt.snapshot.status, 'completed');
+  assert.equal(receipt.exitCode, 0);
+  assert.equal(readFileSync(path.join(runs[0], 'stdout.log'), 'utf8'), 'shell completed\n');
+  assert(existsSync(path.join(runs[0], 'runner.log')), 'Missing startup diagnostics');
+  if (process.env.DAO_WAIT_TEST_TMPDIR) {
+    const manifest = JSON.parse(readFileSync(path.join(runs[0], 'manifest.json'), 'utf8'));
+    assert.equal(path.dirname(manifest.endpoint), '/tmp', 'Expected fallback from unusable TMPDIR');
+  }
+  console.log((binary ? 'installed binary ' : 'source ') + (replMode ? 'REPL' : 'argv') + ' CLI wait smoke passed: one runner completed with exit 0 and verified stdout; 3 model requests total; 0 during waiting; completion resumed once.');
 } finally { rmSync(fixture, { recursive: true, force: true }); }

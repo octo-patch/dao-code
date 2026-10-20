@@ -2,7 +2,7 @@ import { toolExecution } from "../session/tool_execution.js";
 import { createConnection, type Socket } from "node:net";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, watch, type FSWatcher } from "node:fs";
+import { accessSync, constants, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync, watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,20 @@ import { sandboxSpawn } from "./sandbox.js";
 import { scrubbedEnv } from "./safe_env.js";
 import type { ExecutionSnapshot, ExecutionEvent } from "../agent/background_types.js";
 import type { RunnerManifest, RunnerState } from "./shell_runner.js";
+function runnerEndpoint(runId: string): string {
+    // TMPDIR can be inherited from another user (e.g. root's private macOS temp).
+    // Keep the socket below macOS's 104-byte sockaddr_un limit, including NUL.
+    for (const dir of new Set([tmpdir(), "/tmp"])) {
+        const endpoint = path.join(dir, `dao-${runId}.sock`);
+        if (Buffer.byteLength(endpoint) >= 104) continue;
+        try {
+            if (!statSync(dir).isDirectory()) continue;
+            accessSync(dir, constants.W_OK | constants.X_OK);
+            return endpoint;
+        } catch { /* Try the system temp directory before starting a runner. */ }
+    }
+    throw new Error("没有可用的 runner 临时目录；请检查 TMPDIR 和 /tmp 的访问权限。");
+}
 export class ManagedShell {
     private socket?: Socket;
     private watcher?: FSWatcher;
@@ -162,20 +176,27 @@ export class ManagedShell {
         const sb = sandboxSpawn(command, cwd);
         if (sb && "error" in sb)
             throw new Error(sb.error);
-        const manifest: RunnerManifest = { sessionId: store.sessionId, taskId, runId, command, cwd, endpoint: path.join(tmpdir(), `dao-${runId}.sock`), spawnSpec: sb ?? undefined };
+        const manifest: RunnerManifest = { sessionId: store.sessionId, taskId, runId, command, cwd, endpoint: runnerEndpoint(runId), spawnSpec: sb ?? undefined };
         store.saveRun(snapshot);
         store.setLaunch(runId, { granted: false, tool: toolExecution.getStore() });
         durableJson(path.join(dir, "manifest.json"), manifest);
         writeFileSync(path.join(dir, "capability"), randomUUID(), { mode: 0o600 });
         emit({ type: "started", snapshot });
-        const main = fileURLToPath(new URL("../index.js", import.meta.url));
-        const source = main.replace(/\.js$/, ".ts");
-        const isSource = existsSync(source) && !main.includes("$bunfs");
-        const args = process.versions.bun && main.includes("$bunfs") ? [] : [...(isSource && !process.versions.bun ? ["--import", createRequire(import.meta.url).resolve("tsx")] : []), isSource ? source : main];
-        const child = spawn(process.execPath, [...args, "--dao-shell-runner", dir], { cwd, detached: true, stdio: "ignore", env: scrubbedEnv() });
-        child.unref();
         const managed = new ManagedShell(store, snapshot, emit);
+        const startupLog = path.join(dir, "runner.log");
         try {
+            const main = fileURLToPath(new URL("../index.js", import.meta.url));
+            const source = main.replace(/\.js$/, ".ts");
+            const isSource = existsSync(source) && !main.includes("$bunfs");
+            const args = process.versions.bun && main.includes("$bunfs") ? [] : [...(isSource && !process.versions.bun ? ["--import", createRequire(import.meta.url).resolve("tsx")] : []), isSource ? source : main];
+            const log = openSync(startupLog, "a", 0o600);
+            let child;
+            try {
+                child = spawn(process.execPath, [...args, "--dao-shell-runner", dir], { cwd, detached: true, stdio: ["ignore", log, log], env: scrubbedEnv({ TMPDIR: path.dirname(manifest.endpoint) }) });
+            } finally {
+                closeSync(log);
+            }
+            child.unref();
             await new Promise<void>((resolve, reject) => {
                 let finished = false;
                 const watcher = watch(dir, () => { if (existsSync(path.join(dir, "runner-state.json")))
@@ -190,8 +211,8 @@ export class ManagedShell {
                     else resolve();
                 };
                 child.once("error", finish);
-                child.once("exit", () => { if (!existsSync(path.join(dir, "runner-state.json")))
-                    finish(new Error("runner 启动失败。")); });
+                child.once("exit", (code, signal) => { if (!existsSync(path.join(dir, "runner-state.json")))
+                    finish(new Error(`runner 启动失败（exit=${code}, signal=${signal}）。`)); });
                 if (existsSync(path.join(dir, "runner-state.json")))
                     finish();
             });
@@ -200,8 +221,23 @@ export class ManagedShell {
         }
         catch (error) {
             if(managed.state && ["completed","failed","canceled"].includes(managed.state.snapshot.status))return managed;
-            managed.unknown(error);
-            throw error;
+            const failure = new Error(`${error instanceof Error ? error.message : String(error)} 启动日志：${startupLog}`, { cause: error });
+            // The runner cannot execute the command until connect(true) grants it.
+            // Once a grant might have been issued, retain the conservative unknown outcome.
+            if (store.launch<{ granted?: boolean }>(runId)?.granted === false &&
+                !existsSync(path.join(dir, "grant.json")) && !existsSync(path.join(dir, "start.claim"))) {
+                snapshot.status = "failed";
+                snapshot.result = `命令未执行：${failure.message}`;
+                store.atomic(() => {
+                    store.setLaunch(runId, { failedBeforeGrant: true });
+                    store.saveRun(snapshot);
+                    emit({ type: "failed", snapshot: { ...snapshot }, eventId: `${runId}:terminal` });
+                });
+                managed.disconnect();
+                throw new Error(snapshot.result, { cause: error });
+            }
+            managed.unknown(failure);
+            throw failure;
         }
     }
 }

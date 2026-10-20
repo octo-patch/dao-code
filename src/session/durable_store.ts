@@ -191,7 +191,7 @@ export class DurableStore {
             if (existing?.state === "result_committed")
                 return existing.result;
             if (existing || (sideEffect && (this.unresolved().length || this.runs().some(r => r.status === "unknown"))))
-                throw new Error("存在结果未知的操作。请先只读核实，并由用户通过 /recovery resolve 明确处理后再执行。");
+                throw new Error("存在结果未知的操作。请先通过 /recovery 查看并只读核实；未决工具由用户通过 /recovery resolve 处理，unknown 后台任务通过 /recovery decide 处理后再执行。");
             this.db.prepare("INSERT INTO tools VALUES (?,?,?)").run(record.scope, record.id, JSON.stringify({ ...record, state: "started" }));
             return undefined;
         });

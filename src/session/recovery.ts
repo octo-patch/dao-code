@@ -31,7 +31,9 @@ export async function recoverBackground(store: DurableStore, runtime: Background
     processManager.bindStore(store);
     for (const original of store.runs()) {
         let snapshot = { ...original };
-        if (snapshot.kind === "shell" && snapshot.recovery === "runner" && !store.launch<{resolvedByUser?:boolean}>(snapshot.runId)?.resolvedByUser) {
+        const launch = store.launch<{ resolvedByUser?: boolean; failedBeforeGrant?: boolean }>(snapshot.runId);
+        if (snapshot.kind === "shell" && snapshot.recovery === "runner" &&
+            !launch?.resolvedByUser && !(launch?.failedBeforeGrant && snapshot.status === "failed")) {
             try {
                 await processManager.recover(snapshot);
             }
