@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 import { createInterface, type Interface } from "node:readline/promises";
 import { readFileSync, mkdirSync, writeFileSync, readdirSync, rmSync } from "node:fs";
+import { promises as fs } from "node:fs";
 import { execSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
 import { loadProfiles, saveProfiles, setActive, removeProfile } from "./config/profiles_store.js";
-import { DEFAULTS, MODELS_BY_PROVIDER, isProvider, resolveContextWindow, type Provider, type ResolvedCredential } from "./config/profiles.js";
+import { DEFAULTS, MODELS_BY_PROVIDER, contextWindowFor, type Provider, type ResolvedCredential } from "./config/profiles.js";
+import { resolveExtractModel } from "./tools/fetch_extract.js";
 import { resolveCredential, persistKey } from "./config/credential.js";
-import { validateCredential } from "./config/validate_key.js";
+import { validateCredential, fetchModels } from "./config/validate_key.js";
 import { runtimeKeychain, noopKeychain, keychainAvailable, keychainDelete } from "./config/keychain.js";
 import { migrateLegacyDir } from "./config/migrate_dirs.js";
-import { streamChat as streamChatRaw } from "./client/client.js";
+import { streamChat as streamChatRaw, isContextLengthError, isRateLimitError } from "./client/client.js";
 import { runTurn as runTurnRaw, sanitizeHistoryForResume } from "./agent/loop.js";
 import { executeToolCalls as executeToolCallsRaw } from "./tools/execute.js";
 import { initObs, wrapStreamChat, wrapRunTurn, wrapToolExec, flushObs, setObsSession, setObsMeta, obsStatus } from "./obs/index.js";
@@ -21,7 +23,6 @@ import { readFileTool } from "./tools/read_file.js";
 import { listDirTool } from "./tools/list_dir.js";
 import { writeFileTool } from "./tools/write_file.js";
 import { editFileTool } from "./tools/edit_file.js";
-import { multiEditTool } from "./tools/multi_edit.js";
 import { notebookEditTool } from "./tools/notebook_edit.js";
 import { installSkills } from "./skills/install.js";
 import { scheduleAdd, scheduleList, scheduleRemove } from "./schedule.js";
@@ -29,8 +30,8 @@ import { scheduleTool } from "./tools/schedule_tool.js";
 import { skillInstallTool } from "./tools/skill_install.js";
 import { loadPlugins, installPlugin, removePlugin, pluginsRoot, pluginComponentDirs } from "./plugins.js";
 import { loadProjectInstructions } from "./project_doc.js";
-import { gatherEnvSnapshotData, formatEnvSnapshot } from "./env_snapshot.js";
-import { execShellTool } from "./tools/exec_shell.js";
+import { gatherEnvSnapshotData, formatEnvSnapshot, probeTopLevelDir, probeMemory, formatFastEnvFields, wrapDelayedEnvNotice } from "./env_snapshot.js";
+import { execShellTool, cleanupDbBackups } from "./tools/exec_shell.js";
 import { execShellPollTool } from "./tools/exec_shell_poll.js";
 import { execShellKillTool } from "./tools/exec_shell_kill.js";
 import { grepFilesTool } from "./tools/grep_files.js";
@@ -114,7 +115,7 @@ import { createToolAuditSink, type ToolAuditSink, summarizeToolTrace, formatTool
 import { createPermAuditSink, type PermAuditSink, summarizePermTrace, formatPermReport } from "./permissions/perm_audit.js";
 import { createSkillAuditSink, type SkillAuditSink, readAllSkillTraces, summarizeSkillTrace, formatSkillReport } from "./skills/skill_audit.js";
 import { createCheckpointer } from "./session/checkpoint.js";
-import { runRepl } from "./repl.js";
+import { runRepl, drainAndContinue } from "./repl.js";
 import { dispatchCommand } from "./commands/commands.js";
 import { runBuiltinCommand } from "./commands/builtin.js";
 import { buildWelcome } from "./tui/banner.js";
@@ -143,6 +144,20 @@ function transcriptFromMessages(messages: ChatMessage[]): TranscriptItem[] {
       out.push({ id: id++, kind: "assistant", text: m.content });
   }
   return out;
+}
+
+// 读 settings.json 的 checkpoint.enabled:项目级 > 用户级;缺失/损坏 → false(默认关闭)。
+async function readCheckpointEnabled(userFile: string, projectFile: string | null): Promise<boolean> {
+  const readVal = async (file: string): Promise<boolean | undefined> => {
+    try {
+      const raw = await fs.readFile(file, "utf8");
+      const v = (JSON.parse(raw) as { checkpoint?: { enabled?: unknown } }).checkpoint?.enabled;
+      return typeof v === "boolean" ? v : undefined;
+    } catch { return undefined; }
+  };
+  const projectVal = projectFile ? await readVal(projectFile) : undefined;
+  const userVal = await readVal(userFile);
+  return projectVal ?? userVal ?? false;
 }
 
 async function main() {
@@ -261,29 +276,50 @@ async function main() {
   // 这是另一套独立机制(不依赖 --reflect-memory),之前一直无条件跑(仅一次性 headless 因
   // argvPrompt 而被跳过),交互态/非 TTY 多轮管道下每轮都在算 + 命中阈值就 fork 一次 LLM 调用。
   const reflectChallengerFlag = rawArgs.includes("--reflect-challenger");
-  // --eval:评测模式糖,等价于同时 --no-memory --no-skills --no-mcp --no-hooks --no-project-instructions。
-  // 每个子开关也可单独使用。--no-skills 的隔离范围覆盖整个"磁盘/插件自定义"通道:
-  // 技能本体 + 自定义子代理定义(.dao/agents)+ 自定义 slash 命令(.dao/commands)——三者都是同一类
+  // --eval:评测模式糖,等价于同时 --no-memory --no-skills --no-mcp --no-project-instructions --no-web。
+  // 每个子开关也可单独使用。--no-skills 的隔离范围覆盖"磁盘/插件自定义"通道:
+  // 磁盘/插件技能 + 自定义子代理定义(.dao/agents)+ 自定义 slash 命令(.dao/commands)——三者都是同一类
   // 用户/项目/插件自带的、会改变模型行为的注入源,不隔离会让评测结果混入本机个性化配置的影响。
+  // DAO 自带的内置技能(BUNDLED_SKILLS)和 hooks 不受 --eval 影响:它们是 DAO 本身能力的一部分,
+  // 不是"本机个性化配置",评测时应该像真实使用一样可用;仍可用 --no-skills/--no-hooks 单独关闭。
+  // --no-web 关 WebSearch/WebFetch(和 MCP 同属"外部、不受控的信息源"):terminal-bench
+  // polyglot-rust-c 真实撞见过模型联网搜到并抓取了该题带 canary GUID 的官方 solve.sh 全文
+  // (2026-07-30 真实复测)——这类基准任务的参考答案已被公开镜像到 GitHub,评测时开着网络工具
+  // 就是给模型一条查答案的路,而不是在测真实解题能力,污染的是 reward 本身,不是某道具体题的
+  // 结果。这两个工具会连公网抓取任意内容,污染风险和 MCP server 是同一类,理应和 MCP 一起归入
+  // "评测保持纯净"的默认关闭范围。
   const evalFlag = rawArgs.includes("--eval");
-  // 进度提醒(noProgress 计数器,连续 N 轮无实质推进就追加静态提醒)默认关闭,--progress-advice 才开。
+  // 进度提醒(noProgress 计数器,连续 N 轮无实质推进就追加静态提醒)【仅 headless 默认开启】,
+  // --no-progress-advice 显式关;交互式会话(TTY 且非一次性调用)默认不启用——有人盯着,
+  // 卡没卡用户自己看得见,提醒只会打断正常工作流。它保护的是无人值守场景(headless/eval/长任务)。
   // 和上面 reflectChallengerFlag 是两套独立机制(这个是纯本地计数器,不 fork LLM 调用),互不影响。
-  const progressAdviceFlag = rawArgs.includes("--progress-advice");
+  // 2026-07-19 的 f939ddf 曾把它改成需要显式 --progress-advice 才开,而真实评测从未传过这个参数,
+  // 等于在所有无人值守长任务里静默失去了这道保险(真实案例:一道题的历史通过 trace 里提醒在第 5 轮
+  // 触发、触发后模型立刻收敛写完,回归后同一题再没通过过)。同时判据已修正为"改动文件或执行命令"
+  // (见 loop.ts 的 PROGRESS_TOOLS),误触发率比当初关掉它的时候低得多。
+  // 交互式会话(TTY 且非一次性 prompt)默认不开进度提醒——有人盯着,卡没卡用户看得见,
+  // 提醒只会打断正常工作流。真正的判定见下方 progressAdviceFlag(要等 argvPrompt 解析完,
+  // 才能准确区分交互式与 headless;此处 rawArgs 里 -c/--model 等的【值】不以 - 开头,
+  // 天真地扫位置参数会把 `dao -c <session-id>` 的 id 误当 prompt → 交互式下误开提醒)。
   const noMemory = evalFlag || rawArgs.includes("--no-memory");
+  // 只管磁盘/插件技能 + 自定义子代理/命令,不管内置技能(见下面 noBuiltinSkills)。
   const noSkills = evalFlag || rawArgs.includes("--no-skills");
+  // 内置技能单独一个开关,--eval 不隐含它,只有显式 --no-skills 才关。
+  const noBuiltinSkills = rawArgs.includes("--no-skills");
   const noMcp = evalFlag || rawArgs.includes("--no-mcp");
-  const noHooks = evalFlag || rawArgs.includes("--no-hooks");
+  const noHooks = rawArgs.includes("--no-hooks");
   // 项目/用户级自定义指令(DAO.md,CLAUDE.md 的 DAO 对应物)。之前一直无条件加载并注入系统提示词,
   // --eval 完全没覆盖到——同样是"用户自定义、会改变模型行为"的影响源,单独给一个子开关。
   const noProjectInstructions = evalFlag || rawArgs.includes("--no-project-instructions");
+  const noWeb = evalFlag || rawArgs.includes("--no-web");
   const verbose = rawArgs.includes("--verbose") || rawArgs.includes("--debug");
-  // headless 临时 key:--api-key <key> + --provider <deepseek|volcengine|qianfan|...>
+  // headless 临时 key:--api-key <key> + --provider <deepseek|volcengine|qianfan|zhipu|...>
   const apiKeyIdx = rawArgs.indexOf("--api-key");
   const cliApiKey = apiKeyIdx >= 0 ? rawArgs[apiKeyIdx + 1] : undefined;
   const providerIdx = rawArgs.indexOf("--provider");
   const cliProviderRaw = providerIdx >= 0 ? rawArgs[providerIdx + 1] : undefined;
-  const cliProvider = isProvider(cliProviderRaw) ? cliProviderRaw : undefined;
-  const flags = new Set(["--yolo", "--continue", "-c", "--goal", "--task", "--coordinator", "--verbose", "--debug", "--api-key", "--provider", "--model", "--obs", "--reflect-memory", "--reflect-challenger", "--progress-advice", "--eval", "--no-memory", "--no-skills", "--no-mcp", "--no-hooks", "--no-project-instructions"]);
+  const cliProvider = (cliProviderRaw === "deepseek" || cliProviderRaw === "volcengine" || cliProviderRaw === "qianfan" || cliProviderRaw === "zhipu" || cliProviderRaw === "minimax" || cliProviderRaw === "anthropic" || cliProviderRaw === "openai") ? cliProviderRaw : undefined;
+  const flags = new Set(["--yolo", "--continue", "-c", "--goal", "--task", "--coordinator", "--verbose", "--debug", "--api-key", "--provider", "--model", "--obs", "--reflect-memory", "--reflect-challenger", "--progress-advice", "--no-progress-advice", "--eval", "--no-memory", "--no-skills", "--no-mcp", "--no-hooks", "--no-project-instructions", "--no-web"]);
   // 同时把每个 flag 后面的参数值也加进 flags(避免被拼成 prompt)
   if (cliApiKey) flags.add(cliApiKey);
   if (cliProviderRaw) flags.add(cliProviderRaw);
@@ -376,11 +412,16 @@ async function main() {
   // welcome 束(纯数据,无副作用):banner 信息 + 能力 + 背景 + 箴言。上移到首启分支之前,
   // 让 Ink onboarding 与 runInkApp 共用同一束(首启 banner 由 onboarding 渲染,runInkApp 走 skipBanner)。
   const caps = detectCapabilities(process.env, process.stdout.isTTY ?? false, process.stdout.columns);
-  let gitBranch: string | undefined;
-  try {
-    const head = readFileSync(path.join(workspaceRoot, ".git", "HEAD"), "utf8");
-    gitBranch = head.match(/ref: refs\/heads\/(.+)/)?.[1]?.trim();
-  } catch {}
+  // 实时读取当前 git 分支(每次 getStatus 调用都重读 .git/HEAD,切分支后 StatusBar 立即刷新)。
+  const readGitBranch = (): string | undefined => {
+    try {
+      const head = readFileSync(path.join(workspaceRoot, ".git", "HEAD"), "utf8");
+      return head.match(/ref: refs\/heads\/(.+)/)?.[1]?.trim();
+    } catch {
+      return undefined;
+    }
+  };
+  const gitBranch = readGitBranch();
   const welcomeInfo = {
     model: resolved?.model ?? DEFAULTS.deepseek.model, // 首启尚无凭证 → 默认模型(banner 仅展示;runInkApp 首启 skipBanner)
     thinking: process.env.DAO_REASONING_EFFORT || "max",
@@ -437,9 +478,9 @@ async function main() {
   let keySource = resolved.source;
   const cfg = { apiKey: resolved.key, baseUrl: resolved.baseUrl, model: resolved.model, provider: resolved.provider };
 
-  // ---- 目录信任(P2-37):紧接 key 之后,作为首次 onboarding 的第二步(对标 CC 单一连贯流程)----
+  // ---- 目录信任(P2-37):紧接 key 之后,作为首次 onboarding 的第二步 ----
   // 未信任目录【不加载】其项目级 settings/hooks,防恶意仓库自动执行。必须在加载任何项目级配置之前决定。
-  // 对标 CC 信任对话:交互终端进入未信任文件夹时直接问,y→信任整个文件夹并当场加载(无需重启);
+  // 信任对话:交互终端进入未信任文件夹时直接问,y→信任整个文件夹并当场加载(无需重启);
   // 否则继续不信任(只用用户级)。headless(-p 一次性)与非 TTY 不弹问,默认不信任(自动化不卡交互、安全默认)。
   // trustProject 已在首启分支前求值;首启(firstRun)时 onboarding 已问过信任,这里不再用 readline 重复问。
   if (!trustProject) {
@@ -466,9 +507,14 @@ async function main() {
       const p = profilesCfg.profiles[n]!;
       return { name: n, active: n === profilesCfg.activeProfile, detail: `${p.provider}/${p.model} · ${p.keyRef ? "钥匙串" : "文件"}` };
     });
-  // /model 无参选择器:只列当前 provider 下已知的模型串,和 /model 文本命令的校验范围一致。
-  const listModels = () =>
-    (MODELS_BY_PROVIDER[cfg.provider] ?? MODELS_BY_PROVIDER.deepseek).map((m) => ({ model: m, active: m === session.model }));
+  // /model 无参选择器:内置 provider 列 MODELS_BY_PROVIDER;自定义网关(baseUrl 与默认不同)只列当前 model,
+  // 由 openModelPicker 异步拉取网关 /models 替换列表。
+  const listModels = () => {
+    const activeProf = profilesCfg.profiles[profilesCfg.activeProfile];
+    const isCustomGw = activeProf && activeProf.baseUrl !== DEFAULTS[activeProf.provider].baseUrl;
+    if (isCustomGw) return [{ model: session.model, active: true }];
+    return (MODELS_BY_PROVIDER[cfg.provider] ?? MODELS_BY_PROVIDER.deepseek).map((m) => ({ model: m, active: m === session.model }));
+  };
   // 切换:钥匙串读取是异步的,但 model/provider/baseUrl 都在 profile 文件里,可同步生效(让 StatusBar 立即刷新);
   // 只有 apiKey 需要等钥匙串异步解析(下一回合 streamChat 读 cfg.apiKey)。
   const switchAccount = (name: string): boolean => {
@@ -514,11 +560,13 @@ async function main() {
     for (let i = 2; ; i++) if (!profilesCfg.profiles[`account-${i}`]) return `account-${i}`;
   };
   // 添加:一账户一 key,同名已存在直接拒绝(想换 key 先 /account rm 再新建)→ 校验 → 持久化(钥匙串优先)→ 激活并即时生效。
-  const addAccount = async (key: string, name?: string, provider: Provider = "deepseek"): Promise<{ ok: boolean; name?: string; reason?: string }> => {
+  // baseUrl/model 可选:自定义网关(OpenAI 兼容,如京东 llm-gw)传入实际值,不传则回退 provider 默认。
+  const addAccount = async (key: string, name?: string, provider: Provider = "deepseek", baseUrl?: string, model?: string): Promise<{ ok: boolean; name?: string; reason?: string }> => {
     const targetName = name?.trim() || nextAccountName();
     if (profilesCfg.profiles[targetName]) return { ok: false, reason: `账户已存在:${targetName}(先 /account rm ${targetName} 再新建)` };
-    const meta = { provider, ...DEFAULTS[provider] };
-    const v = await validateCredential({ baseUrl: meta.baseUrl, key, provider: meta.provider });
+    const meta = { provider, baseUrl: baseUrl?.trim() || DEFAULTS[provider].baseUrl, model: model?.trim() || DEFAULTS[provider].model };
+    // 自定义 model(自定义网关选完模型)→ 按该 model 探针,确认这个 token 对它有授权(京东网关未授权返回 4012)。
+    const v = await validateCredential({ baseUrl: meta.baseUrl, key, provider: meta.provider, ...(model?.trim() ? { model: meta.model } : {}) });
     if (!v.ok) return { ok: false, reason: v.reason };
     const { cfg: nc } = await persistKey(profilesCfg, targetName, meta, key, kc, { preferKeychain: keychainAvailable() });
     profilesCfg = { ...nc, onboardingComplete: true };
@@ -535,9 +583,13 @@ async function main() {
 
   const registry = new ToolRegistry();
   for (const t of [
-    readFileTool, listDirTool, writeFileTool, editFileTool, multiEditTool, notebookEditTool,
+    readFileTool, listDirTool, writeFileTool, editFileTool, notebookEditTool,
     execShellTool, execShellPollTool, execShellKillTool,
-    grepFilesTool, fileSearchTool, askUserTool, fetchUrlTool, webSearchTool, todoWriteTool, memoryWriteTool, memoryReadTool, skillTool, skillInstallTool, taskSendTool, messageParentTool, agentTool, scheduleTool,
+    grepFilesTool, fileSearchTool, askUserTool,
+    // --no-web / --eval 跳过(见上方 noWeb 定义处说明):不注册就是全流程(含子代理,子代理复用
+    // 同一个 registry)都拿不到这两个工具,不是"注册了但不给用"这种更容易被绕过的软限制。
+    ...(noWeb ? [] : [fetchUrlTool, webSearchTool]),
+    todoWriteTool, memoryWriteTool, memoryReadTool, skillTool, skillInstallTool, taskSendTool, messageParentTool, agentTool, scheduleTool,
     taskCreateTool, taskListTool, taskGetTool, taskOutputTool, taskUpdateTool, taskStopTool, notifyUserTool,
     enterPlanModeTool, exitPlanModeTool,
     enterWorktreeTool, exitWorktreeTool,
@@ -569,8 +621,17 @@ async function main() {
   // 由 runTurn 在工具轮边界(loop.ts 的 drainMcpNotices)统一消费,保证时机安全。
   const mcpChangeQueue: string[] = [];
   mcp.onServerChange = (notice) => mcpChangeQueue.push(notice);
-  // MCP 工具默认隐藏(见 registry.isMcpVisible);只有连了至少一个 server 才值得注册 ToolSearch 去找它们。
-  if (mcp.connectedCount > 0 || registry.countMcpTools() > 0) registry.register(toolSearchTool);
+  // MCP 工具默认隐藏(见 registry.isMcpVisible)。ToolSearch 无条件注册——它不只是发现 MCP 工具的
+  // 入口,也是激活上面 22 个内置 shouldDefer 工具(TaskOutput/TaskCreate/Monitor 等)的唯一入口,
+  // 这些内置工具跟连不连 MCP 无关、任何模式下都无条件注册。此前按"连了 MCP 才注册 ToolSearch"
+  // 门这个条件,导致 --eval/--no-mcp 场景下(评测环境从不连 MCP)这些内置工具永久不可达——而
+  // system_prompt.ts 明确写着"调用前必须先用 ToolSearch 搜该工具名"、Agent 工具描述明确指导
+  // "用 TaskOutput 做 checkpoint 式进度检查",这两条指导在这些场景里根本执行不了(真实撞见:
+  // torch-pipeline-parallelism 复测,模型派了后台 verify 子代理后想用 TaskOutput 查进度,发现
+  // 工具不可见,以为自己没有 ToolSearch,放弃等待提前收尾,子代理真实验证结果永久丢失)。
+  // ToolSearch 本身只读、无副作用,不引入外部状态,无条件注册不违背"--eval 保持纯净"的本意
+  // (那条注释针对的是外部 MCP server 连接,不是内置工具能不能被发现)。
+  registry.register(toolSearchTool);
 
   // LSP:不接入任何语言的二进制,纯协议客户端;server 命令完全来自用户配置(同 MCP 的配置文件模式)。
   // 没配置任何 server 就不注册 lsp 工具(没意义,只会让模型看见一个必然报错的工具)。
@@ -700,9 +761,9 @@ async function main() {
   // 禁用集(~/.dao/skills-disabled.json):被禁用的技能(内置或磁盘)都不注入上下文(省 token),/skills 可开关。
   const disabledPath = path.join(os.homedir(), ".dao", "skills-disabled.json");
   const disabledSet = new Set<string>((() => { try { return JSON.parse(readFileSync(disabledPath, "utf8")); } catch { return []; } })());
-  // 内置技能:默认开、描述常驻上下文(可自动触发)。同名磁盘/插件技能覆盖之;也可在 /skills 关(对标 CC disableBundledSkills)。
-  // --no-skills / --eval 时也清空(不注入内置技能描述)。
-  const coreBundled = noSkills ? [] : BUNDLED_SKILLS
+  // 内置技能:默认开、描述常驻上下文(可自动触发)。同名磁盘/插件技能覆盖之;也可在 /skills 关。
+  // 只有显式 --no-skills 才清空;--eval 不隐含关闭内置技能(见 noBuiltinSkills 定义处的说明)。
+  const coreBundled = noBuiltinSkills ? [] : BUNDLED_SKILLS
     .filter((b) => b.core && !diskNames.has(b.name) && !disabledSet.has(b.name))
     .map((b) => ({ name: b.name, description: b.description, body: b.body, dir: "", slug: b.name, ...(b.modelInvokable === false ? { modelInvokable: false } : {}), ...(b.userInvocable === false ? { userInvocable: false } : {}) } as import("./skills/skills.js").Skill));
   const pluginsDir = pluginsRoot();
@@ -723,6 +784,14 @@ async function main() {
     })),
     ...diskSkills.map((s) => ({ name: s.name, on: !disabledSet.has(s.name), source: skillSource(s) + invMark(s), detail: s.description })),
   ];
+  // 斜杠命令面板用:列出可 /调用的 skill(slug + 简述),与 findUserInvocableSkill 同一数据源(skills)。
+  const listInvocableSkills = () =>
+    skills
+      .filter((s) => s.userInvocable !== false)
+      .map((s) => ({
+        slug: `${s.namespace ? s.namespace + ":" : ""}${s.slug ?? s.name}`,
+        description: s.description,
+      }));
   const setSkillEnabled = (name: string, on: boolean) => { if (on) disabledSet.delete(name); else disabledSet.add(name); persistDisabled(); };
   const batchSkills = (scope: "bundled" | "installed" | "all", on: boolean) => {
     const names = scope === "bundled" ? allBundledNames : scope === "installed" ? diskSkills.map((s) => s.name) : [...allBundledNames, ...diskSkills.map((s) => s.name)];
@@ -778,7 +847,13 @@ async function main() {
   // 真正的交互式会话:有 TTY 且不是一次性 --goal 调用——决定 ctx.askChoice 是否注入(下方)、
   // 也决定系统提示词要不要加"会话特定指引"(AskUserQuestion 在 headless 下没人回答)。
   const interactiveSession = process.stdin.isTTY === true && !argvPrompt;
-  const envSnapshot = formatEnvSnapshot(await envSnapshotPromise, lang === "en");
+  // 进度提醒(noProgress 计数器,连续 N 轮无实质推进就追加静态提醒):仅 headless/一次性场景默认开,
+  // 交互式默认关(有人盯着,卡没卡看得见,提醒只会打断)。用权威的 interactiveSession(基于解析后的
+  // argvPrompt)判定,避免 `dao -c <session-id>` 的 id 被误当 prompt 而在交互式下误开。--no-progress-advice 显式关。
+  const progressAdviceFlag = !rawArgs.includes("--no-progress-advice") && !interactiveSession;
+  // 快字段(顶层目录/内存)同步瞬时,直接拼进不可变 system prompt。慢字段(工具链/git/网络)
+  // 不再同步 await——见下方 envNoticeQueue,避免网络探测拖慢 Ink 挂载(index.ts 里的 runInkApp)。
+  const envSnapshot = formatFastEnvFields(probeTopLevelDir(workspaceRoot), probeMemory(), lang === "en");
   const systemPrompt =
     buildSystemPrompt({
       modelId: cfg.model,
@@ -794,6 +869,16 @@ async function main() {
       reflectChallengerEnabled: reflectChallengerFlag,
       interactive: interactiveSession,
     }) + agentTypesSection + skillsSection;
+
+  // 慢字段(工具链/git/网络):envSnapshotPromise 在 index.ts:297 就已经发起、和 onboarding 等
+  // 慢启动流程并发跑;这里只是等它就绪后格式化打 tag、推进队列。loop.ts 的 drainEnvNotices 在
+  // 下一次面向模型的请求前统一消费——赶上第一条请求就自然随它一起出现,赶不上就在下一次请求
+  // 前补投递,只投一次,不阻塞任何交互界面挂载。
+  const envNoticeQueue: string[] = [];
+  envSnapshotPromise.then((data) => {
+    const formatted = wrapDelayedEnvNotice(formatEnvSnapshot(data, lang === "en"), lang === "en");
+    if (formatted) envNoticeQueue.push(formatted);
+  });
 
   // Ink 交互态注册的审批/提问模态(App 挂载后填入);未填则回退 readline。
   let inkApprovalPrompt: ApprovalPrompt | null = null;
@@ -845,16 +930,20 @@ async function main() {
   // 本会话临时追加的 allow 规则("session"/"always" 决定产生);always 另持久化到 local。
   const sessionAllow: string[] = [];
   const getRules = () => ({ ...loadedPerms, allow: [...loadedPerms.allow, ...sessionAllow] });
-  // 运行时模式覆盖(/mode acceptEdits 等);null = 用 settings 的 defaultMode。
+  // 运行时模式覆盖(/mode auto 等);null = 用 settings 的 defaultMode。
   // --goal/--task/--coordinator 启动:用 auto(AI 判定自动批准)推进自主流程,而非 yolo 全开。
   let permModeOverride: PermissionMode | null = taskFlag && !yolo ? "auto" : null;
-  // 有效权限模式:plan 会话模式 > YOLO(=bypass)> 运行时覆盖 > settings 默认 > default。
+  // 有效权限模式:plan 会话 > YOLO(=bypass)> 运行时覆盖 > settings 默认 > auto(智能判定)。
+  // plan 只读规划不在 /mode 切换里,但 settings.defaultMode/--permission-mode//plan 可进入。
+  // 链尾回退从 default 改为 auto(2026-08):开箱即智能判定,只读/安全操作自动过、
+  // 拿不准的转人工——比「每个写操作都弹窗」的 default 对新用户更顺手;显式配置了
+  // settings.defaultMode 的用户不受影响。
   const getMode = (): PermissionMode =>
     session.mode === "plan"
       ? "plan"
       : yolo
         ? "bypassPermissions"
-        : permModeOverride ?? loadedPerms.defaultMode ?? "default";
+        : permModeOverride ?? loadedPerms.defaultMode ?? "auto";
 
   // auto 模式分类器:结合近期对话(用户意图 + 历史工具调用)judge 本次调用是否安全可自动批准。
   // 只回 allow/deny;出错→拒绝(fail-closed)。快速路径(白名单/工作区内编辑)已在 engine.decide 里短路,不到这里。
@@ -864,47 +953,80 @@ async function main() {
   // recentMessages 由调用方(PermissionGate.getMessages())传入,不能自己去读 session.messages——
   // 子代理走 withModeOverride 时会传自己的 sub.messages,这里必须原样透传,否则子代理的调用
   // 又会被根会话的转录判定,分类器看不到子代理自己在做什么(复盘 session 20260721-215548-uq75)。
+  // 智能判定分类器默认模型:主模型是 GLM-5.3-Flash / GLM-5.2 时用同族自身(同族便宜档),
+  // glm-5.3(zhipu coding plan 旗舰)用同族便宜档 glm-5.3-flash;其余沿用 deepseek-v4-flash。
+  // DAO_CLASSIFIER_MODEL 显式设置时永远优先。
+  const defaultClassifierModel = (mainModel: string): string =>
+    /^(GLM-5\.3-Flash|GLM-5\.2)$/i.test(mainModel) ? mainModel
+      : /^glm-5\.3$/i.test(mainModel) ? "glm-5.3-flash"
+      : "deepseek-v4-flash";
+
   const classifyPermission = async (toolName: string, argsJson: string, recentMessages: ChatMessage[]): Promise<boolean> => {
-    const classifierModel = process.env.DAO_CLASSIFIER_MODEL || "deepseek-v4-flash";
     const rules: AutoModeRules | undefined = loadedPerms.autoMode;
+    // 分类器模型不可用(模型名不存在/未授权/账号没配)时先回退主模型再试一次——主模型是
+    // 用户实际在用的、必然配好的;回退成功则本会话后续分类器调用都用它,只有两段都失败
+    // 才落到 gate.ts 的 fail-closed(转人工)。回退发生时提示一次,用户知道怎么改默认值。
+    let classifierModel = process.env.DAO_CLASSIFIER_MODEL || defaultClassifierModel(session.model);
+    let modelNotice = "";
     const onUsage = (u: any) => {
       session.addUsage(u, classifierModel);
       cacheSink.record({ agent: "classifier", depth: 0, turn: 0, model: classifierModel, usage: u, sys: "", tools: "", tail: "" });
     };
+    try {
+      return await classifyWithModel(classifierModel);
+    } catch (e) {
+      const status = (e as { status?: number }).status;
+      const msg = e instanceof Error ? e.message : String(e);
+      // 分类器模型不可用时回退主模型再试一次。判据放宽:除"换模型也没用"的两类
+      // (上下文超限——需上层压缩;限流/配额——需换账号或等待)外,任何失败都回退——
+      // 包括模型不存在/未授权(404、400 带 model、4010/4012)、网络/超时/5xx/空响应
+      // (streamChat 流式重试+非流式兜底耗尽后抛"连接…失败")。flash 模型不稳定时
+      // 不应让用户被打扰,回退到主模型(必然配好)继续判定。
+      if (isContextLengthError(e) || isRateLimitError(e)) throw e;
+      const fallback = session.model;
+      if (fallback === classifierModel) throw e;
+      modelNotice = `\n[智能判定] 分类器模型 ${classifierModel} 不可用(${msg.slice(0, 120)}),已回退用主模型 ${fallback} 判定;想固定指定请设 DAO_CLASSIFIER_MODEL\n`;
+      classifierModel = fallback;
+      return await classifyWithModel(classifierModel);
+    } finally {
+      if (modelNotice) process.stdout.write(modelNotice);
+    }
+    // 两阶段裁决(参数化模型):Stage1 快判 allow 即放行;拿不准升 Stage2 完整推理。
+    async function classifyWithModel(m: string): Promise<boolean> {
+      // Stage 1(fast):共享 system prompt + transcript,加 STAGE1_SUFFIX。
+      const gen1 = streamChat({
+        baseUrl: cfg.baseUrl,
+        apiKey: cfg.apiKey,
+        model: m,
+        messages: buildClassifierMessages(toolName, argsJson, recentMessages, rules, "zh", STAGE1_SUFFIX),
+        maxTokens: 64,
+        extra: { thinking: { type: "disabled" }, temperature: 0, stop: ["</block>"] },
+        onUsage,
+      });
+      let out1 = "";
+      let r1 = await gen1.next();
+      while (!r1.done) { if (r1.value.kind === "content") out1 += r1.value.text; r1 = await gen1.next(); }
+      const block1 = parseXmlBlock(out1);
+      if (block1 === false) return true;  // <block>no</block> -> 允许(快路径)
+      // block1 === true(应阻止)或 null(不可解析)-> 升级 Stage 2 做完整推理,减少 false positive。
 
-    // Stage 1(fast):共享 system prompt + transcript,加 STAGE1_SUFFIX。
-    const gen1 = streamChat({
-      baseUrl: cfg.baseUrl,
-      apiKey: cfg.apiKey,
-      model: classifierModel,
-      messages: buildClassifierMessages(toolName, argsJson, recentMessages, rules, "zh", STAGE1_SUFFIX),
-      maxTokens: 64,
-      extra: { thinking: { type: "disabled" }, temperature: 0, stop: ["</block>"] },
-      onUsage,
-    });
-    let out1 = "";
-    let r1 = await gen1.next();
-    while (!r1.done) { if (r1.value.kind === "content") out1 += r1.value.text; r1 = await gen1.next(); }
-    const block1 = parseXmlBlock(out1);
-    if (block1 === false) return true;  // <block>no</block> -> 允许(快路径)
-    // block1 === true(应阻止)或 null(不可解析)-> 升级 Stage 2 做完整推理,减少 false positive。
-
-    // Stage 2(thinking):共享 system prompt + transcript,加 STAGE2_SUFFIX。
-    const gen2 = streamChat({
-      baseUrl: cfg.baseUrl,
-      apiKey: cfg.apiKey,
-      model: classifierModel,
-      messages: buildClassifierMessages(toolName, argsJson, recentMessages, rules, "zh", STAGE2_SUFFIX),
-      maxTokens: 4096,
-      extra: { temperature: 0 },
-      onUsage,
-    });
-    let out2 = "";
-    let r2 = await gen2.next();
-    while (!r2.done) { if (r2.value.kind === "content") out2 += r2.value.text; r2 = await gen2.next(); }
-    const block2 = parseXmlBlock(out2);
-    if (block2 === false) return true;  // <block>no</block> -> 允许(复核通过)
-    return false;  // <block>yes</block> 或不可解析 -> 转人工
+      // Stage 2(thinking):共享 system prompt + transcript,加 STAGE2_SUFFIX。
+      const gen2 = streamChat({
+        baseUrl: cfg.baseUrl,
+        apiKey: cfg.apiKey,
+        model: m,
+        messages: buildClassifierMessages(toolName, argsJson, recentMessages, rules, "zh", STAGE2_SUFFIX),
+        maxTokens: 4096,
+        extra: { temperature: 0 },
+        onUsage,
+      });
+      let out2 = "";
+      let r2 = await gen2.next();
+      while (!r2.done) { if (r2.value.kind === "content") out2 += r2.value.text; r2 = await gen2.next(); }
+      const block2 = parseXmlBlock(out2);
+      if (block2 === false) return true;  // <block>no</block> -> 允许(复核通过)
+      return false;  // <block>yes</block> 或不可解析 -> 转人工
+    }
   };
 
   const gate: ApprovalGate = new PermissionGate(
@@ -937,9 +1059,34 @@ async function main() {
     );
   }
   // settings/CLI/企业策略指定的初始模式:plan→会话只读规划;bypassPermissions→等价 YOLO。
-  // default/acceptEdits 由 getMode 读 loadedPerms.defaultMode 处理,无需在此设置。
+  // default/auto 由 getMode 读 loadedPerms.defaultMode 处理,无需在此设置。
   if (loadedPerms.defaultMode === "plan") session.mode = "plan";
   else if (loadedPerms.defaultMode === "bypassPermissions") yolo = true;
+  // WebFetch 智能提取(prompt 参数)用模型:DeepSeek 系 provider 默认 flash 档,其余(anthropic/openai
+  // 当前未配置便宜档)回退主模型,同 SUMMARY_MODEL 的既有降级方式。DAO_FETCH_EXTRACT_MODEL 可覆盖。
+  const EXTRACT_MODEL = resolveExtractModel(process.env.DAO_FETCH_EXTRACT_MODEL, cfg.provider, session.model);
+  const EXTRACT_INSTRUCTION = "下面是一个网页的纯文本内容,请严格按照<提取要求>从中提取相关信息,只输出提取结果," +
+    "不要复述原文、不要寒暄、不要输出提取要求之外的内容。如果页面里确实没有<提取要求>要的信息,明确说明没有,不要编造。";
+  const extractFromPage = async (text: string, prompt: string): Promise<string> => {
+    const gen = streamChat({
+      baseUrl: cfg.baseUrl,
+      apiKey: cfg.apiKey,
+      model: EXTRACT_MODEL,
+      messages: [{ role: "user", content: `${EXTRACT_INSTRUCTION}\n\n<页面内容>\n${text}\n</页面内容>\n\n<提取要求>\n${prompt}\n</提取要求>` }],
+      extra: { thinking: { type: "disabled" }, temperature: 0 },
+      onUsage: (u) => {
+        session.addUsage(u, EXTRACT_MODEL);
+        cacheSink.record({ agent: "fetch-extract", depth: 0, turn: 0, model: EXTRACT_MODEL, usage: u, sys: "", tools: "", tail: "" });
+      },
+    });
+    let out = "";
+    let r = await gen.next();
+    while (!r.done) {
+      if (r.value.kind === "content") out += r.value.text;
+      r = await gen.next();
+    }
+    return out.trim() || (typeof r.value.content === "string" ? r.value.content.trim() : "");
+  };
   // interactiveSession 已在系统提示词组装时算过(上方)。之前 askChoice 无条件构造,
   // headless/一次性调用(harbor/terminal-bench 这类没有真实 stdin 可交互的场景)里也会拿到
   // 这个函数,退回走 ask() 读 stdin——但那里的 stdin 不是真终端,读到的是空/EOF,不匹配任何
@@ -953,6 +1100,8 @@ async function main() {
     foregroundRegistry: createForegroundRegistry(),
     readFiles: new Set<string>(),
     readMeta: new Map<string, { mtime: number; size: number }>(),
+    pendingUnverifiedWrites: new Set<string>(),
+    todoWriteRequired: argvPrompt ? { done: false } : undefined,
     ask: (q: string) => (inkAsk ? inkAsk(q) : ask(`\n${q}\n> `)),
     // 结构化选择:Ink 用 数字/↑↓+Enter 选择器(多选 checkbox);非交互(stdin/eval)退回"编号 + 自由作答"。
     // 只在真正交互式会话里提供——非交互场景不给这个函数,让 AskUserQuestion 工具退回 ctx.ask()(已有
@@ -971,6 +1120,7 @@ async function main() {
       },
     } : {}),
     fetchImpl: fetch,
+    extractFromPage,
     today,
     notifyUser: (m: string) => notify("dao", m), // NotifyUser 用;主会话与子代理均可(复用现成的桌面通知)
     setMode: (mode: "normal" | "plan") => {
@@ -1039,7 +1189,7 @@ async function main() {
   const toolCatalog = apiTools.map((t) => `${t.function.name} — ${t.function.description.split(/[。\n]/)[0]!.slice(0, 60)}`).join("\n");
   const callFlash = async (system: string, user: string): Promise<string> => {
     const gen = streamChat({
-      baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: "deepseek-v4-flash",
+      baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: defaultClassifierModel(session.model),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       extra: { thinking: { type: "disabled" }, temperature: 0 },
     });
@@ -1051,7 +1201,7 @@ async function main() {
   ctx.adaptSkill = makeSkillAdapter({ daoTools, catalog: toolCatalog, callFlash, homeDir: os.homedir() });
 
   // 生命周期钩子(.dao/hooks.json + 用户级):工具前/后、用户提交、会话起止。
-  // --no-hooks / --eval 跳过(评测场景不需要用户自定义的自动执行面)。
+  // 只有显式 --no-hooks 才跳过;--eval 不再隐含关闭 hooks(hooks 视为 DAO 正常能力的一部分)。
   const hooks = noHooks ? [] : loadHooks([
     { path: path.join(os.homedir(), ".dao", "hooks.json") },
     ...pluginComp.hookFiles.map((h) => ({ path: h.file, pluginRoot: h.root })), // B-5 插件 hooks(pluginRoot=插件根,兼容 CC 的 hooks/ 子目录布局)
@@ -1089,12 +1239,23 @@ async function main() {
   // 后台任务管理器:异步子代理 + 通知队列(主循环不阻塞)。
   const taskManager = createTaskManager();
   ctx.taskManager = taskManager; // TaskCreate/get/list/update/stop 用;同一个实例,不是第二套系统
+  // 后台子代理/后台 shell 状态变化的事件驱动等待(供 drainAndContinue 用,见 repl.ts 里
+  // waitForBackgroundChange 的注释)。onChange 是单槽位回调,这里只在非 TTY 的一次性/管道
+  // 路径用——TTY 交互态走另一套 subscribeTasks 逻辑(见下方 register 分支),两者互斥,
+  // 同一次进程运行只会用到其中一个,不会互相覆盖。
+  const waitForBackgroundChange = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      const onChange = () => resolve();
+      taskManager.onChange(onChange);
+      processManager.onChange(onChange);
+    });
   ctx.sendToTask = (id: string, message: string) => taskManager.send(id, message);
   // handoff 审查只在 auto 模式触发;用 getter 每次读最新值,/mode 或长任务切换 mode 时自动同步
   Object.defineProperty(ctx, 'permissionMode', { get: () => getMode(), enumerable: true });
 
   // auto 模式 handoff 安全审查分类器:子代理结束后审查整段转录。
   // 用 flash 模型(同 classifyPermission),构建 handoff 专用 messages -> 调 streamChat -> 解析 XML。
+  // 模型不可用时同样回退主模型并提示一次(与 classifyPermission 同一套判据)。
   ctx.handoffClassifyFn = async (transcript: string): Promise<ClassifyResult> => {
     // transcript 是 buildClassifierTranscript 产出的 JSONL;构建完整 messages
     // buildHandoffClassifierMessages 需要 ChatMessage[],但 classifyHandoffIfNeeded 已经传了 transcript
@@ -1103,21 +1264,37 @@ async function main() {
       { role: "system" as const, content: "你是 auto 模式的子代理安全审查器:子代理执行完毕后,审查其整段执行转录,判断是否有违反安全策略的操作。应标记(返回 block):不可逆破坏(rm -rf、drop table、force push 覆盖)、读写凭据(.ssh/.aws/.env/credentials)、工作区外写入、与任务无关的危险操作、向外部端点发送敏感数据。不标记(返回 allow):与用户意图一致的可逆操作、工作区内正常编辑、只读操作。拿不准就标记(fail-safe)。只回 XML:<decision>allow</decision> 或 <decision>block</decision><reason>原因</reason>。" },
       { role: "user" as const, content: `执行转录:\n${transcript}\n\n审查这段子代理的执行,有违反安全策略的操作吗?` },
     ];
-    const gen = streamChat({
-      baseUrl: cfg.baseUrl,
-      apiKey: cfg.apiKey,
-      model: process.env.DAO_CLASSIFIER_MODEL || "deepseek-v4-flash",
-      messages,
-      extra: { thinking: { type: "disabled" }, temperature: 0 },
-      onUsage: (u) => {
-        session.addUsage(u, process.env.DAO_CLASSIFIER_MODEL || "deepseek-v4-flash");
-        cacheSink.record({ agent: "classifier", depth: 0, turn: 0, model: process.env.DAO_CLASSIFIER_MODEL || "deepseek-v4-flash", usage: u, sys: "", tools: "", tail: "" });
-      },
-    });
-    let out = "";
-    let r = await gen.next();
-    while (!r.done) { if (r.value.kind === "content") out += r.value.text; r = await gen.next(); }
-    return parseHandoffClassifierResponse(out);
+    let handoffModel = process.env.DAO_CLASSIFIER_MODEL || defaultClassifierModel(session.model);
+    const runOnce = (m: string) => {
+      const gen = streamChat({
+        baseUrl: cfg.baseUrl,
+        apiKey: cfg.apiKey,
+        model: m,
+        messages,
+        extra: { thinking: { type: "disabled" }, temperature: 0 },
+        onUsage: (u) => {
+          session.addUsage(u, m);
+          cacheSink.record({ agent: "classifier", depth: 0, turn: 0, model: m, usage: u, sys: "", tools: "", tail: "" });
+        },
+      });
+      let out = "";
+      return (async () => {
+        let r = await gen.next();
+        while (!r.done) { if (r.value.kind === "content") out += r.value.text; r = await gen.next(); }
+        return parseHandoffClassifierResponse(out);
+      })();
+    };
+    try {
+      return await runOnce(handoffModel);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // 同 classifyPermission:除上下文超限/限流外,任何失败都回退主模型。
+      if (isContextLengthError(e) || isRateLimitError(e)) throw e;
+      if (session.model === handoffModel) throw e;
+      process.stdout.write(`\n[智能判定] 安全审查模型 ${handoffModel} 不可用(${msg.slice(0, 120)}),已回退用主模型 ${session.model};想固定指定请设 DAO_CLASSIFIER_MODEL\n`);
+      handoffModel = session.model;
+      return await runOnce(handoffModel);
+    }
   };
 
   // ---- 子代理引擎装配(对齐 CC:runAgent 统一入口)----
@@ -1196,14 +1373,17 @@ async function main() {
     return true;
   };
 
-  // Resolve the limit from the active model on every use so model and account switches take effect immediately.
-  // An explicit DAO_CONTEXT_WINDOW value still takes precedence over the model registry.
-  const contextWindowOverride = Number(process.env.DAO_CONTEXT_WINDOW);
-  const currentContextWindow = () => contextWindowOverride || resolveContextWindow(session.model);
-  // Q1 当前上下文 token:优先用主模型上次真实 prompt_tokens(准,尤其中文),无则回退 chars/3 估算。
-  const contextTokens = () => session.lastPromptTokens ?? estimateTokens(session.messages);
-  // L1.3:主模型持续过载/异常时本回合回退的模型;DAO_FALLBACK_MODEL=off 关闭。
-  const FALLBACK_MODEL = process.env.DAO_FALLBACK_MODEL === "off" ? undefined : (process.env.DAO_FALLBACK_MODEL || "deepseek-v4-flash");
+  // L2.1:上下文窗口按模型默认值初始化(GLM 系列按渠道:zhipu 官方 1M / 自定义网关 200K;glm-5.2=200K,其他=1M),可被 env 覆盖。
+  // 真正的安全网是反应式压缩(见 loop.ts compact 钩子):即便此值偏大,撞上下文超限也会自动压缩重试。
+  // /context-window 命令运行时修改此值(200K/1M 两档或自定义 K),同步写 env 供子进程继承。
+  // /model 切换时:若用户未手动覆盖(env 未设),自动联动到新模型的默认值;手动覆盖后锁死,不随切换改变。
+  const contextWindowManualOverride = Number.isFinite(Number(process.env.DAO_CONTEXT_WINDOW));
+  let contextWindowManuallySet = contextWindowManualOverride;
+  let CONTEXT_WINDOW = Number(process.env.DAO_CONTEXT_WINDOW) || contextWindowFor(cfg.model, cfg.provider, cfg.baseUrl);
+  // Q1 当前上下文 token:优先用主模型上次真实 prompt_tokens(准,尤其中文)。
+  // 无真实值时返回 0——启动与 /clear 后 StatusBar 应显示 0% 而非按系统提示估算的非零值
+  // (系统提示是常驻开销,不是"对话已用上下文";真实用量要到首次 API 调用后才有)。
+  const contextTokens = () => session.lastPromptTokens ?? 0;
   // P2-11 编辑后诊断命令(如 "tsc --noEmit"):设了才在写/改文件后跑、把报错回灌模型。
   // 显式 DAO_DIAGNOSTICS_CMD 优先;否则 DAO_DIAGNOSTICS=1 时按项目自动探测(tsc/eslint)。默认不跑。
   const DIAG_CMD = process.env.DAO_DIAGNOSTICS_CMD?.trim()
@@ -1216,7 +1396,7 @@ async function main() {
   // 【成本实测/勿误信】命中虽真,但 pro 的 miss 价(3￥/1M)与输出价(6￥/1M)均是 flash 的 3 倍,
   // 64–74% 命中折扣压不过那部分 miss+输出 → pro 摘要其实比"冷发 flash"贵约 63%(整会话 ~+12%)。
   // 默认仍用主模型【是为摘要质量/长任务续接更稳】,不是为省钱;想省钱用 DAO_SUMMARY_MODEL=…flash 切回。
-  // 对标 CC:先 <分析> 草稿过一遍,再 <摘要> 输出 9 个固定小节;不丢技术细节/决策/用户原话。
+  // 先 <分析> 草稿过一遍,再 <摘要> 输出 9 个固定小节;不丢技术细节/决策/用户原话。
   const COMPACT_INSTRUCTION = `现在把【以上整段对话】压缩成一份详尽的中文摘要,重点保留用户的明确请求和你已做的动作,确保技术细节、代码模式、架构决策不丢,以便不丢上下文地继续工作。
 
 注意:对话开头可能有【早期对话摘要】或【当前任务清单】这类系统消息——它们会被原样保留,请【不要重复摘要它们】,只摘要其后的真实对话内容。
@@ -1317,36 +1497,41 @@ async function main() {
       executeToolCalls,
       write,
       compact: runCompaction, // L2.2 反应式压缩
-      shouldCompact: () => contextTokens() >= currentContextWindow() * 0.85, // Proactive in-turn compaction.
-      fallbackModel: FALLBACK_MODEL, // L1.3 模型回退
+      shouldCompact: () => contextTokens() >= CONTEXT_WINDOW * 0.85, // §4 轮内主动压缩
       diagnose: makeDiagnose(), // P2-11 编辑后诊断
       reflect: (argvPrompt || !reflectChallengerFlag) ? undefined : reflect, // 轮内卡住检测(assessTurn→挑战者);一次性/eval 不反思,默认关闭需 --reflect-challenger
-      progressAdvice: progressAdviceFlag, // 进度提醒(noProgress 计数器);默认关闭,--progress-advice 才开
+      progressAdvice: progressAdviceFlag, // 进度提醒(noProgress 计数器);仅 headless 默认开,交互式默认关;--no-progress-advice 显式关
+      interactive: interactiveSession, // 进度提醒里"卡住了用 AskUserQuestion"这条只在真交互态才建议
       longTask,
       drainAdvisories: () => pendingReflectAdvisories.splice(0), // 反思器+(暂留)reply 的 advisory
       drainNotifications: () => [...taskManager.drainNotifications(), ...processManager.drainNotifications()], // 后台子代理 + 后台 shell 完成结果:回合边界回灌
       drainMcpNotices: () => mcpChangeQueue.splice(0), // MCP server 状态变化:回合边界回灌,不插进 tool_use/result 中间
+      drainEnvNotices: () => envNoticeQueue.splice(0), // 环境探测补充:回合边界回灌(Task 5 新增)
       onCheckpoint,
     }));
     // 回合末统一反思:记忆 + 方向。自适应节奏;压缩前同步先抢救。argvPrompt(一次性/eval)不跑。
     if (!argvPrompt) {
-      const compactionImminent = contextTokens() >= currentContextWindow() * 0.85;
+      const compactionImminent = contextTokens() >= CONTEXT_WINDOW * 0.85;
       if (compactionImminent || REFLECT_SYNC) await maybeReflect({ compactionImminent });
       else void maybeReflect({ compactionImminent });
     }
-    if (contextTokens() >= currentContextWindow() * 0.85) {
+    if (contextTokens() >= CONTEXT_WINDOW * 0.85) {
       write("\n[接近上限,自动压缩…]\n");
       await runCompaction();
     }
   };
 
   // Ink 态压缩:不向 stdout 写(会冲渲染),只压缩消息;提示由 App 通过 events/notice 给出。
-  const inkCompact = async (): Promise<void> => {
+  // 返回前后 token 估算,供 App 展示压缩效果(如 "~12K → ~3K tok")。
+  const inkCompact = async (): Promise<{ before: number; after: number }> => {
+    const before = estimateTokens(session.messages);
     session.messages = await compactMessages(
       session.messages,
       { summarize: summarizeWithBreaker },
       todoStore.get().length ? formatTodos(todoStore.get()) : undefined,
     );
+    const after = estimateTokens(session.messages);
+    return { before, after };
   };
 
   // 统一反思器(回合末):一个 fork,既反思进展(advisory,有问题才注入)又抽记忆(含 mergeInto 合并)。
@@ -1367,7 +1552,7 @@ async function main() {
     reflectBusy = true;
     try {
       const fork = process.env.DAO_DISTILL_FORK !== "0";
-      const model = fork ? session.model : "deepseek-v4-flash";
+      const model = fork ? session.model : defaultClassifierModel(session.model);
       const tools = fork ? apiToolsForMode(registry, session.mode, lang) : undefined;
       // 只发上次主请求已缓存的前缀(slice 到 lastSentLength)→ 前缀字节一致、命中热缓存。
       const msgs = fork && session.lastSentLength > 0 ? session.messages.slice(0, session.lastSentLength) : session.messages;
@@ -1416,7 +1601,7 @@ async function main() {
   };
 
   // 回合末入口:deepseek 官方 key 不限流,每轮都跑(仅 reflectBusy 防并发);
-  // 其它 provider(volcengine/qianfan 等 coding-plan/token-plan,计费敏感)用自适应节奏(连续安静则放慢)。
+  // 其它 provider(volcengine/qianfan/zhipu 等 coding-plan/token-plan,计费敏感)用自适应节奏(连续安静则放慢)。
   const maybeReflect = async (opts: { compactionImminent: boolean }): Promise<void> => {
     if (!reflectMemoryFlag || argvPrompt || NO_MEMORY) return; // 默认关闭,--reflect-memory 才跑
     // deepseek 不限流:跳过 cadence,每轮直接跑(仅用 reflectBusy 防并发堆叠)。
@@ -1487,10 +1672,24 @@ async function main() {
       // 交互式命令(如 7z 不带 -p、mysql 不带密码、ssh 需要密码)会卡住等待输入,永远不会返回。
       session.messages.push({ role: "system", content: "[headless 提醒] 当前为无人值守模式,不会有用户在终端输入。所有命令必须是非交互式的——用参数或管道传入所需输入(如 7z -p<密码>、echo <密码> | 7z x),不要让命令等待 stdin。交互式命令会永久卡住。" });
       if (up.additionalContext) session.messages.push({ role: "system", content: `[hook 注入的上下文]\n${up.additionalContext}` });
-      await runOneTurn(() =>
-        store.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, messages: session.messages, usage: { ...session.usage } }),
-      );
+      const argvCheckpoint = () =>
+        store.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, messages: session.messages, usage: { ...session.usage } });
+      await runOneTurn(argvCheckpoint);
+      // 一次性/eval 路径没有下一次真实用户输入来触发新回合——模型若以"结束本轮等后台通知"
+      // 收尾(工具描述/系统提示词教它这么做),不主动等就会直接往下走到 SessionEnd 退出整个
+      // 进程,后台进程虽然 detached 独立于 DAO 存活但已没人收它的结果,那句"自动通知"的
+      // 承诺永远兑现不了(真实撞见:terminal-bench flash 赛道 5 道题都是这个模式)。用和
+      // runRepl 同一套 drainAndContinue 排空/等待,直到确实没有后台工作在跑了才继续退出。
+      await drainAndContinue({
+        session,
+        write,
+        runTurn: () => runOneTurn(argvCheckpoint),
+        drainNotifications: () => [...taskManager.drainNotifications(), ...processManager.drainNotifications()],
+        runningBackgroundCount: () => taskManager.running().length + processManager.runningCount(),
+        waitForBackgroundChange,
+      });
       await runHooks(hooks, "SessionEnd", { cwd: workspaceRoot }); // 会话结束钩子(CC 对等:一次性运行也触发)
+      await cleanupDbBackups(workspaceRoot); // 清理本次运行留下的 .dao-backup 安全网文件
       store.saveState({
         cwd: workspaceRoot, model: session.model, mode: session.mode,
         messages: session.messages, usage: { ...session.usage },
@@ -1557,7 +1756,13 @@ async function main() {
         }
       } catch { /* 快照失败不影响 */ }
       skillSink = createSkillAuditSink(store.dir);
-      const ckpt = createCheckpointer(workspaceRoot);
+      // 影子 git 默认关闭;读 settings.json 的 checkpoint.enabled(项目级 > 用户级)决定是否开启。
+      // DAO_NO_CHECKPOINT / DAO_CHECKPOINT 环境变量在 createCheckpointer 内部处理,优先级更高。
+      const checkpointEnabled = await readCheckpointEnabled(
+        path.join(os.homedir(), ".dao", "settings.json"),
+        trustProject ? path.join(workspaceRoot, ".dao", "settings.json") : null,
+      );
+      const ckpt = createCheckpointer(workspaceRoot, { enabled: checkpointEnabled });
       const turnCheckpoints: (string | null)[] = []; // 第 k 项 = 第 k 条用户消息【之前】的影子 git 快照 sha,供 /rewind 联动回滚文件
       let sessionTitle: string | undefined; // /rename 设置
       if (longTask && !continueFlag) session.messages.push({ role: "system", content: lang === "en" ? LONG_TASK_DIRECTIVE_EN : LONG_TASK_DIRECTIVE });
@@ -1599,30 +1804,31 @@ async function main() {
             executeToolCalls,
             write: () => {},
             compact: inkCompact, // L2.2 反应式压缩
-            shouldCompact: () => contextTokens() >= currentContextWindow() * 0.85, // Proactive in-turn compaction.
-            fallbackModel: FALLBACK_MODEL, // L1.3 模型回退
-            diagnose: makeDiagnose(signal), // P2-11 编辑后诊断
+            shouldCompact: () => contextTokens() >= CONTEXT_WINDOW * 0.85, // §4 轮内主动压缩
+                  diagnose: makeDiagnose(signal), // P2-11 编辑后诊断
             reflect: reflectChallengerFlag ? reflect : undefined, // 轮内卡住检测(assessTurn→挑战者);默认关闭,--reflect-challenger 才开
-            progressAdvice: progressAdviceFlag, // 进度提醒(noProgress 计数器);默认关闭,--progress-advice 才开
+            progressAdvice: progressAdviceFlag, // 进度提醒(noProgress 计数器);仅 headless 默认开,交互式默认关;--no-progress-advice 显式关
+            interactive: interactiveSession, // 进度提醒里"卡住了用 AskUserQuestion"这条只在真交互态才建议
             longTask,
             drainAdvisories: () => pendingReflectAdvisories.splice(0), // 反思器+(暂留)reply 的 advisory
             drainMcpNotices: () => mcpChangeQueue.splice(0), // MCP server 状态变化:回合边界回灌,不插进 tool_use/result 中间
+            drainEnvNotices: () => envNoticeQueue.splice(0), // 环境探测补充:回合边界回灌(Task 5 新增)
             drainPending: () => steeringQueue.splice(0), // 运行中排队的补充输入:下一个工具轮边界注入,不等整个大回合跑完
             listOtherAccounts: () => listAccounts().filter((a) => !a.active).map((a) => ({ name: a.name })), // 限流菜单用
             switchAccountAndWait,
             events: logEvents(events, store), // 渲染的同时写日志
-            // 主会话不限轮数(对标 CC main session):靠 token 预算触发自动 compact;DAO_MAX_TURNS 可设硬上限(eval 用)。
+            // 主会话不限轮数:靠 token 预算触发自动 compact;DAO_MAX_TURNS 可设硬上限(eval 用)。
             signal,
             onCheckpoint: persist, // 每个工具轮落一次盘,回合中途异常上抛也不连带丢掉此前已成功的步骤
           }));
           store.append({ t: "turn_end" });
           // 回合末统一反思:记忆 + 方向。自适应节奏;压缩前同步先抢救。
           {
-            const compactionImminent = contextTokens() >= currentContextWindow() * 0.85;
+            const compactionImminent = contextTokens() >= CONTEXT_WINDOW * 0.85;
             if (compactionImminent || REFLECT_SYNC) await maybeReflect({ compactionImminent });
             else void maybeReflect({ compactionImminent });
           }
-          if (contextTokens() >= currentContextWindow() * 0.85) {
+          if (contextTokens() >= CONTEXT_WINDOW * 0.85) {
             const before = session.messages.length;
             events.notice("[接近上限,自动压缩…]");
             await inkCompact();
@@ -1673,7 +1879,6 @@ async function main() {
             return { handled: true, output: `${head}\n${rows.join("\n")}\n${foot}` };
           }
           if (name === "context") {
-            const CONTEXT_WINDOW = currentContextWindow();
             const used = contextTokens();
             const pct = Math.round((used / CONTEXT_WINDOW) * 100);
             const sys = estimateTokens(session.messages.slice(0, 1));
@@ -1711,7 +1916,7 @@ async function main() {
             const cacheRatio = u.promptTokens > 0 ? ((u.cacheHitTokens / u.promptTokens) * 100).toFixed(1) : "—";
             // 优化建议
             const suggestions: string[] = [];
-            if (toolTok > used * 0.15) suggestions.push(`工具定义占 ${Math.round(toolTok / used * 100)}%（/mcp off 关不用的 server 减少工具数）`);
+            if (used > 0 && toolTok > used * 0.15) suggestions.push(`工具定义占 ${Math.round(toolTok / used * 100)}%（/mcp off 关不用的 server 减少工具数）`);
             if (toolResultTok > histTok * 0.5) suggestions.push(`工具结果占对话 ${Math.round(toolResultTok / Math.max(1, histTok) * 100)}%（/compact 压缩历史）`);
             if (skillTok > 5000) suggestions.push(`技能描述占 ~${skillTok.toLocaleString()} tok（/skills off <名> 关不需要的）`);
             if (pct >= 85) suggestions.push("接近上限，下回合将自动压缩（也可 /compact 主动压缩）");
@@ -1916,7 +2121,7 @@ async function main() {
             let codeMsg = "";
             if (withCode) {
               const sha = turnCheckpoints[n - 1];
-              if (!ckpt.enabled) codeMsg = " 文件未回滚(无影子 git)。";
+              if (!ckpt.enabled) codeMsg = " 文件未回滚(影子 git 未开启,可在 settings.json 设 checkpoint.enabled = true)。";
               else if (!sha) codeMsg = " 文件未回滚(该节点无快照)。";
               else {
                 ckpt.snapshot("回退前自动快照"); // 先存当前状态,回退可逆
@@ -1948,8 +2153,26 @@ async function main() {
             process.env.DAO_REASONING_EFFORT = arg;
             return { handled: true, output: `思考强度已设为 ${arg}(下一回合生效)` };
           }
+          if (name === "context-window") {
+            const arg = line.trim().split(/\s+/)[1];
+            const fmtTok = (n: number) => n.toLocaleString();
+            if (!arg) {
+              return { handled: true, output: `当前上下文窗口:${fmtTok(CONTEXT_WINDOW)} tok(${(CONTEXT_WINDOW / 1000).toFixed(0)}K)。\n用法:\n  /context-window 200K  — 200,000 tok\n  /context-window 1M    — 1,000,000 tok\n  /context-window 500   — 自定义,单位 K(即 500,000 tok)` };
+            }
+            // 解析:200K / 1M / 纯数字(单位 K)
+            const m = arg.match(/^(\d+(?:\.\d+)?)\s*([KkMm])?$/);
+            if (!m) return { handled: true, output: `无效格式:「${arg}」。用法:/context-window <200K|1M|<数字>K>(纯数字单位为 K)` };
+            const num = Number(m[1]);
+            const unit = (m[2] ?? "K").toUpperCase();
+            const tok = unit === "M" ? num * 1_000_000 : num * 1_000;
+            if (tok < 1000) return { handled: true, output: `上下文窗口过小(${tok} tok),最小 1K。` };
+            CONTEXT_WINDOW = tok;
+            process.env.DAO_CONTEXT_WINDOW = String(tok);
+            contextWindowManuallySet = true; // 手动设过后锁死,后续切模型不再自动联动
+            return { handled: true, output: `上下文窗口已设为 ${fmtTok(tok)} tok(${(tok / 1000).toFixed(0)}K),自动压缩阈值 ${fmtTok(Math.round(tok * 0.85))} tok(85%)。立即生效。` };
+          }
           if (name === "status") {
-            const pct = Math.round((contextTokens() / currentContextWindow()) * 100);
+            const pct = Math.round((contextTokens() / CONTEXT_WINDOW) * 100);
             const flags = [yolo ? "免审批" : "", longTask ? "长任务" : ""].filter(Boolean).join("/") || "—";
             return { handled: true, output: `状态:模型 ${session.model} · 模式 ${getMode()} · 开关 ${flags} · 上下文 ${pct}% · 思考 ${process.env.DAO_REASONING_EFFORT || "max"}${obsLabel() ? ` · ${obsLabel()}` : ""}\n${session.usageSummary()}` };
           }
@@ -2024,24 +2247,38 @@ async function main() {
             return { handled: true, output: `账户 · 当前来源 ${keySource}\n${list}\n(Ink 下直接 /account 弹选择器;/account add <key> [provider] [name] 添加 · /account <名> 切换 · /account rm <名> 删除)` };
           }
           if (name === "bypass" || name === "yolo") { // /yolo 保留为别名
-            // yolo 只能启动时开(`dao --yolo`);会话内只允许【关闭】,不允许开启。
-            if (!yolo) return { handled: true, output: "※ yolo(免审批)只能启动时开启:`dao --yolo`。会话内想自动批准请用 /mode auto(AI 判定,deny/敏感仍拦)。" };
-            yolo = false;
-            return { handled: true, output: "免审批已关闭:恢复审批门。" };
+            // /yolo 是全权放行的快捷开关(可开可关,与 /mode 全权放行 等价)。
+            if (yolo) {
+              yolo = false;
+              permModeOverride = null;
+              return { handled: true, output: "全权放行已关闭:恢复智能判定审批。" };
+            }
+            session.mode = "normal";
+            yolo = true;
+            permModeOverride = null;
+            return { handled: true, output: "⚡ 全权放行:免审批已开启(权限全交出去,deny 规则与危险命令仍拦)。慎用。" };
           }
           if (name === "mode") {
             const arg = line.trim().split(/\s+/)[1];
             if (!arg) {
-              return { handled: true, output: `当前权限模式:${getMode()}。用法:/mode <default|acceptEdits|auto|plan>(yolo 只能 \`dao --yolo\` 启动时开)` };
+              return { handled: true, output: `当前权限模式:${getMode() === "bypassPermissions" ? "全权放行" : getMode() === "auto" ? "智能判定" : getMode()}。Shift+Tab 两档循环:智能判定 → 全权放行;也可 /mode <auto|全权放行|default> 直接指定;plan 只读规划用 /plan 进入` };
             }
-            if (arg === "plan") { session.mode = "plan"; permModeOverride = null; return { handled: true, output: "◇ 已切到 plan(只读规划,拦写/执行)" }; }
-            if (arg === "bypassPermissions") return { handled: true, output: "※ yolo(bypassPermissions)只能 `dao --yolo` 启动时开启,不能会话内切换。会话内可用 /mode auto。" };
-            if (arg === "default" || arg === "acceptEdits" || arg === "auto") {
+            if (arg === "plan") {
+              return { handled: true, output: "plan 是只读规划权限模式,不经 /mode 切换——用 /plan(会话只读)或 settings.defaultMode = \"plan\"/`--permission-mode plan` 进入。" };
+            }
+            if (arg === "yolo" || arg === "bypass" || arg === "bypassPermissions" || arg === "全权放行") {
+              session.mode = "normal";
+              yolo = true;
+              permModeOverride = null;
+              return { handled: true, output: "⚡ 全权放行:免审批已开启(权限全交出去,deny 规则与危险命令仍拦)。慎用。" };
+            }
+            if (arg === "default" || arg === "auto") {
               if (session.mode === "plan") session.mode = "normal";
+              yolo = false;
               permModeOverride = arg as PermissionMode;
-              return { handled: true, output: arg === "acceptEdits" ? "✎ acceptEdits:自动批准文件编辑,其余照常审批" : arg === "auto" ? "⊙ auto:只读命令/工作区内编辑自动放行;其余交 AI 分类器,确信安全的自动过、拿不准的转人工审批(不会替你拒绝);deny 规则/敏感目标仍按规则拦。" : "权限模式已设为 default(按需审批)" };
+              return { handled: true, output: arg === "auto" ? "⊙ 智能判定:只读命令/工作区内编辑自动放行;其余(含敏感目标)交 AI 分类器,确信安全的自动过、拿不准的转人工审批(不会替你拒绝);deny 规则/危险命令仍拦。" : "权限模式已设为 default(写/执行前询问)" };
             }
-            return { handled: true, output: `未知模式:${arg}(可选 default/acceptEdits/auto/plan)` };
+            return { handled: true, output: `未知模式:${arg}(可选 auto / 全权放行 / default)` };
           }
           if (name === "goal" || name === "task") { // task 为旧别名
             const arg = line.trim().slice(1).split(/\s+/).slice(1).join(" ").trim();
@@ -2124,7 +2361,7 @@ async function main() {
             return { handled: true, prompt: expandCommand(customCommands.get(name)!.body, args) };
           }
           if (name === "restore") {
-            if (!ckpt.enabled) return { handled: true, output: "检查点不可用(无 git)" };
+            if (!ckpt.enabled) return { handled: true, output: "检查点不可用(影子 git 未开启)。可在 settings.json 设置 checkpoint.enabled = true 开启。" };
             const snaps = ckpt.list();
             const target = snaps[1] ?? snaps[0]; // 回退到上一个回合前的快照
             if (!target) return { handled: true, output: "暂无可回退的检查点" };
@@ -2139,12 +2376,30 @@ async function main() {
             if (sk) return { handled: true, prompt: sk.body };
           }
           // /model:委托 dispatchCommand 切换会话模型，并持久化到当前 profile 的 model 字段（下次启动保持）。
+          // 自定义网关的 model 不在 MODELS_BY_PROVIDER 里,跳过 dispatchCommand 的校验直接设置。
           if (name === "model") {
-            const result = dispatchCommand(line, session, cfg.provider);
             const activeProf = profilesCfg.profiles[profilesCfg.activeProfile];
+            const isCustomGw = activeProf && activeProf.baseUrl !== DEFAULTS[activeProf.provider].baseUrl;
+            const modelArg = line.trim().split(/\s+/)[1];
+            if (isCustomGw && modelArg) {
+              session.setModel(modelArg);
+              if (activeProf) { activeProf.model = modelArg; saveProfiles(keyFile, profilesCfg).catch(() => {}); }
+              // 未手动覆盖时,切模型联动上下文窗口到新模型默认值
+              if (!contextWindowManuallySet) {
+                CONTEXT_WINDOW = contextWindowFor(session.model, cfg.provider, cfg.baseUrl);
+                process.env.DAO_CONTEXT_WINDOW = String(CONTEXT_WINDOW);
+              }
+              return { handled: true, output: `已切换模型:${modelArg}` };
+            }
+            const result = dispatchCommand(line, session, cfg.provider);
             if (activeProf) {
               activeProf.model = session.model;
               saveProfiles(keyFile, profilesCfg).catch(() => {});
+            }
+            // 未手动覆盖时,切模型联动上下文窗口到新模型默认值
+            if (!contextWindowManuallySet) {
+              CONTEXT_WINDOW = contextWindowFor(session.model, cfg.provider, cfg.baseUrl);
+              process.env.DAO_CONTEXT_WINDOW = String(CONTEXT_WINDOW);
             }
             return result;
           }
@@ -2162,23 +2417,23 @@ async function main() {
           costCNY: session.costCNY(),
           yolo,
           longTask,
-          branch: gitBranch,
-          contextPct: (contextTokens() / currentContextWindow()) * 100,
+          branch: readGitBranch(),
+          contextPct: (contextTokens() / CONTEXT_WINDOW) * 100,
+          contextWindow: CONTEXT_WINDOW,
+          contextUsed: contextTokens(),
           version: VERSION,
           sessionId: store.id,
         }),
         cycleMode: () => {
-          // yolo(bypassPermissions)不在 Shift+Tab 循环里——只能 `dao --yolo` 启动时开启。
-          // 若当前正处于 yolo,Shift+Tab 退出到 default(可降权,不可在循环中升到 yolo)。
-          // acceptEdits(自动接受编辑)不在循环里——仍可用 /mode acceptEdits 显式进入,但不参与 Shift+Tab 轮换。
-          const order: PermissionMode[] = ["default", "auto", "plan"];
+          // Shift+Tab 两档循环:auto(智能判定,AI 裁决)↔ bypassPermissions(全权放行)。
+          // plan 只读规划不在循环里(经 /plan/settings 进入);当前若在 plan/default,Shift+Tab 落到 auto。
+          const order: PermissionMode[] = ["auto", "bypassPermissions"];
           const cur = getMode();
-          // 当前若在 acceptEdits(经 /mode 进入,不在循环里),Shift+Tab 视为从头进 default 的下一个。
           const idx = order.indexOf(cur);
-          const next = cur === "bypassPermissions" ? "default" : order[(idx + 1) % order.length]!;
-          yolo = false; // 循环永不进入 yolo
-          session.mode = next === "plan" ? "plan" : "normal";
-          permModeOverride = next;
+          const next = order[(idx + 1) % order.length]!; // idx=-1(plan/default/未知)→ 0 → auto
+          yolo = next === "bypassPermissions";
+          session.mode = "normal";
+          permModeOverride = next === "bypassPermissions" ? null : next;
           return next;
         },
         register: ({ approvalPrompt, askUser, askChoice }) => {
@@ -2205,13 +2460,23 @@ async function main() {
         switchAccount: (n) => { switchAccount(n); },
         removeAccount,
         addAccount,
+        fetchGatewayModels: (baseUrl, key) => fetchModels(baseUrl, key),
+        listGatewayModels: async () => {
+          const p = profilesCfg.profiles[profilesCfg.activeProfile];
+          if (!p || p.baseUrl === DEFAULTS[p.provider].baseUrl) return null;
+          const cred = await resolveCredential(profilesCfg, kc);
+          if (!cred) return null;
+          return fetchModels(p.baseUrl, cred.key);
+        },
         listSkills,
         setSkillEnabled,
         batchSkills,
+        listInvocableSkills,
         listModels,
       });
       taskManager.cancelAll(); // 退出时中止所有后台任务
       await runHooks(hooks, "SessionEnd", { cwd: workspaceRoot }); // 会话结束钩子
+      await cleanupDbBackups(workspaceRoot); // 清理本次运行留下的 .dao-backup 安全网文件
       await mcp.close(); // 关闭 MCP 连接
       lspManager.disposeAll(); // 关闭 LSP server 进程
       store.markDone(); // 干净退出 → 标记会话完成(不再被 findResumable 当崩溃会话)
@@ -2261,9 +2526,10 @@ async function main() {
       const persistRepl = () =>
         store.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, messages: session.messages, usage: { ...session.usage } });
       await injectSessionStart(); // SessionStart 注入(首回合前)
-      await runRepl({ session, readLine, runTurn: () => runOneTurn(persistRepl), write, compact: runCompaction, gateUserPrompt, drainNotifications: () => [...taskManager.drainNotifications(), ...processManager.drainNotifications()], getProvider: () => cfg.provider });
+      await runRepl({ session, readLine, runTurn: () => runOneTurn(persistRepl), write, compact: runCompaction, gateUserPrompt, drainNotifications: () => [...taskManager.drainNotifications(), ...processManager.drainNotifications()], runningBackgroundCount: () => taskManager.running().length + processManager.runningCount(), waitForBackgroundChange, getProvider: () => cfg.provider });
       persistRepl(); // 干净退出前再存一次(覆盖最后一轮是"纯文本收尾早退"、没触发过 onCheckpoint 的情形)
       await runHooks(hooks, "SessionEnd", { cwd: workspaceRoot }); // 会话结束钩子(与 TTY 分支对齐)
+      await cleanupDbBackups(workspaceRoot); // 清理本次运行留下的 .dao-backup 安全网文件
       await mcp.close();
       lspManager.disposeAll();
       store.markDone(); // 干净退出标记(与 TTY 分支对齐)

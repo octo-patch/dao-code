@@ -30,7 +30,7 @@ export interface StatusInfo {
   model: string;
   accountName?: string; // 当前激活的 profile 名(显示在 StatusBar 模型名前)
   mode: string;
-  permMode?: string; // 有效权限模式:default/acceptEdits/plan/bypassPermissions
+  permMode?: string; // 有效权限模式:default/auto/bypassPermissions
   promptTokens: number;
   completionTokens: number;
   cacheHitRatio: number;
@@ -38,7 +38,9 @@ export interface StatusInfo {
   yolo: boolean;
   longTask?: boolean; // 长任务自主模式(含原 Coordinator 阶段化编排)
   branch?: string;
-  contextPct: number; // 当前上下文占 1M 窗口的百分比
+  contextPct: number; // 当前上下文占窗口的百分比
+  contextWindow: number; // 上下文窗口大小(tok)
+  contextUsed: number; // 已用上下文(tok)
   version?: string; // dao-code 版本号(不带 v 前缀)
   sessionId?: string; // 当前会话 id(.dao/sessions/<id>),便于对照 /audit、session 日志排查
 }
@@ -51,7 +53,7 @@ export interface AppDeps {
   submit: (text: string | ContentPart[], hooks: { events: TurnEvents; signal: AbortSignal }) => Promise<void>;
   // 斜杠命令(/model /plan /clear /compact /help /exit;以及自定义命令展开成 prompt)。
   runCommand: (line: string) => { handled: boolean; output?: string; exit?: boolean; compact?: boolean; prompt?: string; clearTranscript?: boolean; resumeItems?: TranscriptItem[] };
-  compact: () => Promise<void>;
+  compact: () => Promise<{ before: number; after: number }>;
   getStatus: () => StatusInfo;
   // verbose/debug 模式:展示工具原样参数、工具结果全量、思考全量(默认显意图 + 截断)。
   verbose?: boolean;
@@ -88,11 +90,16 @@ export interface AppDeps {
   listAccounts?: () => { name: string; active: boolean; detail: string }[];
   switchAccount?: (name: string) => void; // 切换激活账户(异步解析+生效,下一回合读 cfg)
   removeAccount?: (name: string) => void; // 删除账户(连带清钥匙串)
-  addAccount?: (key: string, name?: string, provider?: Provider) => Promise<{ ok: boolean; name?: string; reason?: string }>; // 校验+持久化+激活
+  addAccount?: (key: string, name?: string, provider?: Provider, baseUrl?: string, model?: string) => Promise<{ ok: boolean; name?: string; reason?: string }>; // 校验+持久化+激活(baseUrl/model 供自定义网关)
+  fetchGatewayModels?: (baseUrl: string, key: string) => Promise<string[]>; // 拉自定义网关 /models 列表(失败返回 [],引导据此回退手动输入)
+  listGatewayModels?: () => Promise<string[] | null>; // 当前账户是自定义网关时拉 /models 列表;非自定义网关返回 null
   // 技能(skill)交互:/skills 无参弹选择器(逐个开关 + 批量内置/第三方)。省略则退回文本命令。
   listSkills?: () => { name: string; on: boolean; source: string; detail: string }[];
   setSkillEnabled?: (name: string, on: boolean) => void; // 开/关单个技能(写禁用集,重启生效)
   batchSkills?: (scope: "bundled" | "installed" | "all", on: boolean) => void; // 批量开关(内置/第三方/全部)
+  // 可 /调用的 skill 列表(斜杠命令面板 + Tab 补全用):返回 slug(含 namespace:前缀) + 简述。
+  // 仅含 userInvocable !== false 且未被禁用的技能。省略则斜杠面板不列 skill。
+  listInvocableSkills?: () => { slug: string; description: string }[];
   // 模型交互:/model 无参弹选择器(当前 profile provider 下的可选模型)。省略则退回文本循环命令。
   listModels?: () => { model: string; active: boolean }[];
 }

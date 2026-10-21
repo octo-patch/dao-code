@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { execShellTool } from "./exec_shell.js";
+import { execShellTool, cleanupDbBackups } from "./exec_shell.js";
 import { processManager } from "./process_manager.js";
 import { createForegroundRegistry } from "../tui/foreground_registry.js";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -25,6 +25,25 @@ describe("Bash tool", () => {
     const out = await execShellTool.handler({ command: "echo bg", background: true }, ctx);
     expect(out).toMatch(/id=proc-\d+/);
     expect(out).toContain("自动通知");
+  });
+
+  it("前台执行(即便非零退出)清空 pendingUnverifiedWrites——任何一次真实执行都算已有反馈,不判定针对哪个文件", async () => {
+    const pendingUnverifiedWrites = new Set<string>(["/app/compress.rs"]);
+    await execShellTool.handler({ command: "sh -c 'exit 1'" }, { ...ctx, pendingUnverifiedWrites });
+    expect(pendingUnverifiedWrites.size).toBe(0);
+  });
+
+  it("后台命令一发起就清空 pendingUnverifiedWrites(不等命令跑完)", async () => {
+    const pendingUnverifiedWrites = new Set<string>(["/app/compress.rs"]);
+    await execShellTool.handler({ command: "echo bg", background: true }, { ...ctx, pendingUnverifiedWrites });
+    expect(pendingUnverifiedWrites.size).toBe(0);
+  });
+
+  it("sleep 拦截/小文件拦截这类【根本没有真正执行】的早退分支,不清空 pendingUnverifiedWrites", async () => {
+    const pendingUnverifiedWrites = new Set<string>(["/app/compress.rs"]);
+    const out = await execShellTool.handler({ command: "sleep 15" }, { ...ctx, pendingUnverifiedWrites });
+    expect(out).toContain("不要用 sleep 阻塞等待");
+    expect(pendingUnverifiedWrites.size).toBe(1); // 命令被拦截、从未真正执行,不能算"已有反馈"
   });
 
   it("kills the foreground child on abort and returns promptly with [已中断]", async () => {
@@ -62,21 +81,25 @@ describe("Bash tool", () => {
     expect(elapsed).toBeLessThan(3000); // 远小于孙进程的 30s 存活时间,证明没有卡在等 close
   });
 
-  it("apt-get 类命令被超时打断 → 自动尝试 dpkg --configure -a 修复,并在输出里说明", async () => {
+  it("apt-get 类命令被中断打断 → 自动尝试 dpkg --configure -a 修复,并在输出里说明", async () => {
     // 根因(真实撞见:terminal-bench merge-diff-arc-agi-task 任务,算法本身完全正确,纯因为
-    // 早先一次 apt-get 被 120s 超时强杀在事务中途、dpkg 卡在 interrupted 态,导致 verifier
-    // 自己装 curl/uv 也失败、pytest 从未跑起来,判了 0 分——这是"apt-get被超时打断损坏dpkg"
-    // 这个具体机制的第2次独立复现,不是孤立事件)。造一个名字叫 apt-get、实际会跑超过
-    // timeout 的假可执行文件、塞进 PATH 最前面,来触发这条路径,不依赖真实 apt-get/dpkg
-    // 是否装在测试机上——断言只关心"检测到超时+命令名匹配 → 触发了自动恢复尝试并在输出
-    // 里说明",不关心 dpkg 命令本身在这台机器上成不成功。
+    // 早先一次 apt-get 被前台超时强杀在事务中途、dpkg 卡在 interrupted 态,导致 verifier
+    // 自己装 curl/uv 也失败、pytest 从未跑起来,判了 0 分——这是"apt-get被中断打断损坏dpkg"
+    // 这个具体机制的第2次独立复现,不是孤立事件)。去掉 timeout 机制后,DAO 已经不会再主动
+    // 打断前台命令,唯一还会触发这条恢复路径的是 abort(ESC/信号中断)——用 AbortController
+    // 模拟,造一个名字叫 apt-get、实际会跑超过 abort 时机的假可执行文件、塞进 PATH 最前面,
+    // 不依赖真实 apt-get/dpkg 是否装在测试机上——断言只关心"检测到 abort+命令名匹配 →
+    // 触发了自动恢复尝试并在输出里说明",不关心 dpkg 命令本身在这台机器上成不成功。
     const fakeBin = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
     writeFileSync(path.join(fakeBin, "apt-get"), "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
-    const out = await execShellTool.handler(
-      { command: `PATH="${fakeBin}:$PATH" apt-get install foo`, timeout: 100 },
-      ctx,
+    const controller = new AbortController();
+    const p = execShellTool.handler(
+      { command: `PATH="${fakeBin}:$PATH" apt-get install foo` },
+      { ...ctx, signal: controller.signal },
     );
-    expect(out).toContain("[超时,已终止,");
+    setTimeout(() => controller.abort(), 100);
+    const out = await p;
+    expect(out).toContain("[已中断,");
     expect(out).toMatch(/\[自动恢复(失败)?\]/);
     expect(out).toContain("dpkg --configure -a");
   });
@@ -103,10 +126,13 @@ describe("Bash tool", () => {
     const originalPath = process.env.PATH;
     process.env.PATH = `${fakeBin}:${originalPath}`;
     try {
-      const out = await execShellTool.handler(
-        { command: "apt-get install foo", timeout: 100 },
-        ctx,
+      const controller = new AbortController();
+      const p = execShellTool.handler(
+        { command: "apt-get install foo" },
+        { ...ctx, signal: controller.signal },
       );
+      setTimeout(() => controller.abort(), 100);
+      const out = await p;
       expect(out).toContain("[自动恢复]");
       expect(out).not.toContain("[自动恢复失败]");
       // 计数文件应该是 2:第一次失败 + 重试一次成功。
@@ -116,9 +142,15 @@ describe("Bash tool", () => {
     }
   });
 
-  it("非包管理器命令超时 → 不触发 dpkg 自动恢复", async () => {
-    const out = await execShellTool.handler({ command: "sh -c 'sleep 5'", timeout: 100 }, ctx);
-    expect(out).toContain("[超时,已终止,");
+  it("非包管理器命令被中断 → 不触发 dpkg 自动恢复", async () => {
+    const controller = new AbortController();
+    const p = execShellTool.handler(
+      { command: "sh -c 'sleep 5'" },
+      { ...ctx, signal: controller.signal },
+    );
+    setTimeout(() => controller.abort(), 100);
+    const out = await p;
+    expect(out).toContain("[已中断,");
     expect(out).not.toContain("自动恢复");
     expect(out).not.toContain("dpkg");
   });
@@ -189,6 +221,162 @@ describe("Bash tool", () => {
     await execShellTool.handler({ command: "echo reset-streak" }, ctx);
     const out = await execShellTool.handler({ command: 'python -c "print(1)"' }, ctx);
     expect(out).not.toContain("[提示]");
+  });
+
+  describe("headless 会话检测到运行时崩溃信号 → 重新武装 todoWriteRequired 硬拦截", () => {
+    it("stdout/stderr 命中崩溃特征(malloc corrupted)→ done 从 true 重置为 false", async () => {
+      const todoWriteRequired = { done: true };
+      await execShellTool.handler(
+        { command: "echo 'malloc(): corrupted top size' 1>&2" },
+        { ...ctx, headless: true, todoWriteRequired },
+      );
+      expect(todoWriteRequired.done).toBe(false);
+    });
+
+    it("退出码命中信号崩溃(139=SIGSEGV)→ done 重置为 false,即便没有匹配到文字特征", async () => {
+      const todoWriteRequired = { done: true };
+      await execShellTool.handler(
+        { command: "sh -c 'exit 139'" },
+        { ...ctx, headless: true, todoWriteRequired },
+      );
+      expect(todoWriteRequired.done).toBe(false);
+    });
+
+    it("退出码137(SIGKILL,常是外部超时/OOM)不算崩溃信号,不触发重置", async () => {
+      const todoWriteRequired = { done: true };
+      await execShellTool.handler(
+        { command: "sh -c 'exit 137'" },
+        { ...ctx, headless: true, todoWriteRequired },
+      );
+      expect(todoWriteRequired.done).toBe(true);
+    });
+
+    it("正常执行(无崩溃)不触发重置", async () => {
+      const todoWriteRequired = { done: true };
+      await execShellTool.handler({ command: "echo ok" }, { ...ctx, headless: true, todoWriteRequired });
+      expect(todoWriteRequired.done).toBe(true);
+    });
+
+    it("非 headless 会话即便命中崩溃特征也不触发(与 ctx.headless 覆盖面保持一致)", async () => {
+      const todoWriteRequired = { done: true };
+      await execShellTool.handler(
+        { command: "echo 'Segmentation fault (core dumped)' 1>&2" },
+        { ...ctx, todoWriteRequired }, // headless 未设置
+      );
+      expect(todoWriteRequired.done).toBe(true);
+    });
+
+    it("未注入 todoWriteRequired 时,命中崩溃特征也不报错、正常返回结果", async () => {
+      const out = await execShellTool.handler(
+        { command: "echo 'stack smashing detected' 1>&2" },
+        { ...ctx, headless: true },
+      );
+      expect(out).toContain("[exit");
+    });
+  });
+
+  describe("数据库文件执行前自动备份", () => {
+    it("命令引用了存在的 .db 主文件 → 执行前自动备份主文件和它的 WAL/SHM/journal 边车文件", async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
+      const main = path.join(dir, "main.db");
+      const wal = path.join(dir, "main.db-wal");
+      writeFileSync(main, "main-content");
+      writeFileSync(wal, "wal-content");
+      // 命令文本里只提到了 main.db,没提到 main.db-wal——边车文件要能被隐式识别并备份。
+      const out = await execShellTool.handler({ command: `wc -c ${main}` }, ctx);
+      expect(out).toContain("[自动备份]");
+      expect(out).toContain("main.db");
+      expect(readFileSync(main + ".dao-backup", "utf8")).toBe("main-content");
+      expect(readFileSync(wal + ".dao-backup", "utf8")).toBe("wal-content");
+    });
+
+    it("已经备份过的文件不重复覆盖(保留最早的干净版本)", async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
+      const main = path.join(dir, "app.sqlite3");
+      writeFileSync(main, "v1");
+      await execShellTool.handler({ command: `wc -c ${main}` }, ctx);
+      expect(readFileSync(main + ".dao-backup", "utf8")).toBe("v1");
+      writeFileSync(main, "v2-corrupted-by-something-else");
+      const out2 = await execShellTool.handler({ command: `wc -c ${main}` }, ctx);
+      expect(out2).not.toContain("[自动备份]"); // 已备份过,这次不该再触发/覆盖
+      expect(readFileSync(main + ".dao-backup", "utf8")).toBe("v1"); // 备份仍是最早的干净版本
+    });
+
+    it("命令没有引用任何数据库文件 → 不触发,不额外产生备份文件", async () => {
+      const out = await execShellTool.handler({ command: "echo no-db-here" }, ctx);
+      expect(out).not.toContain("[自动备份]");
+    });
+
+    it("python3 -c 内联脚本里引用了数据库文件也能识别(不局限于普通 shell 命令)", async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
+      const main = path.join(dir, "main.db");
+      writeFileSync(main, "content");
+      // 这段脚本引用的其它路径不是"小文本文件",不会被 python-inline 小文件拦截提前挡掉。
+      const out = await execShellTool.handler(
+        { command: `python3 -c "import sqlite3; sqlite3.connect('${main}').execute('SELECT 1')"` },
+        ctx,
+      );
+      expect(out).toContain("[自动备份]");
+      expect(readFileSync(main + ".dao-backup", "utf8")).toBe("content");
+    });
+
+    it("被 python-inline 小文件规则提前拦截、命令根本没执行时 → 不做无意义的备份", async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
+      const small = path.join(dir, "notes.txt");
+      writeFileSync(small, "hello");
+      const out = await execShellTool.handler(
+        { command: `python3 -c "open('${small}')"` },
+        ctx,
+      );
+      expect(out).toContain("不用写 python 脚本"); // 确认真的被小文件规则拦下、命令未执行
+      expect(out).not.toContain("[自动备份]");
+    });
+
+    it("Redis/Firebird/KeePass/dBase 等同构扩展名也能识别", async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
+      for (const name of ["dump.rdb", "log.aof", "vault.kdbx", "table.dbf"]) {
+        const f = path.join(dir, name);
+        writeFileSync(f, "content");
+        const out = await execShellTool.handler({ command: `wc -c ${f}` }, ctx);
+        expect(out).toContain("[自动备份]");
+        expect(readFileSync(f + ".dao-backup", "utf8")).toBe("content");
+      }
+    });
+
+    it("回归:'db' 是 'db3'/'dbf' 的前缀,不能被短的那个抢先截断匹配掉", async () => {
+      // 之前的写法(扩展名后面没加边界)会把 "state.db3" 错误截断匹配成 "state.db",
+      // 按不存在的文件名去 statSync,找不到就被判定"不是备份目标"、什么也没做。
+      const dir = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
+      const f = path.join(dir, "state.db3");
+      writeFileSync(f, "content");
+      const out = await execShellTool.handler({ command: `wc -c ${f}` }, ctx);
+      expect(out).toContain("[自动备份]");
+      expect(readFileSync(f + ".dao-backup", "utf8")).toBe("content");
+    });
+  });
+
+  describe("会话结束清理 .dao-backup 文件", () => {
+    it("递归清理工作区下所有 .dao-backup 文件,不影响其它文件", async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
+      const sub = path.join(dir, "nested");
+      mkdirSync(sub);
+      writeFileSync(path.join(dir, "main.db.dao-backup"), "backup1");
+      writeFileSync(path.join(sub, "app.sqlite3.dao-backup"), "backup2");
+      writeFileSync(path.join(dir, "keep.txt"), "keep-me");
+      const n = await cleanupDbBackups(dir);
+      expect(n).toBe(2);
+      expect(existsSync(path.join(dir, "main.db.dao-backup"))).toBe(false);
+      expect(existsSync(path.join(sub, "app.sqlite3.dao-backup"))).toBe(false);
+      expect(existsSync(path.join(dir, "keep.txt"))).toBe(true);
+    });
+
+    it("没有任何 .dao-backup 文件时返回 0,不报错", async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "exec-shell-test-"));
+      writeFileSync(path.join(dir, "normal.txt"), "hi");
+      const n = await cleanupDbBackups(dir);
+      expect(n).toBe(0);
+      expect(readFileSync(path.join(dir, "normal.txt"), "utf8")).toBe("hi");
+    });
   });
 
   it("declares exec capability and required approval", () => {

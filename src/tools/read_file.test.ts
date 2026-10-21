@@ -85,4 +85,24 @@ describe("Read tool", () => {
     expect(out).toContain("2300\tL2300");
     expect(out).not.toContain("文件共 2500 行"); // 显式 limit 时不加默认截断提示
   });
+
+  it("传了 limit 但文件比 limit 小 → 提示已全部读取、下次可不传 limit", async () => {
+    // a.txt 内容 "line1\nline2\nline3\n",split("\n") 后为 4 行(末尾空串),模型传 limit=20 一次读完
+    const out = await readFileTool.handler({ path: "a.txt", limit: 20 }, { workspaceRoot: root });
+    expect(out).toContain("1\tline1");
+    expect(out).toContain("3\tline3");
+    expect(out).toContain("文件共 4 行,已全部读取");
+    expect(out).toContain("可不传 limit");
+  });
+
+  it("传了 limit 且文件比 limit 大 → 不加小文件提示(确实只读了一部分)", async () => {
+    const out = await readFileTool.handler({ path: "big.txt", limit: 100 }, { workspaceRoot: root });
+    expect(out).toContain("100\tL100");
+    expect(out).not.toContain("已全部读取");
+  });
+
+  it("不传 limit 时不加小文件提示(默认行为已是一次读完)", async () => {
+    const out = await readFileTool.handler({ path: "a.txt" }, { workspaceRoot: root });
+    expect(out).not.toContain("已全部读取");
+  });
 });

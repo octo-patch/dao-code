@@ -16,6 +16,8 @@ export const readFileTool = defineTool({
     "单行超 2000 字符会截断(防压缩过的代码/内联 base64 sourcemap 撑爆上下文);" +
     "不给 limit 时默认只读前 2000 行,截断处会提示续读的 offset,别误以为已经读完整个文件——" +
     "大文件想找具体内容,直接用 Grep 定位行号,比一段段翻页更快。\n" +
+    "效率提示:读小文件(几百行以内)时【不要传 limit】,一次读完整个文件比传 limit=20 分十次读高效得多;" +
+    "只有大文件需要分段读时才传 offset/limit。\n" +
     "工作区外的路径需要用户在弹出的授权里放行才能读。\n" +
     "副作用:成功读过的文件会被记入'已读'状态和当时的 mtime/size 基线——Write/Edit 依此判断" +
     "'编辑前是否读过'和'磁盘内容是否被外部改过'(改文件前必须先读它,就是为了建立这个基线)。",
@@ -27,6 +29,8 @@ export const readFileTool = defineTool({
     "lines over 2000 chars get truncated (protects against minified code or inline base64 sourcemaps blowing up context); " +
     "without limit, only the first 2000 lines are read by default — the truncation notice gives you the offset to continue, don't assume the whole file was read. " +
     "For large files, Grep to locate the right lines beats paging through with repeated reads.\n" +
+    "Efficiency tip: for small files (a few hundred lines or less), do NOT pass limit — reading the whole file at once is far more efficient than reading 20 lines at a time; " +
+    "only use offset/limit for large files that need sectioning.\n" +
     "Paths outside the workspace require the user to grant access via a popup.\n" +
     "Side effect: a successful read records the file as 'read' plus its mtime/size baseline — Write/Edit rely on this to check " +
     "'was it read before editing' and 'did the file change externally since' (this is exactly why editing requires reading first).",
@@ -115,8 +119,15 @@ export const readFileTool = defineTool({
         `\n…(File has ${lines.length} lines total; showing first ${DEFAULT_MAX_LINES} by default; use offset=${end + 1} to continue, or Grep for targeted search)`,
       )
       : "";
+    // 模型传了 limit 但文件比 limit 小(一次就读完了)→ 提示总行数,避免下次对小文件还传 limit 分多次读。
+    const smallFileHint = args.limit !== undefined && lines.length <= args.limit && start === 0
+      ? msg(
+        `\n(文件共 ${lines.length} 行,已全部读取;下次读小文件可不传 limit,一次读完)`,
+        `\n(File has ${lines.length} lines, fully read; for small files, omit limit to read in one go)`,
+      )
+      : "";
     // fire-and-forget:动态发现 .dao/skills/ + 条件 skill 路径匹配(不阻塞读操作)
     ctx.onFileAccessed?.(abs).catch(() => {});
-    return body + more;
+    return body + more + smallFileHint;
   },
 });

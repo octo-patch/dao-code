@@ -1,6 +1,6 @@
 {
   "name": "dao-code",
-  "version": "0.4.17",
+  "version": "0.5.9",
   "description": "Dao Code —— 道家美学的 DeepSeek V4 终端编码 agent(Ink TUI · 太极欢迎屏 · 流式+工具+审批 · 持久记忆 · prompt-cache 感知)",
   "author": "tigicion",
   "type": "module",
@@ -24,6 +24,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.build.json",
+    "postinstall": "patch-package",
     "bundle": "node scripts/sync-version.mjs && bun build ./src/index.ts --compile --outfile dao",
     "bundle:install": "npm run bundle && cp dao \"$HOME/.local/bin/dao\" && codesign --force --sign - \"$HOME/.local/bin/dao\" && echo \"已安装 → $HOME/.local/bin/dao\"",
     "start": "node dist/index.js",
@@ -79,6 +80,7 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "globals": "^17.6.0",
     "ink-testing-library": "^4.0.0",
+    "patch-package": "^8.0.1",
     "react-devtools-core": "^7.0.1",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",

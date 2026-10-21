@@ -114,14 +114,50 @@ describe("streamChat", () => {
     expect(sentBody.stream).toBe(true);
   });
 
-  it("显式设置 max_tokens 上限,不依赖各家 API 隐式默认值(默认 16000,可用 opts.maxTokens 覆盖)", async () => {
+  it("normalizes MiniMax M3.1 Flash thinking to the OpenAI reasoning_effort contract", async () => {
+    let sentBody: any;
+    const capturingFetch = (async (_url: string, init: any) => {
+      sentBody = JSON.parse(init.body);
+      return new Response(sseStream(["data: [DONE]\\n\\n"]), { status: 200 });
+    }) as unknown as typeof fetch;
+    await run(streamChat({
+      baseUrl: "https://api.minimaxi.com/v1",
+      apiKey: "sk",
+      model: "MiniMax-M3.1-Flash",
+      messages: [{ role: "user", content: "hi" }],
+      extra: { thinking: { type: "disabled" } },
+      fetchImpl: capturingFetch,
+    }));
+    expect(sentBody.reasoning_effort).toBe("max");
+    expect(sentBody.thinking).toBeUndefined();
+  });
+
+  it("preserves MiniMax gateway and M3 thinking fields for explicit custom requests", async () => {
+    let sentBody: any;
+    const capturingFetch = (async (_url: string, init: any) => {
+      sentBody = JSON.parse(init.body);
+      return new Response(sseStream(["data: [DONE]\\n\\n"]), { status: 200 });
+    }) as unknown as typeof fetch;
+    await run(streamChat({
+      baseUrl: "https://gateway.example/v1",
+      apiKey: "sk",
+      model: "MiniMax-M3.1-Flash",
+      messages: [{ role: "user", content: "hi" }],
+      extra: { thinking: { type: "disabled" } },
+      fetchImpl: capturingFetch,
+    }));
+    expect(sentBody.thinking).toEqual({ type: "disabled" });
+    expect(sentBody.reasoning_effort).toBeUndefined();
+  });
+
+  it("显式设置 max_tokens 上限,不依赖各家 API 隐式默认值(默认 128000,可用 opts.maxTokens 覆盖)", async () => {
     let sentBody: any;
     const capturingFetch = (async (_url: string, init: any) => {
       sentBody = JSON.parse(init.body);
       return new Response(sseStream(["data: [DONE]\n\n"]), { status: 200 });
     }) as unknown as typeof fetch;
     await run(streamChat({ ...base, messages: [{ role: "user", content: "hi" }], fetchImpl: capturingFetch }));
-    expect(sentBody.max_tokens).toBe(16000);
+    expect(sentBody.max_tokens).toBe(128000);
     expect(sentBody.max_completion_tokens).toBeUndefined();
 
     await run(streamChat({ ...base, messages: [{ role: "user", content: "hi" }], fetchImpl: capturingFetch, maxTokens: 256 }));
@@ -134,10 +170,10 @@ describe("streamChat", () => {
       sentBody = JSON.parse(init.body);
       return new Response(sseStream(["data: [DONE]\n\n"]), { status: 200 });
     }) as unknown as typeof fetch;
-    process.env.DAO_MAX_OUTPUT_TOKENS = "32000";
+    process.env.DAO_MAX_OUTPUT_TOKENS = "50000";
     await run(streamChat({ ...base, messages: [{ role: "user", content: "hi" }], fetchImpl: capturingFetch }));
     delete process.env.DAO_MAX_OUTPUT_TOKENS;
-    expect(sentBody.max_tokens).toBe(32000);
+    expect(sentBody.max_tokens).toBe(50000);
   });
 
   it("gpt-5(推理层模型)用 max_completion_tokens,不用会被拒的 max_tokens", async () => {
@@ -147,11 +183,11 @@ describe("streamChat", () => {
       return new Response(sseStream(["data: [DONE]\n\n"]), { status: 200 });
     }) as unknown as typeof fetch;
     await run(streamChat({ ...base, model: "gpt-5", messages: [{ role: "user", content: "hi" }], fetchImpl: capturingFetch }));
-    expect(sentBody.max_completion_tokens).toBe(16000);
+    expect(sentBody.max_completion_tokens).toBe(128000);
     expect(sentBody.max_tokens).toBeUndefined();
   });
 
-  it("strips reasoningContent from history before sending (never replayed to the API)", async () => {
+  it("strips reasoningContent from a turn that made no tool call (DeepSeek docs: not needed without a tool call)", async () => {
     let sentBody: any;
     const capturingFetch = (async (_url: string, init: any) => {
       sentBody = JSON.parse(init.body);
@@ -168,6 +204,30 @@ describe("streamChat", () => {
       }),
     );
     expect(sentBody.messages[1]).toEqual({ role: "assistant", content: "hello" });
+    expect(sentBody.messages[1].reasoningContent).toBeUndefined();
+    expect(sentBody.messages[1].reasoning_content).toBeUndefined();
+  });
+
+  it("keeps reasoning_content on the wire for a turn that made a tool call (DeepSeek docs + ARK empirical test 2026-07-24: required for tool-call continuation)", async () => {
+    let sentBody: any;
+    const capturingFetch = (async (_url: string, init: any) => {
+      sentBody = JSON.parse(init.body);
+      return new Response(sseStream(["data: [DONE]\n\n"]), { status: 200 });
+    }) as unknown as typeof fetch;
+    const toolCalls = [{ id: "call_1", type: "function" as const, function: { name: "Read", arguments: "{}" } }];
+    await run(
+      streamChat({
+        ...base,
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "", tool_calls: toolCalls, reasoningContent: "先想清楚该读哪个文件" },
+          { role: "tool", tool_call_id: "call_1", content: "file contents" },
+        ],
+        fetchImpl: capturingFetch,
+      }),
+    );
+    expect(sentBody.messages[1].reasoning_content).toBe("先想清楚该读哪个文件");
+    expect(sentBody.messages[1].tool_calls).toEqual(toolCalls);
     expect(sentBody.messages[1].reasoningContent).toBeUndefined();
   });
 
@@ -443,6 +503,31 @@ describe("streamChat", () => {
     expect(message.content).toBeNull();
     expect(message.reasoningContent).toBe("想了很多但还没写结论");
     expect(notified).toBe(1); // 上层被明确告知:这是"推理耗尽预算",不是普通空响应
+  });
+
+  it("SSE 流内返回 error 事件(如 E2004 max_concurrency 过载)→ 抛错并触发重试,不静默吞成空响应", async () => {
+    // 真实场景:brpc 网关在 SSE 流里返回 {"error":{"code":"E2004","message":"...max_concurrency..."}},
+    // 旧 processPayload 只看 choices[0].delta、不识别 error 字段,静默跳过 → 流式"成功"结束但无产出
+    // → loop.ts 当成空响应 → 重试一次还是 E2004 → "连续两次空响应,结束本轮"。
+    let calls = 0;
+    const fetchImpl = (async (_url: string, init: any) => {
+      const b = JSON.parse(init.body); calls++;
+      if (b.stream && calls === 1) {
+        return new Response(sseStream([
+          'data: {"error":{"code":"E2004","message":"Reached server max_concurrency 2000"}}\n\n',
+          "data: [DONE]\n\n",
+        ]), { status: 200 });
+      }
+      if (b.stream) {
+        return new Response(sseStream(['data: {"choices":[{"delta":{"content":"ok"}}]}\n\n', "data: [DONE]\n\n"]), { status: 200 });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const { message } = await run(
+      streamChat({ ...base, messages: [{ role: "user", content: "hi" }], fetchImpl, maxRetries: 2, retryDelayMs: 0 }),
+    );
+    expect(message.content).toBe("ok");
+    expect(calls).toBe(2); // 第一发撞 E2004 → 退避重试 → 第二发成功
   });
 
   it("背景查询遇 529 → 立即上抛,不重试/不兜底", async () => {

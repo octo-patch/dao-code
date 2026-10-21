@@ -34,4 +34,11 @@ describe("ProviderStep", () => {
     stdin.write(DOWN); await delay(); stdin.write(DOWN); await delay(); stdin.write(ENTER); await delay();
     expect(onPick).toHaveBeenCalledWith("qianfan");
   });
+
+  it("picks zhipu after three DOWN", async () => {
+    const onPick = vi.fn();
+    const { stdin } = render(<ProviderStep bg="dark" onPick={onPick} />);
+    stdin.write(DOWN); await delay(); stdin.write(DOWN); await delay(); stdin.write(DOWN); await delay(); stdin.write(ENTER); await delay();
+    expect(onPick).toHaveBeenCalledWith("zhipu");
+  });
 });

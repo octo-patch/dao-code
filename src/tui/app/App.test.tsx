@@ -25,8 +25,8 @@ function makeDeps(over: Partial<AppDeps> = {}): AppDeps {
     },
     runCommand: (line) =>
       line.startsWith("/help") ? { handled: true, output: "命令:/help /exit" } : { handled: true, output: "未知" },
-    compact: async () => {},
-    getStatus: () => ({ model: "deepseek-v4-pro", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3 }),
+    compact: async () => ({ before: 12000, after: 3000 }),
+    getStatus: () => ({ model: "deepseek-v4-pro", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3, contextWindow: 1_000_000, contextUsed: 3000 }),
     register: () => {},
     ...over,
   };
@@ -52,7 +52,7 @@ describe("App", () => {
         {...makeDeps({
           getStatus: () => ({
             model: "deepseek-v4-pro", mode: "normal", promptTokens: 12, completionTokens: 3,
-            cacheHitRatio: 0.5, yolo: false, contextPct: 0.3, version: "0.4.10", sessionId: "20260719-200800-h2w9",
+            cacheHitRatio: 0.5, yolo: false, contextPct: 0.3, contextWindow: 1_000_000, contextUsed: 3000, version: "0.4.10", sessionId: "20260719-200800-h2w9",
           }),
         })}
       />,
@@ -238,7 +238,7 @@ describe("App", () => {
     expect(seenProvider).toBe("qianfan");
   });
 
-  it("/account 添加账户:↓↓ + ⏎ 选到 volcengine(排最后)", async () => {
+  it("/account 添加账户:↓↓ + ⏎ 选到 volcengine", async () => {
     let seenProvider: string | undefined;
     const { stdin } = render(
       <App {...makeDeps({
@@ -263,6 +263,102 @@ describe("App", () => {
     stdin.write("\r");
     await delay();
     expect(seenProvider).toBe("volcengine");
+  });
+
+  it("/account 添加账户:↓↓↓ + ⏎ 选到 zhipu(排最后,custom 之前)", async () => {
+    let seenProvider: string | undefined;
+    const { stdin } = render(
+      <App {...makeDeps({
+        listAccounts: () => [],
+        addAccount: async (key, name, provider) => { seenProvider = provider; return { ok: true, name: name ?? "default" }; },
+      })} />,
+    );
+    for (const ch of "/account") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    stdin.write("\x1b[B"); // ↓ 到 qianfan
+    await delay();
+    stdin.write("\x1b[B"); // ↓ 到 volcengine
+    await delay();
+    stdin.write("\x1b[B"); // ↓ 到 zhipu
+    await delay();
+    stdin.write("\r"); // ⏎ 确认
+    await delay();
+    for (const ch of "zp-key") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    stdin.write("\r");
+    await delay();
+    expect(seenProvider).toBe("zhipu");
+  });
+
+  it("/account 添加账户:选自定义网关 → baseUrl → token → 拉列表选 model → 起名,参数透传给 addAccount", async () => {
+    let seen: { key?: string; name?: string; provider?: string; baseUrl?: string; model?: string } = {};
+    let fetchedWith: { baseUrl?: string; key?: string } = {};
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        listAccounts: () => [],
+        fetchGatewayModels: async (baseUrl, key) => { fetchedWith = { baseUrl, key }; return ["GLM-5.3-joybuilder", "DeepSeek-V4-Pro-joybuilder"]; },
+        addAccount: async (key, name, provider, baseUrl, model) => { seen = { key, name, provider, baseUrl, model }; return { ok: true, name: name ?? "default" }; },
+      })} />,
+    );
+    for (const ch of "/account") stdin.write(ch);
+    await delay();
+    stdin.write("\r"); // 无账户,直接进添加
+    await delay();
+    expect(lastFrame()!).toContain("自定义网关"); // 选择器列出自定义网关项
+    stdin.write("5"); // 数字键选第 5 项:自定义网关(zhipu 加入后 custom 顺延)
+    await delay();
+    for (const ch of "http://llm-gw.jd.local/v1") stdin.write(ch);
+    await delay();
+    stdin.write("\r"); // baseUrl
+    await delay();
+    for (const ch of "gw-token") stdin.write(ch);
+    await delay();
+    stdin.write("\r"); // token → 触发拉列表
+    await delay();
+    expect(fetchedWith).toEqual({ baseUrl: "http://llm-gw.jd.local/v1", key: "gw-token" });
+    expect(lastFrame()!).toContain("GLM-5.3-joybuilder"); // 模型列表选择器
+    stdin.write("1"); // 选第 1 个模型
+    await delay();
+    stdin.write("\r"); // 起名(留空用默认)
+    await delay();
+    expect(seen).toEqual({ key: "gw-token", name: undefined, provider: "deepseek", baseUrl: "http://llm-gw.jd.local/v1", model: "GLM-5.3-joybuilder" });
+  });
+
+  it("/account 自定义网关:拉不到模型列表 → 回退手动输入 model 名", async () => {
+    let seenModel: string | undefined;
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        listAccounts: () => [],
+        fetchGatewayModels: async () => [], // 网关无 /models
+        addAccount: async (key, name, provider, baseUrl, model) => { seenModel = model; return { ok: true, name: name ?? "default" }; },
+      })} />,
+    );
+    for (const ch of "/account") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    stdin.write("5"); // 自定义网关(第 5 项)
+    await delay();
+    for (const ch of "http://gw/v1") stdin.write(ch);
+    await delay();
+    stdin.write("\r"); // baseUrl
+    await delay();
+    for (const ch of "tok") stdin.write(ch);
+    await delay();
+    stdin.write("\r"); // token → 拉列表返回空 → 手动输入提示
+    await delay();
+    expect(lastFrame()!).toContain("输入模型名");
+    for (const ch of "my-model") stdin.write(ch);
+    await delay();
+    stdin.write("\r"); // model
+    await delay();
+    stdin.write("\r"); // 起名
+    await delay();
+    expect(seenModel).toBe("my-model");
   });
 
   it("/account 添加账户:provider 选择器按 Esc → 取消,不调用 addAccount", async () => {
@@ -764,6 +860,45 @@ describe("App", () => {
     expect(lastFrame()).toContain("已切换主题");
   });
 
+  it("/lang 无参切换语言,后续渲染跟随新语言(App 内拦截)", async () => {
+    const { lastFrame, stdin } = render(<App {...makeDeps()} />);
+    for (const ch of "/lang") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay(60);
+    // zh → en:确认提示是英文;状态栏(Input/Output/Cache hit)与面板描述已跟随新语言
+    expect(lastFrame()).toContain("Language switched");
+    expect(lastFrame()).toContain("Cache hit");
+    stdin.write("/lang"); // 精确过滤面板,直接看到 /lang 条目
+    await delay();
+    expect(lastFrame()).toContain("Switch UI language zh/en");
+    for (const ch of "\b\b\b\b\b") stdin.write(ch); // 清空输入
+    await delay();
+    for (const ch of "/lang") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay(60);
+    // en → zh:切回中文,提示与状态栏恢复中文
+    expect(lastFrame()).toContain("已切换语言");
+    expect(lastFrame()).toContain("缓存命中");
+  });
+
+  it("/lang 带参 /lang zh 切到中文;非法参数报错不改语言", async () => {
+    setLang("en");
+    const { lastFrame, stdin } = render(<App {...makeDeps()} />);
+    for (const ch of "/lang zh") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay(60);
+    expect(lastFrame()).toContain("已切换语言");
+    for (const ch of "/lang fr") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay(60);
+    expect(lastFrame()).toContain("zh / en");
+    expect(lastFrame()).toContain("缓存命中"); // 仍是中文,未被非法参数改掉
+  });
+
   it("@文件补全:Tab 补全第一个匹配", async () => {
     let submitted = "";
     const { stdin } = render(
@@ -977,11 +1112,12 @@ describe("App", () => {
     const { lastFrame } = render(
       <App
         {...makeDeps({
-          getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: true, longTask: true, contextPct: 0 }),
+          getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: true, longTask: true, contextPct: 0, contextWindow: 1_000_000, contextUsed: 0 }),
         })}
       />,
     );
     expect(lastFrame()).toContain("长任务");
+    expect(lastFrame()).toContain("全权放行"); // yolo 状态栏文案(中文名)
   });
 
   it("后台任务通知 → 自动作为新回合处理(注入结果)", async () => {
@@ -1046,7 +1182,7 @@ describe("App", () => {
     setLang("en");
     const f = render(
       <App {...makeDeps({
-        getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: false, longTask: true, contextPct: 0 }),
+        getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: false, longTask: true, contextPct: 0, contextWindow: 1_000_000, contextUsed: 0 }),
       })} />,
     ).lastFrame()!;
     expect(f).toContain("Long task");
@@ -1085,14 +1221,14 @@ describe("App", () => {
   it("i18n:权限模式提示 + 模式标签跟随 locale(Shift+Tab)", async () => {
     setLang("en");
     const { lastFrame, stdin } = render(
-      <App {...makeDeps({ cycleMode: () => "acceptEdits" })} />,
+      <App {...makeDeps({ cycleMode: () => "auto" })} />,
     );
     await delay();
     stdin.write("\x1b[Z"); // Shift+Tab(backtab)→ 循环权限模式
     await delay();
     const f = lastFrame()!;
     expect(f).toContain("permission mode →");
-    expect(f).toContain("Auto-accept edits");
+    expect(f).toContain("Smart decision");
     expect(f).not.toContain("权限模式");
   });
 
@@ -1141,7 +1277,7 @@ describe("App", () => {
     const { lastFrame, stdin } = render(
       <App {...makeDeps({
         submit: async (t, { events }) => { submitted = t; events.assistantDone({ role: "assistant", content: "ok" }); },
-        getStatus: () => ({ model: "kimi-k2.6", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3 }), // 支持图片输入的模型
+        getStatus: () => ({ model: "kimi-k2.6", mode: "normal", promptTokens: 12, completionTokens: 3, cacheHitRatio: 0.5, yolo: false, branch: "main", contextPct: 0.3, contextWindow: 1_000_000, contextUsed: 3000 }), // 支持图片输入的模型
       })} />,
     );
     stdin.write(`\x1b[200~${imgPath}\x1b[201~`);
@@ -1152,5 +1288,135 @@ describe("App", () => {
     expect(Array.isArray(submitted)).toBe(true);
     const parts = submitted as ContentPart[];
     expect(parts.some((p) => p.type === "image_url" && p.image_url.url.startsWith("data:image/png;base64,"))).toBe(true);
+  });
+
+  it("Ctrl+G 对话导航:列出用户消息、↑↓ 选择、Enter 跳转回看、Esc 退出回看", async () => {
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        submit: async (text, { events }) => {
+          events.assistantDone({ role: "assistant", content: `答:${text}` });
+        },
+      })} />,
+    );
+    // 先产生 3 轮对话
+    for (const round of ["第一个问题", "第二个问题", "第三个问题"]) {
+      for (const ch of round) stdin.write(ch);
+      await delay();
+      stdin.write("\r");
+      await delay();
+    }
+    // 唤出对话导航面板
+    stdin.write("\x07"); // Ctrl+G
+    await delay();
+    let f = lastFrame()!;
+    expect(f).toContain("对话导航");
+    expect(f).toContain("共 3 条用户消息");
+    expect(f).toContain("第三个问题"); // 默认定位最近一条
+    expect(f).toContain("第一个问题");
+    // ↑ 移到第一条
+    stdin.write("\x1b[A"); // ↑
+    await delay();
+    stdin.write("\x1b[A"); // ↑
+    await delay();
+    f = lastFrame()!;
+    expect(f).toContain("❯ 1. 第一个问题");
+    // Enter 跳转 → 进入回看模式(只读视图,显示那轮历史对话)
+    stdin.write("\r");
+    await delay();
+    f = lastFrame()!;
+    expect(f).toContain("回看历史对话");
+    expect(f).toContain("第一个问题");
+    expect(f).toContain("答:第一个问题");
+    // 面板已关闭
+    expect(f).not.toContain("对话导航");
+    // Esc 退出回看,回到当前 transcript
+    stdin.write("\x1b");
+    await delay();
+    f = lastFrame()!;
+    expect(f).not.toContain("回看历史对话");
+  });
+
+  it("Ctrl+G 无用户消息时不弹面板", async () => {
+    const { lastFrame, stdin } = render(<App {...makeDeps()} />);
+    stdin.write("\x07"); // Ctrl+G
+    await delay();
+    const f = lastFrame()!;
+    expect(f).not.toContain("对话导航");
+  });
+
+  it("Ctrl+G 面板 Esc 关闭", async () => {
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        submit: async (text, { events }) => {
+          events.assistantDone({ role: "assistant", content: `答:${text}` });
+        },
+      })} />,
+    );
+    for (const ch of "hello") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    stdin.write("\x07"); // Ctrl+G
+    await delay();
+    expect(lastFrame()!).toContain("对话导航");
+    stdin.write("\x1b"); // Esc
+    await delay();
+    expect(lastFrame()!).not.toContain("对话导航");
+  });
+
+  it("/clear 清屏:旧 transcript 内容不残留,只剩 /clear 回显", async () => {
+    // Ink <Static> 内部维护 index(只渲染 items.slice(index)),重置 items 为短数组后
+    // index 仍指向旧位置 → 新 welcome 不渲染;且 fullStaticOutput(已写入终端的
+    // 累积 static 文本)不会被清,每帧仍把旧内容写到屏幕。修复:换 key 强制
+    // <Static> 重挂载 + 写清屏转义序列。
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        runCommand: (l) => l.startsWith("/clear") ? { handled: true, output: "已清空对话(保留系统设定)" } : { handled: true, output: "?" },
+      })} />,
+    );
+    // 先产生一轮对话,让 transcript 里有内容
+    for (const ch of "hello") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    expect(lastFrame()!).toContain("echo: hello");
+    // 执行 /clear
+    for (const ch of "/clear") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    await delay();
+    // /clear 后:旧对话内容应消失
+    const after = lastFrame()!;
+    expect(after).toContain("已清空对话");
+    expect(after).not.toContain("echo: hello");
+  });
+
+  it("/compact 成功 → 显示\"已压缩对话\" notice", async () => {
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        runCommand: (l) => l.startsWith("/compact") ? { handled: true, compact: true } : { handled: true, output: "?" },
+        compact: async () => ({ before: 12000, after: 3000 }),
+      })} />,
+    );
+    for (const ch of "/compact") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    for (let i = 0; i < 50 && !lastFrame()!.includes("已压缩对话"); i++) await delay(20);
+    expect(lastFrame()!).toContain("已压缩对话");
+    expect(lastFrame()!).toContain("节省 75%");
+  });
+
+  it("/compact 抛错 → 显示出错 notice,不静默吞掉", async () => {
+    const { lastFrame, stdin } = render(
+      <App {...makeDeps({
+        runCommand: (l) => l.startsWith("/compact") ? { handled: true, compact: true } : { handled: true, output: "?" },
+        compact: async () => { throw new Error("压缩失败:摘要模型不可用"); },
+      })} />,
+    );
+    for (const ch of "/compact") stdin.write(ch);
+    await delay();
+    stdin.write("\r");
+    for (let i = 0; i < 50 && !lastFrame()!.includes("压缩失败"); i++) await delay(20);
+    expect(lastFrame()!).toContain("压缩失败");
   });
 });

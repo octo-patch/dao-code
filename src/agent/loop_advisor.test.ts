@@ -20,7 +20,7 @@ function baseDeps(session: Session, streamChat: any, executeToolCalls: any) {
 
 describe("L4.2/L4.3 advisor", () => {
   it("连续空转 N 轮后,进度提醒【持久 append 进会话】(下一轮请求带上;缓存安全)", async () => {
-    process.env.DAO_ADVISE_EVERY = "2";
+    process.env.DAO_ADVISE_GAPS = "2,2,2";
     const sentLog: any[] = [];
     let turn = 0;
     const streamChat = (opts: StreamChatOptions) => {
@@ -35,7 +35,7 @@ describe("L4.2/L4.3 advisor", () => {
     const s = new Session("SYS", "m");
     s.addUser("go");
     await runTurn(baseDeps(s, streamChat, executeToolCalls));
-    delete process.env.DAO_ADVISE_EVERY;
+    delete process.env.DAO_ADVISE_GAPS;
 
     const advisoryIn = (msgs: any[]) => msgs.some((m) => typeof m.content === "string" && m.content.includes("进度提醒"));
     expect(advisoryIn(sentLog[0])).toBe(false); // 第1次:还没空转
@@ -45,7 +45,7 @@ describe("L4.2/L4.3 advisor", () => {
   });
 
   it("有文件改动则不提醒(进度被重置)", async () => {
-    process.env.DAO_ADVISE_EVERY = "2";
+    process.env.DAO_ADVISE_GAPS = "2,2,2";
     const sentLog: any[] = [];
     let turn = 0;
     const streamChat = (opts: StreamChatOptions) => {
@@ -60,7 +60,146 @@ describe("L4.2/L4.3 advisor", () => {
     const s = new Session("SYS", "m");
     s.addUser("go");
     await runTurn(baseDeps(s, streamChat, executeToolCalls));
-    delete process.env.DAO_ADVISE_EVERY;
+    delete process.env.DAO_ADVISE_GAPS;
     expect(sentLog.every((m) => !m.some((x: any) => typeof x.content === "string" && x.content.includes("进度提醒")))).toBe(true);
+  });
+
+  it("Bash 执行也算实质推进——shell heredoc 写文件是真实产出,不该被判成空转", async () => {
+    // 根因(2026-07-27 path-tracing 真实 trace):PROGRESS_TOOLS 只认四类写文件工具,
+    // 而模型这一整轮都在用 `cat > file <<EOF` 走 Bash 落盘——43 次工具调用里被计为
+    // "有推进"的是 0 次,交付物写了两次、还有 6 个脚本,检测器却全程认为它在空转。
+    // 提醒文案本身要求的就是"写脚本算出来、跑命令查",不把跑命令计入等于自相矛盾。
+    process.env.DAO_ADVISE_GAPS = "2,2,2";
+    const sentLog: any[] = [];
+    let turn = 0;
+    const streamChat = (opts: StreamChatOptions) => {
+      sentLog.push([...opts.messages]);
+      turn++;
+      return (async function* (): AsyncGenerator<never, AssistantMessage> {
+        if (turn <= 4) return { role: "assistant", content: "", tool_calls: [{ id: "t" + turn, type: "function", function: { name: "Bash", arguments: "{}" } }] };
+        return { role: "assistant", content: "done" };
+      })();
+    };
+    const executeToolCalls = async (tcs: any[]) => tcs.map((tc) => ({ role: "tool", tool_call_id: tc.id, content: "ok" }));
+    const s = new Session("SYS", "m");
+    s.addUser("go");
+    await runTurn(baseDeps(s, streamChat, executeToolCalls));
+    delete process.env.DAO_ADVISE_GAPS;
+    expect(sentLog.every((m) => !m.some((x: any) => typeof x.content === "string" && x.content.includes("进度提醒")))).toBe(true);
+  });
+
+  it("TodoWrite 不算实质推进——纯记账的元动作不能把「卡住」计数器清零", async () => {
+    // 同一个结构缺陷的另一面:计数器此前把 TodoWrite 当成推进,于是一个只更新任务清单、
+    // 不产出任何东西的回合就能把提醒压下去——和"强制工具调用被 Skill(make-plan) 兑现"
+    // 是同一类漏洞(用元动作满足判据)。
+    process.env.DAO_ADVISE_GAPS = "2,2,2";
+    const sentLog: any[] = [];
+    let turn = 0;
+    const streamChat = (opts: StreamChatOptions) => {
+      sentLog.push([...opts.messages]);
+      turn++;
+      return (async function* (): AsyncGenerator<never, AssistantMessage> {
+        if (turn <= 3) return { role: "assistant", content: "", tool_calls: [{ id: "t" + turn, type: "function", function: { name: "TodoWrite", arguments: "{}" } }] };
+        return { role: "assistant", content: "done" };
+      })();
+    };
+    const executeToolCalls = async (tcs: any[]) => tcs.map((tc) => ({ role: "tool", tool_call_id: tc.id, content: "ok" }));
+    const s = new Session("SYS", "m");
+    s.addUser("go");
+    await runTurn(baseDeps(s, streamChat, executeToolCalls));
+    delete process.env.DAO_ADVISE_GAPS;
+    expect(s.messages.some((m) => typeof m.content === "string" && m.content.includes("进度提醒"))).toBe(true);
+  });
+
+  it("todo_write enforcement 已移除(2026-07-31 改按模式分流,不再有运行时阈值提醒):大量工具调用+多轮仍不调用 TodoWrite,不再注入 [运行时要求]", async () => {
+    // 旧机制(8次工具调用或5轮未用 TodoWrite 就追加提醒)已删除,替换成 system_prompt.ts 里
+    // headless 专属的开局强制文案(见 system_prompt.test.ts),交互式完全不强制、信任模型判断。
+    // 这条测试是回归防护:确认 loop.ts 不再有任何路径会注入这条旧提醒。
+    let turn = 0;
+    const streamChat = (() => {
+      turn++;
+      return (async function* (): AsyncGenerator<never, AssistantMessage> {
+        if (turn <= 10) return { role: "assistant", content: "", tool_calls: [{ id: "t" + turn, type: "function", function: { name: "Bash", arguments: "{}" } }] };
+        return { role: "assistant", content: "done" };
+      })();
+    }) as any;
+    const executeToolCalls = async (tcs: any[]) => tcs.map((tc) => ({ role: "tool", tool_call_id: tc.id, content: "ok" }));
+    const s = new Session("SYS", "m");
+    s.addUser("go");
+    await runTurn({ ...baseDeps(s, streamChat, executeToolCalls), interactive: false });
+    expect(s.messages.some((m) => typeof m.content === "string" && m.content.includes("[运行时要求]"))).toBe(false);
+  });
+
+  it("三档提醒间隔递减:第1次等4轮,第2次再等3轮(累计7),第3次起再等2轮(累计9/11…)", async () => {
+    const sentLog: any[] = [];
+    let turn = 0;
+    // 20轮全部不触碰 PROGRESS_TOOLS(用 Read 占位),让 noProgress 一路累积到 15+
+    const streamChat = (opts: StreamChatOptions) => {
+      sentLog.push([...opts.messages]);
+      turn++;
+      return (async function* (): AsyncGenerator<never, AssistantMessage> {
+        if (turn <= 16) return { role: "assistant", content: "", tool_calls: [{ id: "t" + turn, type: "function", function: { name: "Read", arguments: "{}" } }] };
+        return { role: "assistant", content: "done" };
+      })();
+    };
+    const executeToolCalls = async (tcs: any[]) => tcs.map((tc) => ({ role: "tool", tool_call_id: tc.id, content: "ok" }));
+    const s = new Session("SYS", "m");
+    s.addUser("go");
+    await runTurn(baseDeps(s, streamChat, executeToolCalls));
+
+    // 请求 i 携带的是"上一轮结束时已经 append 的提醒"——所以 noProgress=5 那轮结束后 append 的
+    // 提醒,出现在下一次(第6次)请求里(sentLog 下标从0开始,故为 sentLog[5])。
+    const totalAdvisoriesBySent = (i: number) => (sentLog[i] as any[]).filter((m) => typeof m.content === "string" && m.content.startsWith("[进度提醒")).length;
+    expect(totalAdvisoriesBySent(4)).toBe(1); // 第4轮末触发第1次(累计阈值4)
+    expect(totalAdvisoriesBySent(7)).toBe(2); // 第7轮末触发第2次(4+3)
+    expect(totalAdvisoriesBySent(9)).toBe(3); // 第9轮末触发第3次(7+2)
+    expect(totalAdvisoriesBySent(11)).toBe(4); // 第11轮末触发第4次(9+2,此后维持2的间隔)
+  });
+
+  it("headless(interactive: false)时,提醒不建议 AskUserQuestion,改成按判断继续+汇报", async () => {
+    process.env.DAO_ADVISE_GAPS = "2,2,2";
+    const sentLog: any[] = [];
+    let turn = 0;
+    const streamChat = (opts: StreamChatOptions) => {
+      sentLog.push([...opts.messages]);
+      turn++;
+      return (async function* (): AsyncGenerator<never, AssistantMessage> {
+        if (turn <= 3) return { role: "assistant", content: "", tool_calls: [{ id: "t" + turn, type: "function", function: { name: "Read", arguments: "{}" } }] };
+        return { role: "assistant", content: "done" };
+      })();
+    };
+    const executeToolCalls = async (tcs: any[]) => tcs.map((tc) => ({ role: "tool", tool_call_id: tc.id, content: "ok" }));
+    const s = new Session("SYS", "m");
+    s.addUser("go");
+    await runTurn({ ...baseDeps(s, streamChat, executeToolCalls), interactive: false });
+    delete process.env.DAO_ADVISE_GAPS;
+
+    const advisory = s.messages.find((m) => typeof m.content === "string" && m.content.includes("进度提醒"));
+    expect(advisory).toBeTruthy();
+    expect((advisory!.content as string).includes("AskUserQuestion")).toBe(false);
+    expect((advisory!.content as string).includes("按你此刻最合理的判断继续推进")).toBe(true);
+  });
+
+  it("interactive 省略(默认交互态)时,提醒仍建议 AskUserQuestion(不改变既有交互态字节)", async () => {
+    process.env.DAO_ADVISE_GAPS = "2,2,2";
+    const sentLog: any[] = [];
+    let turn = 0;
+    const streamChat = (opts: StreamChatOptions) => {
+      sentLog.push([...opts.messages]);
+      turn++;
+      return (async function* (): AsyncGenerator<never, AssistantMessage> {
+        if (turn <= 3) return { role: "assistant", content: "", tool_calls: [{ id: "t" + turn, type: "function", function: { name: "Read", arguments: "{}" } }] };
+        return { role: "assistant", content: "done" };
+      })();
+    };
+    const executeToolCalls = async (tcs: any[]) => tcs.map((tc) => ({ role: "tool", tool_call_id: tc.id, content: "ok" }));
+    const s = new Session("SYS", "m");
+    s.addUser("go");
+    await runTurn(baseDeps(s, streamChat, executeToolCalls));
+    delete process.env.DAO_ADVISE_GAPS;
+
+    const advisory = s.messages.find((m) => typeof m.content === "string" && m.content.includes("进度提醒"));
+    expect(advisory).toBeTruthy();
+    expect((advisory!.content as string).includes("用 AskUserQuestion 向用户求助")).toBe(true);
   });
 });

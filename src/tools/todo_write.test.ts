@@ -63,6 +63,15 @@ describe("TodoWrite tool", () => {
     expect(out).toContain("verify 子代理");
   });
 
+  it("清单全勾完提醒:强制核对对象是任务原文本身,不是清单本身", async () => {
+    const out = await todoWriteTool.handler(
+      { todos: [{ content: "a", status: "completed" }, { content: "b", status: "completed" }, { content: "c", status: "completed" }] },
+      ctx,
+    );
+    expect(out).toContain("任务原文本身");
+    expect(out).toContain("这不是完成的信号"); // 明确否定"清单勾完=完成"这个错误推论
+  });
+
   it("fewer than 3 items, all completed → no nudge", async () => {
     const out = await todoWriteTool.handler(
       {

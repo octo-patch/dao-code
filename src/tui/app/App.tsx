@@ -1,14 +1,15 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Box, Text, Static, useApp, useInput, usePaste } from "ink";
+import { Box, Text, Static, useApp, useInput, usePaste, useStdout } from "ink";
 import { highlight } from "cli-highlight";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { renderMarkdown } from "../markdown.js";
 import { semHex } from "../theme.js";
 import { Welcome } from "../Welcome.js";
-import { t, tips } from "../../i18n/i18n.js";
+import { t, tips, setLang, getLang, switchLang, type Lang } from "../../i18n/i18n.js";
 import { daoVerb, DAO_VERBS } from "../spinner_words.js";
 import { clampLines, parseTodoResult } from "./format.js";
+import { displayWidth } from "../width.js";
 import type { TurnEvents } from "../render.js";
 import type { ApprovalDecision, ApprovalPrompt, ApprovalRequest } from "../../approval/types.js";
 import type { AppDeps, LiveState, StatusInfo, TranscriptItem } from "./types.js";
@@ -20,7 +21,7 @@ import { classifyPath, isImagePath, detectImageFormat } from "../../tools/paths.
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // 权限模式的友好名(Shift+Tab 提示与状态栏共用),避免直接暴露内部枚举名。走 t() 跟随 locale。
-const MODE_KEYS = new Set(["default", "acceptEdits", "auto", "plan", "bypassPermissions"]);
+const MODE_KEYS = new Set(["default", "auto", "plan", "bypassPermissions"]);
 const modeLabel = (m: string): string => (MODE_KEYS.has(m) ? t("mode." + m) : m);
 const MAX_LIVE_LINES = 12; // 流式动态区尾部行数的【上限】;实际取 liveCap(按屏高自适应)。完成后整段进 <Static>,故不丢内容。
 const TOOL_OUT_CAP = 8; // 工具结果 ⎿ 子块默认最多显示几行(ctrl+o / --verbose 全显)
@@ -31,11 +32,11 @@ const ECHO_OUTPUT = new Set(["Bash", "BashOutput", "Grep", "WebSearch", "WebFetc
 // 斜杠命令清单(补全菜单 + Tab 补全共用,单一真相源):命令名 + 顺序即菜单展示顺序。
 // 每条描述走 i18n 键 cmd.<name>(精炼一行,参考 命令面板),渲染处用 t("cmd."+name) 取值。
 const COMMAND_META: ReadonlyArray<string> = [
-  "model", "plan", "mode", "skills", "init", "context", "tasks", "mcp", "diff", "doctor",
+  "model", "plan", "mode", "skills", "init", "context", "context-window", "tasks", "mcp", "diff", "doctor",
   "review", "security-review", "hooks", "agents", "files", "memory", "permissions", "resume",
   "rewind", "branch", "rename", "export", "copy", "btw", "Config", "effort", "status", "plugin",
   "account", "simplify", "remember", "debug-session", "skillify", "batch",
-  "loop", "theme", "bypass", "goal", "dod", "restore", "clear", "compact", "cost", "session",
+  "loop", "theme", "lang", "bypass", "goal", "dod", "restore", "clear", "compact", "cost", "session",
   "audit", "help", "exit",
 ];
 const SLASH_COMMANDS = COMMAND_META;
@@ -64,9 +65,24 @@ function findImagePaths(text: string): string[] {
 
 // 空闲时底部轮换的轻提示(CC 风格:克制暗色一行,无 emoji)。运行中的"可排队"提示单独硬编码。
 // 取末 n 行(流式动态区用,完成后整段会以 markdown 提交进 Static)。
-function tail(s: string, n: number): string {
+// 取字符串末尾、【软换行后】不超过 n 个可见行的部分。
+// 关键:动态区限高按【视觉行】算——一条逻辑长行在窄终端会折成 ceil(宽/列) 个视觉行。
+// 只数 \n(旧实现)会漏算软换行,长行溢出动态区 → 触发 <Static> 重画 → 整屏闪 + 太极闪现。
+// 从末尾往回累积视觉行,够 n 即停;命中上限时行首补 "…" 提示有截断。
+export function tail(s: string, n: number, cols = 80): string {
+  const w = Math.max(1, cols);
+  const rowsOf = (ln: string) => Math.max(1, Math.ceil(displayWidth(ln) / w));
   const all = s.split("\n");
-  return all.length <= n ? s : "…\n" + all.slice(-n).join("\n");
+  let rows = 0;
+  let i = all.length;
+  while (i > 0) {
+    const next = rows + rowsOf(all[i - 1]!);
+    if (next > n) break;
+    rows = next;
+    i--;
+  }
+  if (i <= 0) return s; // 全部放得下
+  return "…\n" + all.slice(i).join("\n");
 }
 
 const LANG: Record<string, string> = {
@@ -149,12 +165,22 @@ function resultDetail(name: string, ok: boolean, content: string): string {
 
 export function App(deps: AppDeps) {
   const { exit } = useApp();
+  const { stdout } = useStdout();
   const [bg, setBg] = useState(deps.welcome.bg); // /theme 运行时可切浅/深
   const c = (sem: Parameters<typeof semHex>[0]) => semHex(sem, bg);
+  // /clear /rewind /resume 重置 transcript 时递增,强制 <Static> 重挂载:
+  // Ink 的 <Static> 内部维护 index(只渲染 items.slice(index)),重置 items 为短数组后
+  // index 仍指向旧位置 → 新 welcome 不渲染;且 fullStaticOutput(已写入终端的累积
+  // static 文本)不会被清,每帧仍把旧内容写到屏幕。换 key 触发 unmount→remount,
+  // Ink 的 handleStaticChange 会清空 fullStaticOutput,新 <Static> 的 index 从 0
+  // 开始能正常渲染 welcome。配合写清屏转义序列擦掉终端上已输出的物理字符。
+  const [staticKey, setStaticKey] = useState(0);
 
   const initial = deps.initialItems ?? [];
   const idRef = useRef(initial.reduce((m, it) => Math.max(m, it.id), 0) + 1);
   const nextId = () => idRef.current++;
+  // token 数格式化:<1k 显示原数,1k+ 显示 k 单位(与 StatusBar 的 fmt 风格一致)。
+  const fmtTok = (n: number) => (n < 1000 ? String(n) : (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k");
   // 欢迎屏延迟固化:会话开始前留在动态区(随终端 resize 重排),
   // 首个 transcript 项产生时才作为 items[0] 进 <Static>(恢复会话则直接固化)。
   const [items, setItems] = useState<({ id: number; kind: "welcome" } | TranscriptItem)[]>(
@@ -210,8 +236,16 @@ export function App(deps: AppDeps) {
   const [accountPick, setAccountPick] = useState<{ items: { name: string; active: boolean; detail: string }[]; idx: number; mode: "switch" | "delete" } | null>(null);
   const [skillPick, setSkillPick] = useState<{ items: { name: string; on: boolean; source: string; detail: string }[]; idx: number; showBundled: boolean } | null>(null);
   const [modelPick, setModelPick] = useState<{ items: { model: string; active: boolean }[]; idx: number } | null>(null);
+  // Ctrl+G 唤出的对话导航面板:列出所有用户消息(摘要),↑↓ 选择、Enter 跳转(回看那轮对话)、Esc 关闭。
+  const [jumpPick, setJumpPick] = useState<{ idx: number } | null>(null);
+  // 回看模式:Enter 跳转后激活,在动态区渲染选中的那轮历史对话(只读);Esc 退出回到当前 transcript。
+  // 不把历史条目 push 进 items(那会污染 scrollback 且无法撤销),而是临时切到只读视图。
+  const [reviewMode, setReviewMode] = useState<TranscriptItem[] | null>(null);
   // 添加账户流程里的 provider 选择器(↑↓选/⏎确认/Esc取消),resolve(null) 表示取消。
-  const [providerPick, setProviderPick] = useState<{ items: { provider: Provider; label: string }[]; idx: number; resolve: (p: Provider | null) => void } | null>(null);
+  // "custom" 是自定义网关(OpenAI 兼容,如京东 llm-gw)分支——不新增 Provider 枚举值,落盘仍用 deepseek 请求路径。
+  const [providerPick, setProviderPick] = useState<{ items: { provider: Provider | "custom"; label: string }[]; idx: number; resolve: (p: Provider | "custom" | null) => void } | null>(null);
+  // 自定义网关:填完 baseUrl+token 后拉 /models 列表让用户 ↑↓ 选 model(resolve(null)=取消)。
+  const [gwModelPick, setGwModelPick] = useState<{ items: string[]; idx: number; resolve: (m: string | null) => void } | null>(null);
   const CHOICE_DONE = t("ui.choice.done"); // 多选专用:回车在此行提交;在正常项上回车=勾选
   const CHOICE_FILL = t("ui.choice.fill");
   const CHOICE_DISCUSS = t("ui.choice.discuss");
@@ -279,12 +313,27 @@ export function App(deps: AppDeps) {
   const history = useRef<string[]>([]);
   const histIdx = useRef<number>(-1); // -1 = 不在历史浏览中
 
-  const pushItem = (it: TranscriptItem) =>
-    setItems((p) => {
-      if (welcomeCommitted.current) return [...p, it];
-      welcomeCommitted.current = true;
-      return [{ id: 0, kind: "welcome" } as const, ...p, it];
+  // 首次 pushItem 时分两步:先单独提交 welcome 进 <Static>,再在下一帧提交真正的 item。
+  // 一次性合并 [welcome, user] 会在低终端(欢迎屏溢出)下触发 shouldClearTerminal 路径,
+  // 该路径与 spinner setTick 的微任务竞态会导致 user 行渲染为空(偶发"首次输入不反显")。
+  // 拆成两次 setItems 后:第一次只把 welcome 从动态区固化进 <Static>(index 0→1),
+  // 第二次才追加 user(index 1→2),每次只新增一个 item,<Static> 的增量渲染不会命中
+  // shouldClearTerminal,消除竞态。
+  const welcomeSplitDone = useRef(welcomeCommitted.current);
+  const pushItem = (it: TranscriptItem) => {
+    if (welcomeCommitted.current || welcomeSplitDone.current) {
+      setItems((p) => [...p, it]);
+      return;
+    }
+    // 首次:先固化 welcome,下一帧再追加 item——两步走,不合并。
+    welcomeSplitDone.current = true;
+    welcomeCommitted.current = true;
+    setItems([{ id: 0, kind: "welcome" } as const]);
+    queueMicrotask(() => {
+      if (process.env.DAO_DEBUG_TUI) process.stderr.write(`[tui] pushItem: welcome committed, queuing ${it.kind}\n`);
+      setItems((p) => [...p, it]);
     });
+  };
 
   // spinner / elapsed 计时(仅 busy 时)。
   useEffect(() => {
@@ -420,7 +469,23 @@ export function App(deps: AppDeps) {
       if (name === "theme") {
         const next = bg === "dark" ? "light" : "dark";
         setBg(next);
+        // 仅本会话临时覆盖;不落盘——下次启动仍按终端背景自动探测(纯自动适配)。
         pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.themeSwitched", next === "light" ? t("ui.theme.light") : t("ui.theme.dark")) });
+        return;
+      }
+      // /lang [zh|en]:无参切换,带参校验;立即生效(整个 TUI 文案走 t(),后续渲染即换语言)+持久化。
+      if (name === "lang") {
+        const arg0 = text.split(/\s+/)[1]?.toLowerCase();
+        const raw = arg0 === "zh" || arg0 === "en" ? arg0 : arg0 ? "" : (getLang() === "zh" ? "en" : "zh");
+        if (raw !== "zh" && raw !== "en") {
+          pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.langInvalid", text.split(/\s+/)[1] ?? "") });
+          return;
+        }
+        const next: Lang = raw;
+        setLang(next);
+        void switchLang(next);
+        // 切换后的确认提示用【新语言】渲染,本身就是生效演示。
+        pushItem({ id: nextId(), kind: "notice", text: next === "zh" ? "已切换语言:中文(/lang 再切回;已保存,重启后仍生效)" : "Language switched: English (/lang to toggle back; saved, persists after restart)" });
         return;
       }
       if (name === "loop") {
@@ -462,8 +527,35 @@ export function App(deps: AppDeps) {
       if (name === "model" && !text.trim().split(/\s+/)[1] && deps.listModels) { openModelPicker(); return; }
       const res = deps.runCommand(full);
       if (res.exit) { exit(); return; }
-      if (res.compact) { await deps.compact(); pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.compacted") }); setStatus(deps.getStatus()); return; }
-      if (name === "clear" || res.clearTranscript) setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []); // /clear /rewind /resume:重置可视 transcript
+      if (res.compact) {
+        const compactingId = nextId();
+        pushItem({ id: compactingId, kind: "notice", text: t("ui.notice.compacting") });
+        try {
+          const { before, after } = await deps.compact();
+          // 替换"正在压缩"为最终结果(而非追加一条,避免两条 notice 并存)。
+          setItems((prev) => prev.map((it) =>
+            it.id === compactingId
+              ? { ...it, text: after < before
+                  ? t("ui.notice.compactResult", fmtTok(before), fmtTok(after), Math.round((1 - after / before) * 100))
+                  : t("ui.notice.compactSkipped") }
+              : it,
+          ));
+        } catch (e) {
+          setItems((prev) => prev.map((it) =>
+            it.id === compactingId ? { ...it, text: t("ui.notice.error", (e as Error).message) } : it,
+          ));
+        }
+        setStatus(deps.getStatus());
+        return;
+      }
+      if (name === "clear" || res.clearTranscript) {
+        // /clear /rewind /resume:重置可视 transcript。
+        // 递增 staticKey 强制 <Static> 重挂载(清 fullStaticOutput + 重置内部 index),
+        // 并写清屏转义序列擦掉终端上已输出的物理字符,否则旧内容残留在屏幕上。
+        setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []);
+        setStaticKey((k) => k + 1);
+        stdout?.write("\x1b[2J\x1b[3J\x1b[H");
+      }
       if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
       // 自定义命令:展开成 prompt → 当作一个回合跑。
       if (res.prompt) {
@@ -594,7 +686,11 @@ export function App(deps: AppDeps) {
   // 选中会话 → 委派 /resume <id>(载入逻辑在 index),并应用其结果(重置 transcript + 提示)。
   const loadResume = (id: string) => {
     const res = deps.runCommand("/resume " + id);
-    if (res.clearTranscript) setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []);
+    if (res.clearTranscript) {
+      setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []);
+      setStaticKey((k) => k + 1);
+      stdout?.write("\x1b[2J\x1b[3J\x1b[H");
+    }
     if (res.resumeItems?.length) for (const it of res.resumeItems) pushItem({ ...it, id: nextId() }); // 重放末段对话
     if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
     setStatus(deps.getStatus());
@@ -603,27 +699,59 @@ export function App(deps: AppDeps) {
   // 单行输入(复用 ask 覆盖层):粘贴 key / 起名都走它;回车提交,空 = 取消。
   const askLine = (q: string) => new Promise<string>((resolve) => setAsk({ question: q, resolve }));
   const reasonText = (r?: string) => (r === "invalid" ? t("ui.reason.invalid") : r === "unreachable" ? t("ui.reason.unreachable") : r === "http" ? t("ui.reason.http") : t("ui.reason.unknown"));
-  const askProvider = () => new Promise<Provider | null>((resolve) => setProviderPick({
+  const askProvider = () => new Promise<Provider | "custom" | null>((resolve) => setProviderPick({
     items: [
       { provider: "deepseek", label: t("ui.account.providerLabel.deepseek") },
       { provider: "qianfan", label: t("ui.account.providerLabel.qianfan") },
       { provider: "volcengine", label: t("ui.account.providerLabel.volcengine") },
       { provider: "minimax", label: t("ui.account.providerLabel.minimax") },
+      { provider: "zhipu", label: t("ui.account.providerLabel.zhipu") },
+      { provider: "custom", label: t("ui.account.providerLabel.custom") },
     ],
     idx: 0,
     resolve,
   }));
-  // 添加账户:先弹选择器选 provider(deepseek/千帆 token plan/火山 coding plan,↑↓选,不是打字)→
-  // 再粘贴对应 key(提示会报出选中的 provider,不再写死 DeepSeek)→ 起名 → 校验 → 持久化 → 激活。
+  // 自定义网关拉取的模型列表选择器(↑↓选/⏎确认/Esc取消)。列表为空时调用方不会调它(走手动输入)。
+  const askGatewayModel = (items: string[]) => new Promise<string | null>((resolve) => setGwModelPick({ items, idx: 0, resolve }));
+  // 添加账户:先弹选择器选 provider(deepseek/千帆/火山/自定义网关,↑↓选)→ 分流:
+  //  · 内置 provider:粘贴 key → 起名 → 校验(打 /models)→ 持久化 → 激活。
+  //  · 自定义网关(OpenAI 兼容):输入 baseUrl → 粘贴 token → 拉 /models 选 model(拉不到则手打)→
+  //    起名 → 按选中 model 探针校验(避开京东网关 4012 未授权)→ 落盘(provider 记 deepseek 复用请求路径)。
   // 空账户列表兜底与选择器"➕"共用同一实现。
   const runAddAccount = async () => {
     const provider = await askProvider();
     if (!provider) { pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.cancelled") }); return; }
+    if (provider === "custom") { await runAddCustomGateway(); return; }
     const key = (await askLine(t("ui.account.pastePrompt", t(`ui.account.providerLabel.${provider}`)))).trim();
     if (!key) { pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.cancelled") }); return; }
     const name = (await askLine(t("ui.account.namePrompt"))).trim();
     pushItem({ id: nextId(), kind: "notice", text: t("ui.account.validating") });
     const r = await deps.addAccount?.(key, name || undefined, provider);
+    pushItem({ id: nextId(), kind: "notice", text: r?.ok ? t("ui.account.added", r.name ?? "") : t("ui.account.addFailed", reasonText(r?.reason)) });
+    setStatus(deps.getStatus());
+  };
+  // 自定义网关引导(OpenAI 兼容,如京东 llm-gw):baseUrl → token → 选/输 model → 起名 → 校验落盘。
+  const runAddCustomGateway = async () => {
+    const baseUrl = (await askLine(t("ui.account.baseUrlPrompt"))).trim();
+    if (!baseUrl) { pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.cancelled") }); return; }
+    const key = (await askLine(t("ui.account.pastePrompt", t("ui.account.providerLabel.custom")))).trim();
+    if (!key) { pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.cancelled") }); return; }
+    // 拉网关模型列表(失败/空 → 回退手动输入 model 名)。
+    pushItem({ id: nextId(), kind: "notice", text: t("ui.account.fetchingModels") });
+    const models = (await deps.fetchGatewayModels?.(baseUrl, key)) ?? [];
+    let model: string;
+    if (models.length) {
+      const picked = await askGatewayModel(models);
+      if (!picked) { pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.cancelled") }); return; }
+      model = picked;
+    } else {
+      model = (await askLine(t("ui.account.modelPrompt"))).trim();
+      if (!model) { pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.cancelled") }); return; }
+    }
+    const name = (await askLine(t("ui.account.namePrompt"))).trim();
+    pushItem({ id: nextId(), kind: "notice", text: t("ui.account.validating") });
+    // provider 传 deepseek:自定义网关复用 OpenAI 兼容请求路径,不新增 Provider 枚举值。
+    const r = await deps.addAccount?.(key, name || undefined, "deepseek", baseUrl, model);
     pushItem({ id: nextId(), kind: "notice", text: r?.ok ? t("ui.account.added", r.name ?? "") : t("ui.account.addFailed", reasonText(r?.reason)) });
     setStatus(deps.getStatus());
   };
@@ -639,11 +767,20 @@ export function App(deps: AppDeps) {
     if (!list.length) { pushItem({ id: nextId(), kind: "notice", text: t("ui.skill.none") }); return; }
     setSkillPick({ items: list, idx: 0, showBundled: false });
   };
-  const openModelPicker = () => {
+  const openModelPicker = async () => {
     const list = deps.listModels?.() ?? [];
     if (!list.length) { pushItem({ id: nextId(), kind: "notice", text: t("ui.model.none") }); return; }
     const idx = Math.max(0, list.findIndex((m) => m.active));
     setModelPick({ items: list, idx });
+    // 自定义网关:异步拉取 /models 替换列表(拉不到则保留当前 model 单项)。
+    const gwModels = await deps.listGatewayModels?.();
+    if (gwModels && gwModels.length) {
+      const currentModel = deps.getStatus().model;
+      setModelPick((p) => p && {
+        items: gwModels.map((m) => ({ model: m, active: m === currentModel })),
+        idx: Math.max(0, gwModels.indexOf(currentModel)),
+      });
+    }
   };
 
   useInput((ch, key) => {
@@ -724,6 +861,20 @@ export function App(deps: AppDeps) {
       }
       return;
     }
+    if (gwModelPick) {
+      const items = gwModelPick.items, n = items.length;
+      if (key.escape) { gwModelPick.resolve(null); setGwModelPick(null); return; }
+      if (key.upArrow) { setGwModelPick((p) => p && { ...p, idx: Math.max(0, p.idx - 1) }); return; }
+      if (key.downArrow) { setGwModelPick((p) => p && { ...p, idx: Math.min(n - 1, p.idx + 1) }); return; }
+      if (key.return || (ch && /[1-9]/.test(ch))) {
+        const i = ch && /[1-9]/.test(ch) ? Number(ch) - 1 : gwModelPick.idx;
+        if (i < 0 || i >= n) return;
+        gwModelPick.resolve(items[i]!);
+        setGwModelPick(null);
+        return;
+      }
+      return;
+    }
     if (resumePick) {
       const n = resumePick.items.length;
       if (key.upArrow) { setResumePick((p) => p && { ...p, idx: Math.max(0, p.idx - 1) }); return; }
@@ -746,7 +897,8 @@ export function App(deps: AppDeps) {
         return;
       }
       const reqAp = approval.requests[apIdx];
-      const noAlways = !!reqAp?.sensitive || !!reqAp?.noPersist; // 敏感 / 记不成规则 → 不接受"始终允许"
+      // 记不成规则 → 不接受"始终允许";极端危险命令(dangerous)也不提供 [a](子开关开了也仍确认)。
+      const noAlways = !!reqAp?.noPersist || !!reqAp?.dangerous;
       const d: ApprovalDecision | null =
         ch === "y" ? "once" : ch === "a" ? (noAlways ? null : "always") : ch === "n" ? "deny" : null;
       if (d) {
@@ -769,9 +921,18 @@ export function App(deps: AppDeps) {
       const doneRowIdx = choice.multi ? nOpt : -1;
       const fillIdx = nOpt + (choice.multi ? 1 : 0);
       const discussIdx = nOpt + (choice.multi ? 2 : 1);
-      const done = (val: string) => { choice.resolve(val); setChoice(null); setAskInput(""); setChoiceChecked(new Set()); setChoiceWarn(false); };
-      // 选"先讨论一下" = 停下把回合让给用户:先把讨论意向作 tool 结果记入,再打断本回合(否则模型会读完继续干)。
-      const discuss = () => { done(t("ui.choice.discussValue")); controllerRef.current?.abort(); };
+      // 用户的选择/输入要反显到 transcript(和主输入框 onSubmit 一样),否则用户看不到自己答了什么。
+      const done = (val: string) => {
+        pushItem({ id: nextId(), kind: "user", text: val });
+        choice.resolve(val);
+        setChoice(null);
+        setAskInput("");
+        setChoiceChecked(new Set());
+        setChoiceWarn(false);
+      };
+      // 选"先讨论一下":把讨论意向作 tool 结果返回给模型,让模型据此收尾(生成回复而非继续干活)。
+      // 不 abort——abort 会打断模型,导致模型看不到 tool 结果、无法生成"好的,我们讨论一下"这类收尾回复。
+      const discuss = () => { done(t("ui.choice.discussValue")); };
       const toggle = (i: number) => { setChoiceWarn(false); setChoiceChecked((s) => { const n = new Set(s); if (n.has(i)) n.delete(i); else n.add(i); return n; }); };
       const submitMulti = () => { // 提交已勾选;空集不静默提交,提示先勾选(避免误触丢问题)
         const picked = [...choiceChecked].sort((a, b) => a - b).map((i) => choice.options[i]!);
@@ -831,7 +992,11 @@ export function App(deps: AppDeps) {
     }
     if (ask) {
       if (key.escape) { ask.resolve("[用户中断]"); setAsk(null); setAskInput(""); controllerRef.current?.abort(); return; }
-      if (key.return) { ask.resolve(askInput); setAsk(null); setAskInput(""); }
+      if (key.return) {
+        const val = askInput || "(用户未回答)";
+        pushItem({ id: nextId(), kind: "user", text: val });
+        ask.resolve(askInput); setAsk(null); setAskInput("");
+      }
       else if (key.backspace || key.delete) setAskInput((s) => s.slice(0, -1));
       else if (ch && !key.ctrl && !key.meta) setAskInput((s) => s + ch);
       return;
@@ -862,7 +1027,7 @@ export function App(deps: AppDeps) {
       exitArmedTimer.current = setTimeout(() => setExitArmed(false), 2000);
       return;
     }
-    // Shift+Tab:循环权限模式(default→auto→plan),随时可用。acceptEdits/bypass 不在循环里。
+    // Shift+Tab:循环权限模式(智能判定 → 全权放行,两档循环),随时可用。
     if (key.tab && key.shift && deps.cycleMode) {
       const m = deps.cycleMode();
       setStatus(deps.getStatus());
@@ -890,6 +1055,42 @@ export function App(deps: AppDeps) {
     if (key.ctrl && ch === "b" && busy && deps.convertForegroundToBackground) {
       const n = deps.convertForegroundToBackground();
       if (n > 0) pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.convertedToBackground", n) });
+      return;
+    }
+    // Ctrl+G:唤出/关闭对话导航面板。随时可用(busy 也能回看历史)。
+    // 不用 Ctrl+J(虽 J for Jump 更直觉):Ink 的 parseKeypress 把 \x0a(LF)当 enter 而非 ctrl+j,
+    // 真实终端里 Ctrl+J 发的就是 \x0a,会被当回车——无法区分。Ctrl+G 的 \x07 能正确解析为 ctrl+g。
+    if (key.ctrl && ch === "g") {
+      const userItems = items.filter((it): it is TranscriptItem => "kind" in it && it.kind === "user");
+      if (userItems.length === 0) return; // 没有用户消息,不弹面板
+      setJumpPick((p) => (p ? null : { idx: userItems.length - 1 })); // 默认定位到最近一条
+      return;
+    }
+    // 回看模式:Esc 退出回到当前 transcript;其他键一律吞掉(只读视图,不响应输入)。
+    if (reviewMode) {
+      if (key.escape) setReviewMode(null);
+      return;
+    }
+    // 对话导航面板:↑↓ 浏览、Enter 跳转(回看那轮对话)、Esc 关闭。
+    if (jumpPick) {
+      const userItems = items.filter((it): it is TranscriptItem => "kind" in it && it.kind === "user");
+      const n = userItems.length;
+      if (n === 0) { setJumpPick(null); return; }
+      if (key.escape) { setJumpPick(null); return; }
+      if (key.upArrow) { setJumpPick((p) => p && { idx: Math.max(0, p.idx - 1) }); return; }
+      if (key.downArrow) { setJumpPick((p) => p && { idx: Math.min(n - 1, p.idx + 1) }); return; }
+      if (key.return) {
+        // 选中第 idx 条用户消息,把它到下一条用户消息(或末尾)之间的 transcript 条目切到回看视图(只读)。
+        // 不 push 进 items(那会污染 scrollback 且无法撤销),而是临时切到只读视图,Esc 退出回到当前 transcript。
+        const target = userItems[jumpPick.idx]!;
+        const startAt = items.indexOf(target);
+        const nextUser = userItems[jumpPick.idx + 1];
+        const endAt = nextUser ? items.indexOf(nextUser) : items.length;
+        const slice = items.slice(startAt, endAt).filter((it): it is TranscriptItem => "kind" in it);
+        setJumpPick(null);
+        setReviewMode(slice);
+        return;
+      }
       return;
     }
     if (busy) {
@@ -956,8 +1157,13 @@ export function App(deps: AppDeps) {
     if (key.delete) { setField((f) => ({ ...f, text: f.text.slice(0, f.cursor) + f.text.slice(f.cursor + 1) })); return; } // 删光标处
     if (key.tab) {
       // 斜杠命令补全:输入以 / 开头且尚无空格时,Tab 补到唯一匹配(+空格)或公共前缀。
+      // 候选 = 内置命令 + 可 /调用的 skill slug。
       if (field.text.startsWith("/") && !field.text.includes(" ")) {
-        const matches = SLASH_COMMANDS.filter((cmd) => ("/" + cmd).startsWith(field.text)).map((cmd) => "/" + cmd);
+        const cmdMatches = SLASH_COMMANDS.filter((cmd) => ("/" + cmd).startsWith(field.text)).map((cmd) => "/" + cmd);
+        const skillMatches = (deps.listInvocableSkills?.() ?? [])
+          .filter((s) => ("/" + s.slug).startsWith(field.text))
+          .map((s) => "/" + s.slug);
+        const matches = [...cmdMatches, ...skillMatches];
         if (matches.length === 1) {
           const done = matches[0]! + " ";
           setField({ text: done, cursor: done.length });
@@ -1053,14 +1259,25 @@ export function App(deps: AppDeps) {
   // 否则 ink 每个 token 重绘时会把超出部分滚动、连带重画 <Static>(欢迎屏太极闪现)+ 整屏闪。
   // 完整思考/答案在回合结束都会进 <Static>,预览短一点不丢内容。每个 token 都会重渲染,故 resize 也能跟上。
   const liveCap = Math.max(4, Math.min(MAX_LIVE_LINES, (process.stdout.rows ?? 40) - 10));
+  // 动态区可用列宽:tail() 按此把逻辑长行折成视觉行来限高(见 tail 注释)。
+  const liveCols = process.stdout.columns ?? 80;
 
+  // 调试日志:DAO_DEBUG_TUI=1 时记录 <Static> 渲染入参,便于排查"首次输入不反显"等渲染竞态。
+  const debugItemsRef = useRef<number>(-1);
+  if (process.env.DAO_DEBUG_TUI) {
+    if (debugItemsRef.current !== items.length) {
+      debugItemsRef.current = items.length;
+      const kinds = items.map((it) => it.kind).join(",");
+      process.stderr.write(`[tui] Static render: items.length=${items.length} kinds=[${kinds}] busy=${busy} live=${!!live}\n`);
+    }
+  }
   return (
     <Box flexDirection="column">
       {/* 会话开始前:欢迎屏在动态区,随终端 resize 实时重排(useTermWidth 订阅)。 */}
       {items.length === 0 && !deps.skipBanner ? (
         <Welcome info={deps.welcome.info} caps={deps.welcome.caps} bg={bg} maxim={deps.welcome.maxim} />
       ) : null}
-      <Static items={items}>
+      <Static key={staticKey} items={items}>
         {(item, index) =>
           item.kind === "welcome" ? (
             deps.skipBanner ? null : <Welcome key={item.id} info={deps.welcome.info} caps={deps.welcome.caps} bg={bg} maxim={deps.welcome.maxim} />
@@ -1070,13 +1287,23 @@ export function App(deps: AppDeps) {
         }
       </Static>
 
+      {reviewMode && (
+        <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={c("gold")} paddingX={1}>
+          <Text color={c("gold")}>↻ 回看历史对话(共 {reviewMode.length} 条记录)· Esc 返回当前对话</Text>
+          {reviewMode.map((it) => (
+            <Row key={it.id} item={it} c={c} />
+          ))}
+          <Text color={c("dim")}>— 回看结束,按 Esc 返回 —</Text>
+        </Box>
+      )}
+
       {live && (
         <Box flexDirection="column" marginTop={1}>
           {/* 推理预览:只显示思考文本(spinner/动词/耗时统一放下方状态行,避免重复)。 */}
           {live.reasoning && !live.content ? (
-            <Text color={c("dim")}>{tail(live.reasoning, liveCap)}</Text>
+            <Text color={c("dim")}>{tail(live.reasoning, liveCap, liveCols)}</Text>
           ) : null}
-          {live.content ? <Text>{tail(live.content, liveCap)}</Text> : null}
+          {live.content ? <Text>{tail(live.content, liveCap, liveCols)}</Text> : null}
           {/* 唯一的状态行:spinner + 当前活动/动词 + 耗时 + 工具数 + 排队数(长任务也看得见在干嘛)。 */}
           <Text color={c("dim")}>
             {spin} {live.lastActivity || (live.content ? t("ui.live.generating") : verb)}…{" "}
@@ -1091,10 +1318,10 @@ export function App(deps: AppDeps) {
             {t("ui.approval.title", approval.requests.length > 1 ? ` (${apIdx + 1}/${approval.requests.length})` : "")}
           </Text>
           <Text color={c("ink")}>{(approval.requests[apIdx]?.summary ?? "").slice(0, 600).replace(/^/gm, "  ")}</Text>
-          {approval.requests[apIdx]?.sensitive ? (
-            <Text color={c("dim")}>{t("ui.approval.sensitive")}</Text>
-          ) : approval.requests[apIdx]?.noPersist ? (
+          {approval.requests[apIdx]?.noPersist ? (
             <Text color={c("dim")}>{t("ui.approval.noPersist")}</Text>
+          ) : approval.requests[apIdx]?.sensitive ? (
+            <Text color={c("dim")}>{approval.requests[apIdx]?.dangerous ? t("ui.approval.sensitive") : t("ui.approval.sensitivePlain")}</Text>
           ) : (
             <Text color={c("dim")}>{t("ui.approval.normal")}</Text>
           )}
@@ -1194,6 +1421,35 @@ export function App(deps: AppDeps) {
         );
       })()}
 
+      {jumpPick && (() => {
+        const userItems = items.filter((it): it is TranscriptItem => "kind" in it && it.kind === "user");
+        const n = userItems.length;
+        if (n === 0) return null;
+        const rows = userItems.map((it, i) => {
+          const label = (it.kind === "user" ? it.text : "").replace(/\n/g, " ").trim().slice(0, 60);
+          return `${i + 1}. ${label || "(空)"}`;
+        });
+        // 窗口滚动:条目多时只显示可见窗口,选中项始终在屏内(复用 skillPick 的窗口逻辑)。
+        const WIN = Math.max(5, Math.min(n, (process.stdout.rows ?? 40) - 8));
+        const start = n <= WIN ? 0 : Math.max(0, Math.min(jumpPick.idx - Math.floor(WIN / 2), Math.max(0, n - WIN)));
+        const shown = rows.slice(start, start + WIN);
+        return (
+          <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={c("gold")} paddingX={1}>
+            <Text color={c("gold")}>对话导航(共 {n} 条用户消息)· ↑↓ 选择 · ⏎ 跳转 · Esc 关闭</Text>
+            {start > 0 ? <Text color={c("dim")}>  ↑ {start} 条更早</Text> : null}
+            {shown.map((label, j) => {
+              const i = start + j;
+              return (
+                <Text key={i} color={i === jumpPick.idx ? c("gold") : c("ink")}>
+                  {i === jumpPick.idx ? "❯ " : "  "}{label}
+                </Text>
+              );
+            })}
+            {start + WIN < n ? <Text color={c("dim")}>  ↓ {n - start - WIN} 条更晚</Text> : null}
+          </Box>
+        );
+      })()}
+
       {providerPick && (() => {
         const rows = providerPick.items.map((p) => p.label);
         return (
@@ -1204,6 +1460,22 @@ export function App(deps: AppDeps) {
               return (
                 <Text key={i} color={focused ? c("jade") : c("ink")}>
                   {focused ? "❯ " : "  "}{label}
+                </Text>
+              );
+            })}
+          </Box>
+        );
+      })()}
+
+      {gwModelPick && (() => {
+        return (
+          <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={c("jade")} paddingX={1}>
+            <Text color={c("jade")}>{t("ui.account.gatewayModelTitle")}</Text>
+            {gwModelPick.items.map((m, i) => {
+              const focused = i === gwModelPick.idx;
+              return (
+                <Text key={i} color={focused ? c("jade") : c("ink")}>
+                  {focused ? "❯ " : "  "}{i + 1}. {m}
                 </Text>
               );
             })}
@@ -1274,7 +1546,7 @@ export function App(deps: AppDeps) {
         </Box>
       )}
 
-      {!approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && (
+      {!approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick && (
         <Box flexDirection="column" marginTop={1}>
           {/* 输入行加圆角边框,交互时清晰可辨(活跃=青玉,运行中=暗);补全/提示行在框外。 */}
           <Box borderStyle="round" borderColor={busy ? c("dim") : c("jade")} paddingX={1}>
@@ -1287,21 +1559,28 @@ export function App(deps: AppDeps) {
           </Box>
           {input.startsWith("/") && !input.includes(" ") ? (() => {
             // 命令面板(参考):竖排,左命令右简介,列对齐;过多则截断并提示继续输入筛选。
-            const matched = COMMAND_META.filter((name) => ("/" + name).startsWith(input));
-            if (matched.length === 0) return <Text color={c("dim")}>{t("ui.cmd.noMatch")}</Text>;
-            const shown = matched.slice(0, MAX_SLASH_MENU);
-            const w = Math.max(...shown.map((name) => name.length)) + 3; // "/name" 列宽(含 / 与右侧间距)
+            // 候选 = 内置命令 + 可 /调用的 skill(内置命令在前,skill 在后)。
+            const cmdMatched = COMMAND_META.filter((name) => ("/" + name).startsWith(input));
+            const skillMatched = (deps.listInvocableSkills?.() ?? [])
+              .filter((s) => ("/" + s.slug).startsWith(input))
+              .map((s) => ({ name: s.slug, desc: s.description }));
+            const matched = cmdMatched.length + skillMatched.length;
+            if (matched === 0) return <Text color={c("dim")}>{t("ui.cmd.noMatch")}</Text>;
+            const cmdShown = cmdMatched.slice(0, MAX_SLASH_MENU);
+            const skillShown = skillMatched.slice(0, Math.max(0, MAX_SLASH_MENU - cmdShown.length));
+            const allShown = [...cmdShown.map((n) => ({ name: n, desc: t("cmd." + n) })), ...skillShown];
+            const w = Math.max(...allShown.map((x) => x.name.length)) + 3; // "/name" 列宽(含 / 与右侧间距)
             return (
               <Box flexDirection="column">
-                {shown.map((name) => (
-                  <Text key={name}>
+                {allShown.map((x) => (
+                  <Text key={x.name}>
                     {"  "}
-                    <Text color={c("jade")}>{("/" + name).padEnd(w)}</Text>
-                    <Text color={c("dim")}>{t("cmd." + name)}</Text>
+                    <Text color={c("jade")}>{("/" + x.name).padEnd(w)}</Text>
+                    <Text color={c("dim")}>{x.desc}</Text>
                   </Text>
                 ))}
-                {matched.length > shown.length ? (
-                  <Text color={c("dim")}>{t("ui.cmd.more", matched.length - shown.length)}</Text>
+                {matched > allShown.length ? (
+                  <Text color={c("dim")}>{t("ui.cmd.more", matched - allShown.length)}</Text>
                 ) : null}
               </Box>
             );
@@ -1327,7 +1606,7 @@ export function App(deps: AppDeps) {
         </Box>
       )}
 
-      {modeHint && !approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick ? (
+      {modeHint && !approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick ? (
         <Text color={c("jade")}>{"  "}{t("ui.modeHint")} {modeHint}</Text>
       ) : null}
       {bgRunning > 0 ? <Text color={c("gold")}>{t("ui.bgRunning", bgRunning)}</Text> : null}
@@ -1358,10 +1637,15 @@ const hl = (line: string, lang: string): string => {
 
 function Row({ item, c, expanded }: { item: TranscriptItem; c: (s: Parameters<typeof semHex>[0]) => string; expanded?: boolean }) {
   if (item.kind === "user") {
+    // 整行贯通底色区分用户输入与 AI 回复(width 100% 铺满整行);左缩进 2 格,不再用竖条标记。
+    const lines = item.text.split("\n");
     return (
-      <Box marginTop={1}>
-        <Text color={c("jade")}>› </Text>
-        <Text color={c("ink")}>{item.text}</Text>
+      <Box flexDirection="column" marginTop={1} width="100%">
+        {lines.map((ln, i) => (
+          <Box key={i} width="100%" backgroundColor={c("panel")}>
+            <Text color={c("ink")}>{"  "}{ln || " "}</Text>
+          </Box>
+        ))}
       </Box>
     );
   }
@@ -1492,14 +1776,13 @@ function StatusBar({
       <Text color={c("dim")}>
         {/* 耗时只在上方 live 行显示一次,这里不再重复 */}
         {status.longTask ? <Text color={c("gold")}>{t("ui.status.longTask")}</Text> : ""}
-        {status.yolo ? <Text color={c("vermilion")}>※ YOLO · </Text> : ""}
+        {status.yolo ? <Text color={c("vermilion")}>{t("ui.status.yolo")} </Text> : ""}
         {/* 模式只在非默认时标出:normal 是默认态,展示它只会让人困惑 */}
         {status.mode === "plan" ? <Text color={c("gold")}>{t("ui.status.planMode")}</Text> : ""}
-        {status.permMode === "acceptEdits" ? <Text color={c("jade")}>{t("ui.status.acceptEdits")}</Text> : ""}
         {status.permMode === "auto" ? <Text color={c("jade")}>{t("ui.status.auto")}</Text> : ""}
         {bgShells && bgShells > 0 ? <Text color={c("gold")}>⎈ {bgShells} shell{bgShells > 1 ? "s" : ""} · </Text> : ""}
         {status.accountName ? <Text color={c("jade")}>{status.accountName}/</Text> : null}
-        {status.model} · {t("ui.status.input")} {fmt(status.promptTokens)} · {t("ui.status.output")} {fmt(status.completionTokens)} · {t("ui.status.cacheHit")} {pct}%{status.costCNY ? ` · ￥${status.costCNY.toFixed(status.costCNY < 1 ? 3 : 2)}` : ""} · {t("ui.status.context")} {status.contextPct < 1 ? "<1" : Math.round(status.contextPct)}%
+        {status.model} · {t("ui.status.input")} {fmt(status.promptTokens)} · {t("ui.status.output")} {fmt(status.completionTokens)} · {t("ui.status.cacheHit")} {pct}%{status.costCNY ? ` · ￥${status.costCNY.toFixed(status.costCNY < 1 ? 3 : 2)}` : ""} · {t("ui.status.context")} {fmt(status.contextUsed)}/{fmt(status.contextWindow)}
         {status.branch ? ` · ⎇ ${status.branch}` : ""}
         {status.version ? ` · v${status.version}` : ""}
         {status.sessionId ? ` · ${status.sessionId}` : ""}

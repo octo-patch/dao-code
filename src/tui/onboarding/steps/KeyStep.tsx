@@ -24,6 +24,7 @@ export function KeyStep({
   const helpKey = provider === "volcengine" ? "onboard.key.help.volcengine"
     : provider === "qianfan" ? "onboard.key.help.qianfan"
     : provider === "minimax" ? "onboard.key.help.minimax"
+    : provider === "zhipu" ? "onboard.key.help.zhipu"
     : "onboard.key.help.deepseek";
 
   const submit = async (k: string) => {

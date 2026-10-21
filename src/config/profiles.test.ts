@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { migrateConfig, resolveActive, DEFAULTS, MODELS_BY_PROVIDER, supportsVision, resolveContextWindow, isProvider } from "./profiles.js";
+import { migrateConfig, resolveActive, DEFAULTS, MODELS_BY_PROVIDER, supportsVision, contextWindowFor } from "./profiles.js";
 
 describe("migrateConfig", () => {
   it("wraps a legacy { apiKey } config into a default deepseek profile", () => {
@@ -71,6 +71,15 @@ describe("resolveActive", () => {
   });
 });
 
+describe("DEFAULTS.minimax", () => {
+  it("uses the global direct endpoint and Flash-first M3 default", () => {
+    expect(DEFAULTS.minimax).toEqual({
+      baseUrl: "https://api.minimax.io/v1",
+      model: "MiniMax-M3.1-Flash",
+    });
+  });
+});
+
 describe("DEFAULTS.volcengine", () => {
   it("points at the coding-plan base url with deepseek-v4-pro as default model", () => {
     expect(DEFAULTS.volcengine).toEqual({
@@ -85,6 +94,15 @@ describe("DEFAULTS.qianfan", () => {
     expect(DEFAULTS.qianfan).toEqual({
       baseUrl: "https://qianfan.baidubce.com/v2/tokenplan/personal",
       model: "deepseek-v4-pro",
+    });
+  });
+});
+
+describe("DEFAULTS.zhipu", () => {
+  it("points at the coding-plan base url with glm-5.3 as default model", () => {
+    expect(DEFAULTS.zhipu).toEqual({
+      baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
+      model: "glm-5.3",
     });
   });
 });
@@ -115,43 +133,67 @@ describe("MODELS_BY_PROVIDER", () => {
       "kimi-k2.7-code",
       "minimax-m2.7",
       "minimax-m3",
+      "ark-code-latest",
     ]);
   });
-  it("keeps the official MiniMax-M3 and MiniMax-M2.7 model IDs for direct access", () => {
-    expect(MODELS_BY_PROVIDER.minimax).toEqual(["MiniMax-M3", "MiniMax-M2.7"]);
+  it("zhipu coding plan 两档:glm-5.3 + glm-5.3-flash", () => {
+    expect(MODELS_BY_PROVIDER.zhipu).toEqual(["glm-5.3", "glm-5.3-flash"]);
   });
-});
-
-describe("DEFAULTS.minimax", () => {
-  it("points at the official global OpenAI-compatible base url with MiniMax-M3 as default model", () => {
-    expect(DEFAULTS.minimax).toEqual({
-      baseUrl: "https://api.minimax.io/v1",
-      model: "MiniMax-M3",
-    });
-  });
-});
-
-describe("isProvider", () => {
-  it("accepts MiniMax for headless provider selection", () => {
-    expect(isProvider("minimax")).toBe(true);
-    expect(isProvider("unknown")).toBe(false);
-    expect(isProvider(undefined)).toBe(false);
+  it("MiniMax direct is Flash-first and keeps M3 as the second owned choice", () => {
+    expect(MODELS_BY_PROVIDER.minimax).toEqual(["MiniMax-M3.1-Flash", "MiniMax-M3"]);
   });
 });
 
 describe("supportsVision", () => {
-  it("MiniMax-M3 supports image/video input; MiniMax-M2.7 does not", () => {
+  it("kimi-k2.6 和 kimi-k2.7-code 都支持视觉", () => {
+    expect(supportsVision("kimi-k2.6")).toBe(true);
+    expect(supportsVision("kimi-k2.7-code")).toBe(true);
+  });
+  it("glm-5.3-flash(多模态)支持视觉", () => {
+    expect(supportsVision("glm-5.3-flash")).toBe(true);
+  });
+  it("MiniMax M3.1 Flash and M3 support image input", () => {
+    expect(supportsVision("MiniMax-M3.1-Flash")).toBe(true);
     expect(supportsVision("MiniMax-M3")).toBe(true);
-    expect(supportsVision("MiniMax-M2.7")).toBe(false);
+    expect(supportsVision("minimax-m3.1-flash")).toBe(true);
+  });
+  it("deepseek-v4-pro 等非视觉模型返回 false", () => {
+    expect(supportsVision("deepseek-v4-pro")).toBe(false);
+    expect(supportsVision("glm-5.2")).toBe(false);
+    expect(supportsVision("glm-5.3")).toBe(false);
+    expect(supportsVision("unknown-model")).toBe(false);
   });
 });
 
-describe("resolveContextWindow", () => {
-  it("resolves each MiniMax model's real window instead of the flat 1M default", () => {
-    expect(resolveContextWindow("MiniMax-M3")).toBe(1_000_000);
-    expect(resolveContextWindow("MiniMax-M2.7")).toBe(204_800);
+describe("contextWindowFor", () => {
+  it("GLM 系列官方渠道一律 1M(zhipu/volcengine/qianfan 及无渠道信息调用)", () => {
+    expect(contextWindowFor("glm-5.2")).toBe(1_000_000);
+    expect(contextWindowFor("GLM-5.3-Flash")).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.3-flash")).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.3")).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.2", "volcengine", DEFAULTS.volcengine.baseUrl)).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.1", "qianfan", DEFAULTS.qianfan.baseUrl)).toBe(1_000_000);
   });
-  it("falls back to the 1M default for unregistered models", () => {
-    expect(resolveContextWindow("deepseek-v4-pro")).toBe(1_000_000);
+  it("GLM 系列按渠道区分:zhipu 官方 coding plan 按官方文档一律 1M", () => {
+    expect(contextWindowFor("glm-5.3", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.3-flash", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(1_000_000);
+    expect(contextWindowFor("GLM-5.3-Flash", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(1_000_000);
+  });
+  it("GLM 系列在自定义网关(provider 记 deepseek、baseUrl 非官方)上保守 200K", () => {
+    expect(contextWindowFor("glm-5.3", "deepseek", "http://llm-gw.jd.local/v1")).toBe(200_000);
+    expect(contextWindowFor("GLM-5.3-joybuilder", "deepseek", "http://llm-gw.jd.local/v1")).toBe(200_000);
+    expect(contextWindowFor("glm-5.3-flash", "deepseek", "https://gw.example.com/v1")).toBe(200_000);
+    expect(contextWindowFor("glm-5.2", "deepseek", "https://gw.example.com/v1")).toBe(200_000);
+  });
+  it("deepseek 官方 baseUrl 不触发网关保守值(GLM 系列按 1M)", () => {
+    expect(contextWindowFor("glm-5.3", "deepseek", DEFAULTS.deepseek.baseUrl)).toBe(1_000_000);
+  });
+  it("其他模型默认 1M", () => {
+    expect(contextWindowFor("deepseek-v4-pro")).toBe(1_000_000);
+    expect(contextWindowFor("deepseek-v4-flash")).toBe(1_000_000);
+    expect(contextWindowFor("kimi-k2.6")).toBe(1_000_000);
+    expect(contextWindowFor("MiniMax-M3.1-Flash")).toBe(1_000_000);
+    expect(contextWindowFor("MiniMax-M3")).toBe(1_000_000);
+    expect(contextWindowFor("unknown-model")).toBe(1_000_000);
   });
 });

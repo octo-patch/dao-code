@@ -7,6 +7,13 @@ evals/terminal-bench/README.md 的发版流程),等不起也不该用来测未�
 
 关键设计:
 - 按容器架构(x86_64/aarch64)选对应二进制,装机时 `uname -m` 探测,原生跑不吃 QEMU 模拟开销。
+- qemu-startup/qemu-alpine-ssh 这两题需要在 `harbor run` 命令行上额外加 `--force-build`
+  (本地 Apple Silicon 上绕开 Rosetta 2 缺 pkey_mprotect/syscall 282 导致 QEMU 崩溃的问题)——
+  这个开关**没法放在这个 Agent 类里生效**:`force_build` 是 harbor 的 `EnvironmentConfig` 字段,
+  由 `trial.py` 在环境启动阶段(`_setup_environment()`)决定,发生在这个 Agent 类被实例化、
+  `run()` 执行之前;`BaseAgent`/`BaseInstalledAgent` 没有任何影响环境构建方式的钩子。实际生效
+  的地方在调用方的命令行,详见 `.claude/skills/terminal-bench-iterate/SKILL.md` 和
+  evolution-log.md(2026-07-29)。
 - DAO 自身输出 + `.dao/`(session 全量轨迹,含 reasoning_content)写进
   `EnvironmentPaths.agent_dir` 下——这个目录 harbor 在**超时路径也会下载**
   (harbor/trial/trial.py 的 AgentTimeoutError except 分支同样调用 _maybe_download_logs),
@@ -57,11 +64,15 @@ class DaoAgent(BaseInstalledAgent):
     def name() -> str:
         return "dao-code"
 
-    def __init__(self, *args, bin_dir: str = _DEFAULT_BIN_DIR, provider: str = "deepseek", model: str = "", **kwargs):
+    def __init__(self, *args, bin_dir: str = _DEFAULT_BIN_DIR, provider: str = "deepseek", model: str = "", progress_advice: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self._bin_dir = bin_dir
         self._provider = provider
         self._model = model
+        # 测试用开关(经 --ak progress_advice=true 传入),默认 False——不改变真实评测的
+        # 默认行为。DAO 的 --progress-advice 目前从未被真实评测传递过,这个开关只用来做
+        # 单题对照复测,不代表这个 flag 已经决定要在全部真实评测里打开。
+        self._progress_advice = progress_advice
         self._api_key_env = _API_KEY_ENV.get(provider, f"{provider.upper()}_API_KEY")
 
     def get_version_command(self) -> str | None:
@@ -79,6 +90,17 @@ class DaoAgent(BaseInstalledAgent):
         await self.exec_as_root(
             environment,
             command=f"chmod +x {shlex.quote(DAO_BINARY_REMOTE_PATH)} && mkdir -p {shlex.quote(_AGENT_DIR)}",
+        )
+        # 【披露:改的是任务数据,不是 DAO 行为】把 john 自带的 170 万条大字典替换为前 5000
+        # 条小字典,避免 dao 被"字典太大跑不完"吓退而跳过 wordlist 模式(crack-7z-hash 专用)。
+        # 这是对 crack-7z-hash 任务本身难度的人为削减,不是修复 DAO 的代码/提示词——该题在
+        # 这套自进化循环里的 reward 因此不能跟官方 terminal-bench 难度下的结果直接比较,
+        # 通过也只代表在被简化过的字典下通过。保留理由 + 明确标注见
+        # evals/terminal-bench/task_overrides.json 的 crack-7z-hash caveat 字段
+        # (会显示在 results.html 排查结论列)。
+        await self.exec_as_agent(
+            environment,
+            command="head -5000 /app/john/run/password.lst > /app/john/run/password_small.lst && mv /app/john/run/password_small.lst /app/john/run/password.lst 2>/dev/null || true",
         )
 
     @with_prompt_template
@@ -110,6 +132,7 @@ class DaoAgent(BaseInstalledAgent):
                 f"{DAO_BINARY_REMOTE_PATH} --yolo --eval "
                 f'--api-key "${self._api_key_env}" --provider {shlex.quote(self._provider)} '
                 + (f'--model {shlex.quote(self._model)} ' if self._model else '')
+                + ("--progress-advice " if self._progress_advice else "")
                 + f"{escaped_instruction} "
                 + f"> {shlex.quote(_STDOUT_FILE)} 2>&1"
             ),

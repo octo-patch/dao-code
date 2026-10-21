@@ -5,20 +5,21 @@ import { z } from "zod";
 import { defineTool } from "./types.js";
 import type { PermissionMode } from "../permissions/settings.js";
 
-const VALID_MODES = new Set(["default", "acceptEdits", "plan", "bypassPermissions", "auto"]);
+const VALID_MODES = new Set(["default", "auto", "bypassPermissions", "plan"]);
 
 // 参考 Config 工具:读写运行时配置项。支持全局(~/.dao/settings.json)和项目级(.dao/settings.json)。
-// 目前支持 setting: permissions.defaultMode, theme。后续可扩展。
+// 目前支持 setting: permissions.defaultMode, theme, checkpoint.enabled。后续可扩展。
 export const configTool = defineTool({
   name: "Config",
   description:
     "读取或设置 dao 配置项。不传 value 时返回当前值;传 value 时写入。" +
-    "支持 setting: 'permissions.defaultMode'(权限模式:default/acceptEdits/plan/bypassPermissions/auto)、" +
-    "'theme'(终端主题:light/dark)。" +
+    "支持 setting: 'permissions.defaultMode'(权限模式:default/auto/bypassPermissions/plan,plan 只读规划不经 /mode 切换)、" +
+    "'theme'(终端主题:light/dark)、'checkpoint.enabled'(影子 git 快照/回滚,默认关闭,设 true 开启)。" +
     "配置来源优先级:企业策略 > 用户级(~/.dao/settings.json)> 项目级(.dao/settings.json)。",
   descriptionEn:
     "Read or set dao configuration. Omit value to read current; include value to write. " +
-    "Supports: 'permissions.defaultMode' (default/acceptEdits/plan/bypassPermissions/auto), 'theme' (light/dark). " +
+    "Supports: 'permissions.defaultMode' (default/auto/bypassPermissions/plan; plan is read-only, not in /mode cycle), 'theme' (light/dark), " +
+    "'checkpoint.enabled' (shadow git snapshot/rollback, off by default, set true to enable). " +
     "Config source priority: enterprise > user (~/.dao/settings.json) > project (.dao/settings.json).",
   capability: "plan",
   approval: "auto",
@@ -67,6 +68,12 @@ export const configTool = defineTool({
         return "无效值。theme 可选:light/dark";
       }
       obj.theme = value;
+    } else if (setting === "checkpoint.enabled") {
+      if (typeof value !== "boolean") {
+        return "无效值。checkpoint.enabled 可选:true/false";
+      }
+      obj.checkpoint ??= {};
+      obj.checkpoint.enabled = value;
     } else {
       // 通用写入:按点号路径设置
       const keys = setting.split(".");

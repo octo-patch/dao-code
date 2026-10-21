@@ -1,10 +1,12 @@
 import { promises as fs, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname as pathDirname } from "node:path";
 
-// 权限模式(1:1 复刻 CC):default 按需弹审批;acceptEdits 自动批准文件编辑;
-// plan 只读规划(拦写/执行);bypassPermissions 全部放行(=YOLO)。
-export type PermissionMode = "default" | "acceptEdits" | "plan" | "bypassPermissions" | "auto";
-const MODES = new Set<PermissionMode>(["default", "acceptEdits", "plan", "bypassPermissions", "auto"]);
+// 权限模式:default 按需弹审批;auto 交给 AI 分类器(确信安全的自动放行,拿不准的转人工,
+// 敏感目标也交分类器判定——不再强制人工);bypassPermissions 全部放行(=YOLO);plan 只读规划
+// (写/exec/network 一律 deny),不在 /mode 切换与 Shift+Tab 循环里,经 settings.defaultMode /
+// --permission-mode / /plan 进入。
+export type PermissionMode = "default" | "auto" | "bypassPermissions" | "plan";
+const MODES = new Set<PermissionMode>(["default", "auto", "bypassPermissions", "plan"]);
 
 import type { AutoModeRules } from "./classifier.js";
 

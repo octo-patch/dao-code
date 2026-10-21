@@ -1,0 +1,16 @@
+diff --git a/node_modules/ink/build/ink.js b/node_modules/ink/build/ink.js
+index b8fd45c..75d83e9 100644
+--- a/node_modules/ink/build/ink.js
++++ b/node_modules/ink/build/ink.js
+@@ -708,7 +708,10 @@ export default class Ink {
+             if (sync) {
+                 this.options.stdout.write(bsu);
+             }
+-            this.options.stdout.write(ansiEscapes.clearTerminal + this.fullStaticOutput + output);
++            // Fix: include staticOutput in the clear-terminal path, otherwise
++            // new <Static> items are lost when the previous frame was overflowing
++            // (e.g. tall welcome banner on a short terminal).
++            this.options.stdout.write(ansiEscapes.clearTerminal + this.fullStaticOutput + staticOutput + output);
+             this.lastOutput = output;
+             this.lastOutputToRender = outputToRender;
+             this.lastOutputHeight = outputHeight;

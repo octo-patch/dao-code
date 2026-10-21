@@ -24,14 +24,17 @@ function makeGate(opts: {
 }) {
   const remembered: string[] = [];
   const sessionAllow: string[] = [];
+  // 真实环境 addSessionAllow 会把规则并入本会话 allow 集合——测试桩要模拟这一点,
+  // 否则"始终允许"后 gate.decide 查不到规则,验证不了整体加白真的生效。
+  const rules: PermissionsConfig = opts.rules ?? emptyPermissions();
   const prompt = async (reqs: ApprovalRequest[]) =>
     new Map(reqs.map((r) => [r.id, opts.decisions?.[r.id] ?? "deny"]));
   const gate = new PermissionGate(
     () => opts.mode ?? "default",
-    () => opts.rules ?? emptyPermissions(),
+    () => rules,
     prompt,
     async (rule) => { remembered.push(rule); },
-    (rule) => { sessionAllow.push(rule); },
+    (rule) => { sessionAllow.push(rule); rules.allow.push(rule); },
     opts.classify,
     opts.getMessages,
   );
@@ -79,13 +82,29 @@ describe("PermissionGate.decide", () => {
     expect(asked).toBe(1); // 评估失败也转人工
     expect(out.get("e")).toBe(true);
   });
-  it("auto 模式:sensitive 请求跳过分类器,直接走人工(S3.1)", async () => {
+  it("auto 模式:敏感(非危险)请求也交分类器,不再强制人工", async () => {
+    let classifyCalled = 0;
+    const { gate } = makeGate({ mode: "auto", classify: async () => { classifyCalled++; return true; } });
+    const out = await gate.requestBatch([
+      { id: "s", toolName: "Bash", capability: "exec", summary: "", argsJson: '{"command":"cat ~/.aws/credentials"}', sensitive: true },
+    ]);
+    expect(classifyCalled).toBe(1); // 敏感目标交给 AI 分类器判定
+    expect(out.get("s")).toBe(true); // 分类器放行
+  });
+  it("auto 模式:分类器没放行敏感请求 → 转人工(不是自动拒绝)", async () => {
+    const { gate } = makeGate({ mode: "auto", classify: async () => false, decisions: { s: "once" } });
+    const out = await gate.requestBatch([
+      { id: "s", toolName: "Bash", capability: "exec", summary: "", argsJson: '{"command":"cat ~/.ssh/id_rsa"}', sensitive: true },
+    ]);
+    expect(out.get("s")).toBe(true); // 分类器 BLOCK → 人工允许
+  });
+  it("auto 模式:危险命令(dangerous)跳过分类器,直接走人工(S3.1)", async () => {
     let classifyCalled = 0;
     const { gate } = makeGate({ mode: "auto", classify: async () => { classifyCalled++; return true; }, decisions: { s: "deny" } });
     const out = await gate.requestBatch([
-      { id: "s", toolName: "Bash", capability: "exec", summary: "", argsJson: '{"command":"rm -rf /"}', sensitive: true },
+      { id: "s", toolName: "Bash", capability: "exec", summary: "", argsJson: '{"command":"rm -rf /"}', sensitive: true, dangerous: true },
     ]);
-    expect(classifyCalled).toBe(0); // 分类器没被调用(敏感/危险不交 AI 自动放行)
+    expect(classifyCalled).toBe(0); // 危险命令不交 AI 自动放行
     expect(out.get("s")).toBe(false); // 由人工裁决(此处 deny)
   });
   it("auto 模式:人工选'始终允许'会记规则(分类器未放行后)", async () => {
@@ -119,22 +138,29 @@ describe("PermissionGate.withModeOverride", () => {
     schema: z.object({}), handler: async () => "",
   });
 
-  it("父级 default -> 子代理 acceptEdits:write 从 ask 变 allow", () => {
+  it("父级 default -> 子代理 auto:write 从 ask 变 allow(工作区编辑 auto 放行)", () => {
     const { gate } = makeGate({ mode: "default" });
     expect(gate.decide("Write", '{"path":"a.ts"}', writeTool)).toBe("ask");
-    const subGate = gate.withModeOverride("acceptEdits");
+    const subGate = gate.withModeOverride("auto");
     expect(subGate.decide("Write", '{"path":"a.ts"}', writeTool)).toBe("allow");
   });
 
-  it("父级 default -> 子代理 plan:write 从 ask 变 deny", () => {
+  it("父级 default -> 子代理 bypassPermissions(yolo):write 从 ask 变 allow", () => {
+    const { gate } = makeGate({ mode: "default" });
+    const subGate = gate.withModeOverride("bypassPermissions");
+    expect(subGate.decide("Write", '{"path":"a.ts"}', writeTool)).toBe("allow");
+  });
+
+  it("父级 default -> 子代理 plan:write 从 ask 变 deny(只读规划)", () => {
     const { gate } = makeGate({ mode: "default" });
     const subGate = gate.withModeOverride("plan");
     expect(subGate.decide("Write", '{"path":"a.ts"}', writeTool)).toBe("deny");
+    expect(subGate.decide("Read", '{"path":"a.ts"}', readTool)).toBe("allow");
   });
 
-  it("父级 acceptEdits -> 子代理 plan:read 仍 allow", () => {
-    const { gate } = makeGate({ mode: "acceptEdits" });
-    const subGate = gate.withModeOverride("plan");
+  it("父级 default -> 子代理 auto:read 仍 allow", () => {
+    const { gate } = makeGate({ mode: "default" });
+    const subGate = gate.withModeOverride("auto");
     expect(subGate.decide("Read", '{"path":"a.ts"}', readTool)).toBe("allow");
   });
 
@@ -253,14 +279,14 @@ describe("PermissionGate.lastApprovalSource", () => {
     expect(gate.lastApprovalSource("needsHuman")).toBe("human");
   });
 
-  it("敏感请求跳过分类器直接转人工 → 记 human", async () => {
+  it("危险命令跳过分类器直接转人工 → 记 human", async () => {
     const { gate } = makeGate({
       mode: "auto",
       classify: async () => true,
       decisions: { s: "once" },
     });
     await gate.requestBatch([
-      { id: "s", toolName: "Bash", capability: "exec", summary: "", argsJson: '{"command":"rm -rf /"}', sensitive: true },
+      { id: "s", toolName: "Bash", capability: "exec", summary: "", argsJson: '{"command":"rm -rf /"}', sensitive: true, dangerous: true },
     ]);
     expect(gate.lastApprovalSource("s")).toBe("human");
   });

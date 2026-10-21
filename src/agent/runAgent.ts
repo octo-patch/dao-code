@@ -206,10 +206,11 @@ export async function* runAgent(params: RunAgentParams): AsyncGenerator<ChatMess
     resolvedTools = result.resolvedTools;
   }
 
-  // 权限模式解析(参考:agentDef.permissionMode ?? 'acceptEdits')。
-  // agentDef.permissionMode 可为 Mode(normal/plan)或 PermissionMode(default/acceptEdits/plan/auto/bypassPermissions)。
-  // - plan:只读模式(Session.mode=plan + gate mode=plan,write/exec 被 deny)
-  // - acceptEdits/default/auto/bypassPermissions:Session.mode=normal,gate 用该 PermissionMode
+  // 权限模式解析。
+  // agentDef.permissionMode 可为 Mode(normal/plan)或 PermissionMode(default/auto/bypassPermissions)。
+  // - plan(Mode):Session 只读(Session.mode=plan,写/执行工具从工具表移除),gate 用 default——
+  //   只读工具在 default 下 allow,只读语义由工具移除保证,不依赖权限模式。
+  // - auto/default/bypassPermissions:Session.mode=normal,gate 用该 PermissionMode。
   // - normal/undefined:继承父级(Session.mode=normal,gate 用父级 mode)
   const rawPermMode = modeOverride ?? agentDef.permissionMode;
   const agentMode: Mode = rawPermMode === "plan" ? "plan" : "normal";
@@ -228,12 +229,21 @@ export async function* runAgent(params: RunAgentParams): AsyncGenerator<ChatMess
   if (parentGate instanceof PermissionGate) {
     const parentMode = (gate as unknown as { getMode: () => PermissionMode }).getMode();
     // 解析子代理的 PermissionMode:
-    // - plan -> "plan"
-    // - acceptEdits/default/auto/bypassPermissions -> 直接用
-    // - normal/undefined -> 继承父级(父 acceptEdits 子也 acceptEdits)
+    // - plan -> "plan"(权限模式 plan:Session 只读 + gate 只读,write/exec/network 被 deny)
+    // - auto/default/bypassPermissions -> 直接用,但父级已是 bypassPermissions(yolo)时例外(见下)
+    // - normal/undefined -> 继承父级(父 auto 子也 auto)
+    //
+    // 例外(2026-08-01,真实撞见:torch-tensor-parallelism + video-processing 两次独立 terminal-bench
+    // trial):父级处于 bypassPermissions(headless --yolo --eval,没有真人可应答审批)时,子代理不能
+    // 被自己声明的权限模式降级到一个需要人工"ask"应答的模式——VERIFY_AGENT/GENERAL_PURPOSE_AGENT
+    // 都声明 auto(依赖 AI 分类器自动放行,后台无人也能跑),但 auto 下拿不准的调用仍转人工,
+    // headless 场景无人应答时 execute.ts 的 ask 分支恒为拒绝,派子代理做独立验证这条设计路径因此
+    // 会失效。所以父级 yolo 时子代理强制保持 yolo。plan 不受此例外影响——它是有意的只读限制,
+    // 不是"依赖人工应答"这条链路的问题,该保留(EXPLORE_AGENT/PLAN_AGENT 的只读语义不该被 yolo 打破)。
     const agentPermMode: PermissionMode =
       rawPermMode === "plan" ? "plan"
       : rawPermMode === "normal" || rawPermMode === undefined ? parentMode
+      : parentMode === "bypassPermissions" ? "bypassPermissions"
       : rawPermMode;
     // getMessages 传子代理自己的转录(sub.messages),不是父级的--否则子代理跑 auto 模式时,
     // 分类器判定用的还是父级(甚至更上层)的对话,看不到子代理自己在做什么,"相关性"判断必然
@@ -410,6 +420,7 @@ ${skill.body}` });
     subagentDepth: subDepth,
     readFiles: new Set<string>(),
     readMeta: new Map<string, { mtime: number; size: number }>(),
+    pendingUnverifiedWrites: new Set<string>(),
     sessionModel: resolvedModel,
     ...(worktreePath ? { workspaceRoot: worktreePath } : {}),
     ...(messageParent ? { messageParent } : {}),

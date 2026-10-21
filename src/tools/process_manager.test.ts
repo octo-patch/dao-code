@@ -168,6 +168,22 @@ describe("processManager", () => {
     expect(processManager.hasShellNotifications()).toBe(false);
   });
 
+  // 回归测试:reset() 后,上一个会话残留进程的 exit 事件不应往新 notifications 数组里 push。
+  // 此前 exit 回调里不检查 this.procs.has(id),reset() clear procs + 赋值新 notifications 数组后,
+  // 延迟触发的 exit 事件会往新数组里 push 不该存在的通知,污染下一轮。
+  it("reset() 后延迟触发的 exit 事件不污染新 notifications 数组", async () => {
+    const id = processManager.start("echo pollute-test", workDir);
+    await waitExited(id);
+    processManager.drainNotifications(); // 清掉正常通知
+    expect(processManager.hasShellNotifications()).toBe(false);
+    // reset 后 exit 回调如果延迟触发,不应往新数组 push
+    processManager.reset();
+    // 给 exit 事件一点时间在事件循环里传播
+    await new Promise((r) => setTimeout(r, 100));
+    expect(processManager.hasShellNotifications()).toBe(false);
+    expect(processManager.drainNotifications()).toHaveLength(0);
+  });
+
   // ── adopt():接管已在跑的前台子进程(Ctrl+B 转后台用) ──
 
   describe("adopt", () => {
@@ -196,6 +212,32 @@ describe("processManager", () => {
       processManager.kill(id);
       const r = await waitExited(id);
       expect(r.status).toBe("exited");
+    });
+  });
+
+  // ── kill() 对包管理器命令的 dpkg 自动恢复(与 exec_shell.ts 前台 abort 路径同一个根因) ──
+  //
+  // 真实撞见(2026-08-03,pytorch-model-cli 复测):模型后台起了两次 apt-get install gcc
+  // (第一次还没确认完成又起了第二次),KillShell 杀掉其中一个,dpkg 锁没释放,验收阶段
+  // 自己要装的 curl/uv 全部因为 "Could not get lock /var/lib/dpkg/lock-frontend" 失败。
+  // exec_shell.ts 里已经有一套"apt-get 被中断打断 → 自动 dpkg --configure -a 修复"的逻辑,
+  // 但那套逻辑只挂在前台 abort 分支——KillShell(杀后台进程)完全没有触发过。
+  describe("kill() 对包管理器命令的自动恢复", () => {
+    it("kill 一个非包管理器的后台命令 → 不触发 dpkg 恢复,返回 undefined", async () => {
+      const id = processManager.start("sleep 30", workDir);
+      const recovery = await processManager.kill(id);
+      expect(recovery).toBeUndefined();
+    });
+
+    it("kill 一个后台 apt-get 命令 → 尝试 dpkg --configure -a 修复,返回结果说明", async () => {
+      const id = processManager.start("apt-get install foo & sleep 30", workDir);
+      const recovery = await processManager.kill(id);
+      expect(recovery).toMatch(/\[自动恢复(失败)?\]/);
+      expect(recovery).toContain("dpkg --configure -a");
+    });
+
+    it("未知 id 仍然同步抛错(不受 dpkg 恢复逻辑影响)", () => {
+      expect(() => processManager.kill("proc-999")).toThrow(/未知后台进程/);
     });
   });
 });
