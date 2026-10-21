@@ -1670,7 +1670,12 @@ export function App(deps: AppDeps) {
       ) : null}
       {schedulerStatus?.state === "waiting" ? <Text color={c("gold")}>{t("ui.waitingTasks", schedulerStatus.waiting?.count ?? 0, schedulerStatus.waiting?.mode ?? "any")}</Text> : null}
       {schedulerStatus?.state === "recovering" ? <Text color={c("gold")}>{t("ui.backgroundRecovering")}</Text> : null}
-      {schedulerStatus?.state === "paused" ? <Text color={c("gold")}>{t("ui.backgroundPaused")}</Text> : null}
+      {schedulerStatus?.state === "paused" ? (
+        <Text color={c("gold")}>
+          {t("ui.backgroundPaused")}
+          {schedulerStatus.runningTasks > 0 || bgRunning > 0 || bgShells > 0 ? t("ui.backgroundStillRunning") : ""}
+        </Text>
+      ) : null}
       {bgRunning > 0 ? <Text color={c("gold")}>{t("ui.bgRunning", bgRunning)}{deps.listAgentTasks ? " · Ctrl+T" : ""}</Text> : null}
       <StatusBar status={status} c={c} bgShells={bgShells} />
     </Box>

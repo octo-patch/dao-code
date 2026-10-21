@@ -1508,8 +1508,12 @@ describe('App shared scheduler', () => {
     try {
       scheduler.submit('start'); await scheduler.settled(); await delay();
       expect(ui.lastFrame()).toContain('等待 1 个后台任务');
-      ui.stdin.write('\x1b'); await delay(); expect(ui.lastFrame()).toContain('自动续跑已暂停');
+      ui.stdin.write('\x1b'); await delay();
+      expect(ui.lastFrame()).toContain('会话已暂停，输入新消息继续');
+      expect(ui.lastFrame()).toContain('后台任务仍在运行');
       a.finish(); await delay(); expect(runs).toBe(1);
+      expect(ui.lastFrame()).toContain('会话已暂停，输入新消息继续');
+      expect(ui.lastFrame()).not.toContain('后台任务仍在运行');
       ui.stdin.write('continue'); await delay(); ui.stdin.write('\r'); await delay();
       expect(runs).toBe(2); expect(runtime.events()).toEqual([]);
     } finally { ui.unmount(); scheduler.close(); }
