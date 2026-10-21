@@ -6,6 +6,7 @@ import type { TurnEvents } from "../render.js";
 import type { ApprovalPrompt } from "../../approval/types.js";
 import type { Provider } from "../../config/profiles.js";
 import type { ContentPart } from "../../client/types.js";
+import type { TabAttention } from "../tab_attention.js";
 
 // transcript 里一条已完成的条目(进 <Static>,终端原生滚动)。
 export type TranscriptItem =
@@ -67,6 +68,8 @@ export interface AppDeps {
   register: (ui: { approvalPrompt: ApprovalPrompt; askUser: (q: string) => Promise<string>; askChoice: (q: string, options: string[], multi?: boolean) => Promise<string> }) => void;
   // 桌面通知(标题, 正文);省略则不通知。审批/提问弹窗展示时调用一次,让切走的用户知道 dao 在等确认。
   notify?: (title: string, message: string) => void;
+  // 标签标题圆点:需要输入或回合完成时点亮,查看/输入后清除。
+  tabAttention?: Pick<TabAttention, "mark" | "clear">;
   // @文件补全:给前缀(子串),返回匹配的工作区相对路径(已截断);省略则不补全。
   completeFiles?: (prefix: string) => string[];
   // /resume 无参时的交互选择:返回本工作区历史会话(已按最近排序),App 弹出上下选择器;省略则退回文本列表。

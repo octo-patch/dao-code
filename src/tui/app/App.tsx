@@ -214,6 +214,7 @@ export function App(deps: AppDeps) {
     setApproval({ requests: next.requests, resolve: next.resolve });
     const first = next.requests[0];
     if (first) {
+      deps.tabAttention?.mark();
       const suffix = next.requests.length > 1 ? `等${next.requests.length}项` : "";
       deps.notify?.("dao", `待确认:${first.toolName}${suffix}`);
     }
@@ -356,6 +357,7 @@ export function App(deps: AppDeps) {
     const askUser = (question: string) =>
       new Promise<string>((resolve) => {
         setAsk({ question, resolve });
+        deps.tabAttention?.mark();
         deps.notify?.("dao", `待回答:${question.slice(0, 60)}`);
       });
     const askChoice = (question: string, options: string[], multi?: boolean) =>
@@ -373,6 +375,7 @@ export function App(deps: AppDeps) {
         const cleaned = options.filter((o) => !reserved.has(norm(o)));
         setChoice({ question, options: cleaned, multi: !!multi, resolve });
         setChoiceIdx(0); setChoiceChecked(new Set()); setChoiceWarn(false);
+        deps.tabAttention?.mark();
         deps.notify?.("dao", `待选择:${question.slice(0, 60)}`);
       });
     deps.register({ approvalPrompt, askUser, askChoice });
@@ -627,6 +630,7 @@ export function App(deps: AppDeps) {
 
   // 跑一个回合(用户输入 / 后台任务通知共用):管理 busy/live/中断/出错。
   async function runAgentTurn(text: string | ContentPart[]) {
+    deps.tabAttention?.clear();
     if (deps.scheduler) { deps.scheduler.submit(text); await deps.scheduler.settled(); return; }
     setBusy(true);
     setStartedAt(Date.now());
@@ -637,6 +641,7 @@ export function App(deps: AppDeps) {
     controllerRef.current = controller;
     try {
       await deps.submit(text, { events: makeEvents(), signal: controller.signal });
+      if (!controller.signal.aborted) deps.tabAttention?.mark();
     } catch (e) {
       pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.error", (e as Error).message) });
     } finally {
@@ -694,12 +699,15 @@ export function App(deps: AppDeps) {
       busyRef.current = running;
       setBusy(running);
       if (running && !wasRunning) {
+        deps.tabAttention?.clear();
         setStartedAt(Date.now());
         reasoningRef.current = "";
         setLive({ reasoning: "", content: "", tools: [], toolCount: 0, lastActivity: "" });
       } else if (!running) {
         setLive(null);
         setStatus(deps.getStatus());
+        // 等后台任务时只是让出回合,尚未完成;暂停/中断也不能报完成。
+        if (wasRunning && status.state === "idle") deps.tabAttention?.mark();
       }
       wasRunning = running;
     });
@@ -823,6 +831,10 @@ export function App(deps: AppDeps) {
   };
 
   useInput((ch, key) => {
+    // Ink 会去掉焦点序列的 ESC 前缀。先消费,防止 [I/[O 混进输入或触发模态操作。
+    if (ch === "[I") { deps.tabAttention?.clear(); return; }
+    if (ch === "[O") return;
+    deps.tabAttention?.clear(); // 不支持焦点事件的终端,首次按键也能清除。
     if (accountPick) {
       const accts = accountPick.items, nA = accts.length;
       // switch 模式额外两行动作:➕添加 / 🗑删除;delete 模式只列账户。
@@ -1245,6 +1257,7 @@ export function App(deps: AppDeps) {
 
   // 粘贴:bracketed paste 下整段作一个字符串进来(不经 useInput),原样追加进输入框、不自动提交。
   usePaste((text) => {
+    deps.tabAttention?.clear();
     if (approval) return;
     if (choice) { if (choiceIdx === choice.options.length + (choice.multi ? 1 : 0)) setAskInput((s) => s + text); return; } // 焦点在"自己输入"行才接受粘贴
     if (ask) { setAskInput((s) => s + text); return; }
