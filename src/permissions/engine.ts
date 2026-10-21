@@ -71,7 +71,7 @@ const AUTO_ALLOWLIST = new Set([
   "TodoWrite", "AskUserQuestion", "MemoryRead", "Skill", "echo",
   "WebSearch", "WebFetch",
   "LSP",
-  "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskOutput", "TaskStop",
+  "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskOutput", "TaskStop", "TaskWait",
   "CronList",
 ]);
 

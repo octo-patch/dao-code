@@ -136,6 +136,11 @@ describe("wrapToolExec", () => {
 });
 
 describe("wrapRunTurn", () => {
+  it("preserves structured waiting outcome with tracing enabled", async () => {
+    setBackend(makeFake().backend);
+    const result = { kind: "waiting", wait: { waitId: "w" } };
+    expect(await wrapRunTurn(async () => result)({})).toBe(result);
+  });
   beforeEach(() => { setBackend(null); setObsSession(undefined); setObsMeta({ version: undefined }); });
   it("关闭时原样返回", () => {
     const inner = async () => {};

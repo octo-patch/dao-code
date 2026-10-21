@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, readFileSync, unlinkSync } from "node:fs";
+import { mkdtempSync, readFileSync, unlinkSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createSessionStore, loadState, findResumable, listSessions, loadMeta } from "./log.js";
@@ -24,6 +24,14 @@ const stateInput = (cwd = "/w") => ({
 });
 
 describe("SessionStore", () => {
+  it("save failure is visible and leaves the prior snapshot intact", () => {
+    const store = createSessionStore(base);
+    store.saveState(stateInput());
+    mkdirSync(path.join(store.dir, "state.json.tmp"));
+    expect(() => store.saveState({ ...stateInput(), backgroundWait: true })).toThrow();
+    expect(loadState(base, store.id)?.backgroundWait).toBeUndefined();
+    expect(loadState(base, store.id)?.messages).toEqual(msgs());
+  });
   it("append 事件写入 events.jsonl(逐行 JSON)", () => {
     const s = createSessionStore(base);
     s.append({ t: "user", text: "你好" });

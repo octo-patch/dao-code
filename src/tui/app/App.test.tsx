@@ -1,5 +1,5 @@
 import React from "react";
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render } from "ink-testing-library";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -9,6 +9,11 @@ import type { AppDeps } from "./types.js";
 import type { ContentPart } from "../../client/types.js";
 import type { ApprovalDecision, ApprovalPrompt } from "../../approval/types.js";
 import { setLang } from "../../i18n/i18n.js";
+
+// UI language switching must not write the developer's real ~/.dao/settings.json.
+vi.mock("../../i18n/i18n.js", async (original) => ({
+  ...await original<typeof import("../../i18n/i18n.js")>(), switchLang: vi.fn(async () => {}),
+}));
 
 const delay = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
@@ -33,6 +38,95 @@ function makeDeps(over: Partial<AppDeps> = {}): AppDeps {
 }
 
 describe("App", () => {
+  it("短回合完成也点亮圆点,焦点切回/按键/粘贴清除且不污染输入", async () => {
+    const tabAttention = { mark: vi.fn(), clear: vi.fn() };
+    const submit = vi.fn<AppDeps["submit"]>(async () => {});
+    const ui = render(<App {...makeDeps({ submit, tabAttention })} />);
+    try {
+      await delay(); ui.stdin.write("hi"); await delay(); ui.stdin.write("\r"); await delay();
+      expect(tabAttention.mark).toHaveBeenCalledTimes(1);
+      tabAttention.clear.mockClear();
+      ui.stdin.write("\x1b[O"); await delay();
+      expect(tabAttention.clear).not.toHaveBeenCalled();
+      ui.stdin.write("\x1b[I"); await delay();
+      expect(tabAttention.clear).toHaveBeenCalledTimes(1);
+      expect(ui.lastFrame()).not.toContain("[I");
+      expect(ui.lastFrame()).not.toContain("[O");
+      tabAttention.clear.mockClear();
+      ui.stdin.write("x"); await delay();
+      expect(tabAttention.clear).toHaveBeenCalledTimes(1);
+      expect(ui.lastFrame()).toContain("x");
+      tabAttention.clear.mockClear();
+      ui.stdin.write("\x1b[200~[I\x1b[201~"); await delay();
+      expect(tabAttention.clear).toHaveBeenCalledTimes(1);
+      ui.stdin.write("\r"); await delay();
+      expect(submit.mock.calls.at(-1)?.[0]).toBe("x[I");
+    } finally { ui.unmount(); }
+  });
+
+  it("异常和用户中断不会被当作成功完成点亮圆点", async () => {
+    const tabAttention = { mark: vi.fn(), clear: vi.fn() };
+    const ui = render(<App {...makeDeps({ tabAttention, submit: async () => { throw new Error("请求失败"); } })} />);
+    try {
+      await delay(); ui.stdin.write("hi"); await delay(); ui.stdin.write("\r"); await delay();
+      expect(tabAttention.mark).not.toHaveBeenCalled();
+      ui.rerender(<App {...makeDeps({ tabAttention, submit: async (_text, { signal }) => {
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      } })} />);
+      ui.stdin.write("hi"); await delay(); ui.stdin.write("\r"); await delay();
+      ui.stdin.write("\x1b"); await delay(100);
+      expect(tabAttention.mark).not.toHaveBeenCalled();
+    } finally { ui.unmount(); }
+  });
+
+  it("Ctrl+T inspects running agents, refreshes local output and closes without aborting or losing the draft", async () => {
+    let signal: AbortSignal | undefined;
+    let finish!: () => void;
+    const submit = vi.fn(async (_text, hooks) => {
+      signal = hooks.signal;
+      await new Promise<void>((resolve) => { finish = resolve; });
+    });
+    const task: import("../../agent/tasks.js").BgTask = {
+      id: "agent-review", runId: "run", kind: "agent", status: "running",
+      description: "Review docs", startedAt: Date.now(), messages: [],
+    };
+    const { stdin, lastFrame, unmount } = render(<App {...makeDeps({ submit, listAgentTasks: () => [task] })} />);
+    try {
+      stdin.write("review"); await delay(); stdin.write("\r"); await delay();
+      stdin.write("draft"); await delay();
+      stdin.write("\x14"); await delay();
+      expect(lastFrame()).toContain("子 agent 执行情况");
+      expect(lastFrame()).toContain("agent-review");
+      task.messages!.push({ role: "assistant", content: null, tool_calls: [{ id: "call", type: "function", function: { name: "Read", arguments: "README.md" } }] });
+      await delay(1100);
+      expect(lastFrame()).toContain("Read README.md");
+      expect(lastFrame()).toContain("1 次工具调用");
+      stdin.write("\x1b"); await delay();
+      expect(lastFrame()).not.toContain("子 agent 执行情况");
+      expect(lastFrame()).toContain("draft");
+      expect(signal?.aborted).toBe(false);
+      expect(submit).toHaveBeenCalledTimes(1);
+    } finally { finish?.(); unmount(); }
+  });
+
+  it("Ctrl+T selects failed tasks and toggles closed without submitting input", async () => {
+    const submit = vi.fn();
+    const tasks: import("../../agent/tasks.js").BgTask[] = [
+      { id: "a", runId: "1", kind: "agent", status: "running", description: "first", startedAt: Date.now() },
+      { id: "b", runId: "2", kind: "agent", status: "failed", description: "second", startedAt: Date.now(), error: "round limit reached" },
+    ];
+    const { stdin, lastFrame, unmount } = render(<App {...makeDeps({ submit, listAgentTasks: () => tasks })} />);
+    try {
+      await delay(); stdin.write("\x14"); await delay();
+      stdin.write("\x1b[B"); await delay();
+      expect(lastFrame()).toContain("round limit reached");
+      stdin.write("\r"); await delay();
+      expect(submit).not.toHaveBeenCalled();
+      stdin.write("\x14"); await delay();
+      expect(lastFrame()).not.toContain("子 agent 执行情况");
+    } finally { unmount(); }
+  });
+
   // 默认跑中文(断言中文文案的用例据此);需要英文的用例在自身内 setLang("en")。
   beforeEach(() => setLang("zh"));
 
@@ -797,11 +891,13 @@ describe("App", () => {
   it("审批模态弹出时触发桌面通知,让切走的用户知道 dao 在等确认", async () => {
     let ap: ApprovalPrompt | null = null;
     const notified: [string, string][] = [];
+    const tabAttention = { mark: vi.fn(), clear: vi.fn() };
     render(
       <App
         {...makeDeps({
           register: ({ approvalPrompt }) => { ap = approvalPrompt; },
           notify: (title, message) => { notified.push([title, message]); },
+          tabAttention,
         })}
       />,
     );
@@ -811,16 +907,19 @@ describe("App", () => {
     expect(notified).toHaveLength(1);
     expect(notified[0]![0]).toBe("dao");
     expect(notified[0]![1]).toContain("Write");
+    expect(tabAttention.mark).toHaveBeenCalledTimes(1);
   });
 
   it("AskUserQuestion 问题弹出时触发桌面通知", async () => {
     let ask: ((q: string) => Promise<string>) | null = null;
     const notified: [string, string][] = [];
+    const tabAttention = { mark: vi.fn(), clear: vi.fn() };
     render(
       <App
         {...makeDeps({
           register: ({ askUser }) => { ask = askUser; },
           notify: (title, message) => { notified.push([title, message]); },
+          tabAttention,
         })}
       />,
     );
@@ -830,16 +929,19 @@ describe("App", () => {
     expect(notified).toHaveLength(1);
     expect(notified[0]![0]).toBe("dao");
     expect(notified[0]![1]).toContain("要不要覆盖已有文件?");
+    expect(tabAttention.mark).toHaveBeenCalledTimes(1);
   });
 
   it("ask_choice 选择弹出时触发桌面通知", async () => {
     let ask: ((q: string, options: string[], multi?: boolean) => Promise<string>) | null = null;
     const notified: [string, string][] = [];
+    const tabAttention = { mark: vi.fn(), clear: vi.fn() };
     render(
       <App
         {...makeDeps({
           register: ({ askChoice }) => { ask = askChoice; },
           notify: (title, message) => { notified.push([title, message]); },
+          tabAttention,
         })}
       />,
     );
@@ -849,6 +951,7 @@ describe("App", () => {
     expect(notified).toHaveLength(1);
     expect(notified[0]![0]).toBe("dao");
     expect(notified[0]![1]).toContain("选哪个方案?");
+    expect(tabAttention.mark).toHaveBeenCalledTimes(1);
   });
 
   it("/theme 切换主题(App 内拦截)", async () => {
@@ -1418,5 +1521,76 @@ describe("App", () => {
     stdin.write("\r");
     for (let i = 0; i < 50 && !lastFrame()!.includes("压缩失败"); i++) await delay(20);
     expect(lastFrame()!).toContain("压缩失败");
+  });
+});
+
+describe('App shared scheduler', () => {
+  it('后台等待不点亮圆点,恢复并完成后才点亮,继续运行时清除', async () => {
+    const { BackgroundRuntime } = await import('../../agent/background_runtime.js');
+    const { SessionScheduler } = await import('../../agent/session_scheduler.js');
+    const { Session } = await import('../../session/session.js');
+    const { execution } = await import('../../agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const task = execution(runtime);
+    const tabAttention = { mark: vi.fn(), clear: vi.fn() };
+    let runs = 0;
+    const scheduler = new SessionScheduler({ runtime, session: new Session('', 'm'), save: () => {}, user: async () => {},
+      run: async () => ++runs === 1 ? { kind: 'waiting', wait: runtime.prepare({ ids: ['a'], mode: 'all' }).handle } : { kind: 'completed' } });
+    const ui = render(<App {...makeDeps({ scheduler, tabAttention })} />);
+    try {
+      await delay(); scheduler.submit('start'); await scheduler.settled();
+      expect(scheduler.status().state).toBe('waiting');
+      expect(tabAttention.mark).not.toHaveBeenCalled();
+      task.finish(); await scheduler.finished();
+      expect(tabAttention.mark).toHaveBeenCalledTimes(1);
+      tabAttention.clear.mockClear();
+      scheduler.submit('next'); await scheduler.settled();
+      expect(tabAttention.clear).toHaveBeenCalledTimes(1);
+      expect(tabAttention.mark).toHaveBeenCalledTimes(2);
+      scheduler.pause();
+      expect(tabAttention.mark).toHaveBeenCalledTimes(2);
+    } finally { ui.unmount(); scheduler.close(); }
+  });
+  it.each(['/cost', '/tasks', '/status', '/theme'])('%s preserves background waiting and automatic completion', async (command) => {
+    setLang('zh');
+    const { BackgroundRuntime } = await import('../../agent/background_runtime.js');
+    const { SessionScheduler } = await import('../../agent/session_scheduler.js');
+    const { Session } = await import('../../session/session.js');
+    const { execution } = await import('../../agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const task = execution(runtime); const session = new Session('', 'm'); let runs = 0;
+    const scheduler = new SessionScheduler({ runtime, session, save: () => {}, user: async () => {},
+      run: async () => ++runs === 1 ? { kind: 'waiting', wait: runtime.prepare({ ids: ['a'], mode: 'all' }).handle } : { kind: 'completed' } });
+    const runCommand = vi.fn(() => ({ handled: true, output: 'status result' }));
+    const ui = render(<App {...makeDeps({ scheduler, runCommand })} />);
+    try {
+      scheduler.submit('start'); await scheduler.settled(); await delay();
+      ui.stdin.write(command); await delay(); ui.stdin.write('\r'); await delay();
+      expect(scheduler.status().state).toBe('waiting'); expect(runtime.activeWaits).toBe(1);
+      if (command !== '/theme') expect(runCommand).toHaveBeenCalledWith(command);
+      task.finish(); await scheduler.finished(); expect(runs).toBe(2); expect(runtime.events()).toEqual([]);
+    } finally { ui.unmount(); scheduler.close(); }
+  });
+
+  it('renders waiting, Esc pauses automatic wakeup, new user input resumes', async () => {
+    setLang('zh');
+    const { BackgroundRuntime } = await import('../../agent/background_runtime.js');
+    const { SessionScheduler } = await import('../../agent/session_scheduler.js');
+    const { Session } = await import('../../session/session.js');
+    const { execution } = await import('../../agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const a = execution(runtime); const session = new Session('', 'm'); let runs = 0;
+    const scheduler = new SessionScheduler({ runtime, session, save: () => {}, user: async (text) => { session.addUser(text); },
+      run: async () => ++runs === 1 ? { kind: 'waiting', wait: runtime.prepare({ ids: ['a'], mode: 'all' }).handle } : { kind: 'completed' } });
+    const ui = render(<App {...makeDeps({ scheduler })} />);
+    try {
+      scheduler.submit('start'); await scheduler.settled(); await delay();
+      expect(ui.lastFrame()).toContain('等待 1 个后台任务');
+      ui.stdin.write('\x1b'); await delay();
+      expect(ui.lastFrame()).toContain('会话已暂停，输入新消息继续');
+      expect(ui.lastFrame()).toContain('后台任务仍在运行');
+      a.finish(); await delay(); expect(runs).toBe(1);
+      expect(ui.lastFrame()).toContain('会话已暂停，输入新消息继续');
+      expect(ui.lastFrame()).not.toContain('后台任务仍在运行');
+      ui.stdin.write('continue'); await delay(); ui.stdin.write('\r'); await delay();
+      expect(runs).toBe(2); expect(runtime.events()).toEqual([]);
+    } finally { ui.unmount(); scheduler.close(); }
   });
 });

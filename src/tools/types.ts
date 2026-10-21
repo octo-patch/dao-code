@@ -8,6 +8,10 @@ export type Capability = "read" | "write" | "exec" | "network" | "plan";
 export type Approval = "auto" | "suggest" | "required";
 
 export interface ToolContext {
+  durableStore?: import("../session/durable_store.js").DurableStore;
+  toolScope?: string;
+  rollbackTaskWait?: () => void;
+  requestTaskWait?: (request: import("../agent/background_types.js").WaitRequest) => string;
   // 项目身份根目录:memory/MCP/LSP/skills/settings/审计日志 等子系统都按它定位,启动时定一次,
   // 不随 worktree 切换而变——即使当前在某个 worktree 里干活,这些子系统仍指向"真正的项目"。
   workspaceRoot: string;
@@ -82,7 +86,7 @@ export interface ToolContext {
     worktreePath?: string;
     description?: string;
     onCacheSafeParams?: (params: { systemPrompt: string; forkContextMessages: import("../client/types.js").ChatMessage[] }) => void;
-    messageParent?: (message: string) => void;
+    messageParent?: (message: string, kind?: import("../agent/background_types.js").MessageKind) => void;
   }) => AsyncGenerator<import("../client/types.js").ChatMessage, void>;
   // Agent 恢复
   resumeAgent?: (agentId: string, prompt: string) => Promise<string>;
@@ -90,10 +94,12 @@ export interface ToolContext {
   agentDefinitions?: import("../agent/agent_defs.js").AgentDef[];
   // fork 时父消息
   forkMessages?: import("../client/types.js").ChatMessage[];
+  /** Live parent history; survives resume, compaction and recovery replacing the array. */
+  getForkMessages?: () => import("../client/types.js").ChatMessage[];
   // 给运行中的后台子代理追加指令(SendMessage);返回是否送达(任务在跑)。
   sendToTask?: (id: string, message: string) => boolean;
   // (后台子代理用)给父代理发 mid-run 消息;由 runAgent 的 messageParent 参数绑定到本任务 id。前台子代理为 undefined。
-  messageParent?: (message: string) => void;
+  messageParent?: (message: string, kind?: import("../agent/background_types.js").MessageKind) => void;
   // 直达人类桌面的即时通知(NotifyUser 用);与 messageParent 不同——不经任何代理层排队,当下就弹。
   notifyUser?: (message: string) => void;
   // 按关键词搜 MCP 工具并激活命中项(ToolSearch 用);激活后从下一次工具调用起才会出现在发给模型的

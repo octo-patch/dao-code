@@ -6,6 +6,7 @@ import type { TurnEvents } from "../render.js";
 import type { ApprovalPrompt } from "../../approval/types.js";
 import type { Provider } from "../../config/profiles.js";
 import type { ContentPart } from "../../client/types.js";
+import type { TabAttention } from "../tab_attention.js";
 
 // transcript 里一条已完成的条目(进 <Static>,终端原生滚动)。
 export type TranscriptItem =
@@ -46,13 +47,17 @@ export interface StatusInfo {
 }
 
 export interface AppDeps {
+  // 只读实时快照；查看时不消费 TaskOutput 游标或通知。
+  listAgentTasks?: () => import("../../agent/tasks.js").BgTask[];
+  scheduler?: import("../../agent/session_scheduler.js").SessionScheduler;
+  bindEvents?: (events: TurnEvents) => void;
   welcome: { info: WelcomeInfo; caps: Capabilities; bg: Background; maxim: Maxim };
   // 首启 onboarding 已自行展示过 banner;真→App 不再渲染 <Welcome>(避免重复)。
   skipBanner?: boolean;
   // 跑一个用户回合:由 index 绑定真实 session/registry/gate;App 提供 events(喂 state)与 signal(ESC 取消)。
   submit: (text: string | ContentPart[], hooks: { events: TurnEvents; signal: AbortSignal }) => Promise<void>;
   // 斜杠命令(/model /plan /clear /compact /help /exit;以及自定义命令展开成 prompt)。
-  runCommand: (line: string) => { handled: boolean; output?: string; exit?: boolean; compact?: boolean; prompt?: string; clearTranscript?: boolean; resumeItems?: TranscriptItem[] };
+  runCommand: (line: string) => { handled: boolean; output?: string; exit?: boolean; compact?: boolean; prompt?: string; clearTranscript?: boolean; resumeItems?: TranscriptItem[] } | Promise<{ handled: boolean; output?: string; exit?: boolean; compact?: boolean; prompt?: string; clearTranscript?: boolean; resumeItems?: TranscriptItem[] }>;
   compact: () => Promise<{ before: number; after: number }>;
   getStatus: () => StatusInfo;
   // verbose/debug 模式:展示工具原样参数、工具结果全量、思考全量(默认显意图 + 截断)。
@@ -63,6 +68,8 @@ export interface AppDeps {
   register: (ui: { approvalPrompt: ApprovalPrompt; askUser: (q: string) => Promise<string>; askChoice: (q: string, options: string[], multi?: boolean) => Promise<string> }) => void;
   // 桌面通知(标题, 正文);省略则不通知。审批/提问弹窗展示时调用一次,让切走的用户知道 dao 在等确认。
   notify?: (title: string, message: string) => void;
+  // 标签标题圆点:需要输入或回合完成时点亮,查看/输入后清除。
+  tabAttention?: Pick<TabAttention, "mark" | "clear">;
   // @文件补全:给前缀(子串),返回匹配的工作区相对路径(已截断);省略则不补全。
   completeFiles?: (prefix: string) => string[];
   // /resume 无参时的交互选择:返回本工作区历史会话(已按最近排序),App 弹出上下选择器;省略则退回文本列表。
@@ -72,7 +79,7 @@ export interface AppDeps {
   // 异步后台任务:取出待注入的 <task-notification>(空闲时自动作为新回合喂给模型)。
   drainNotifications?: () => string[];
   // 订阅后台任务状态变化(完成/失败/取消)→ 触发 UI 刷新与通知处理。
-  subscribeTasks?: (cb: () => void) => void;
+  subscribeTasks?: (cb: () => void) => void | (() => void);
   // 当前运行中的后台任务数(状态栏展示)。
   runningTasks?: () => number;
   // 当前运行中的后台 shell 数(状态栏展示)。

@@ -10,14 +10,15 @@ describe("normalizeModel — 子代理模型名兜底", () => {
     expect(normalizeModel("deepseek-v4-pro")).toBe("deepseek-v4-pro");
     expect(normalizeModel("deepseek-v4-flash")).toBe("deepseek-v4-flash");
   });
-  it("含 flash/pro 的归一", () => {
-    expect(normalizeModel("flash")).toBe("deepseek-v4-flash");
-    expect(normalizeModel("Pro")).toBe("deepseek-v4-pro");
-  });
-  it("无法识别(裸 deepseek-v4 / 乱写)-> undefined 继承父模型,不透传无效名", () => {
-    expect(normalizeModel("deepseek-v4")).toBeUndefined();
-    expect(normalizeModel("gpt-4")).toBeUndefined();
+  it("显式 ID 不按简称猜测其他供应商模型", () => {
+    expect(normalizeModel("flash")).toBe("flash");
+    expect(normalizeModel("Pro")).toBe("Pro");
+    expect(normalizeModel("deepseek-v4")).toBe("deepseek-v4");
+    expect(normalizeModel(" INHERIT ")).toBe("inherit");
     expect(normalizeModel(undefined)).toBeUndefined();
+  });
+  it.each(["GLM-5.3-Flash-joybuilder", "Claude-Opus-4.8-joybuilder", "gateway-pro", "gpt-4"])("完整模型 ID %s 原样保留", (model) => {
+    expect(normalizeModel(` ${model} `)).toBe(model);
   });
   it("多 provider 模型名原样保留(不归一化成 undefined)", () => {
     expect(normalizeModel("kimi-k2.6")).toBe("kimi-k2.6");
@@ -66,6 +67,7 @@ function mkCtx(over: Record<string, unknown> = {}) {
   const { fn } = fakeRunAgent("OK");
   return {
     workspaceRoot: "/tmp",
+    sessionModel: "deepseek-v4-pro",
     readFiles: new Set<string>(),
     subagentDepth: 0,
     agentDefinitions: [GENERAL_PURPOSE],
@@ -75,6 +77,21 @@ function mkCtx(over: Record<string, unknown> = {}) {
 }
 
 describe("agent tool", () => {
+  it("fork reads the current parent history after its message array is replaced", async () => {
+    const { Session } = await import("../session/session.js");
+    const session = new Session("SYS", "m");
+    const { fn, calls } = fakeRunAgent("OK");
+    const ctx = mkCtx({ runAgent: fn, forkMessages: session.messages, getForkMessages: () => session.messages });
+    session.messages = [{ role: "system", content: "restored system" }, { role: "user", content: "restored task" }];
+    session.addUser("latest constraint");
+    await agentTool.handler({ task: "verify", fork: true }, ctx);
+    expect(calls[0].forkContextMessages.slice(0, 3)).toEqual(session.messages);
+    session.clear(); session.addUser("new task");
+    await agentTool.handler({ task: "verify again", fork: true }, ctx);
+    expect(calls[1].forkContextMessages.slice(0, 2)).toEqual(session.messages);
+    expect(JSON.stringify(calls[1].forkContextMessages)).not.toContain("restored task");
+  });
+
   it("declares plan capability and auto approval", () => {
     expect(agentTool.capability).toBe("plan");
     expect(agentTool.approval).toBe("auto");
@@ -186,10 +203,20 @@ describe("agent tool", () => {
     expect(taskManager.drainNotifications().join("\n")).toContain("跑到一半了");
   });
 
-  it("background + model → 显式拒绝(不静默丢)", async () => {
-    const ctx = mkCtx();
-    const out = await agentTool.handler({ task: "x", background: true, model: "deepseek-v4-flash" } as any, ctx);
-    expect(out).toContain("background");
+  it("后台调用保留显式网关模型及只读模式，并正常结算任务", async () => {
+    const { fn, calls } = fakeRunAgent("后台完成");
+    const taskManager = createTaskManager();
+    const done = new Promise<void>((resolve) => {
+      const unsubscribe = taskManager.subscribe((event) => {
+        if (event.type === "completed") { unsubscribe(); resolve(); }
+      });
+    });
+    const ctx = mkCtx({ runAgent: fn, taskManager, sessionModel: "Main-Gateway" });
+    const out = await agentTool.handler({ task: "x", background: true, model: "GLM-5.3-Flash-joybuilder", mode: "plan" } as any, ctx);
+    expect(out).toContain("已后台启动");
+    await done;
+    expect(calls[0]).toMatchObject({ model: "GLM-5.3-Flash-joybuilder", mode: "plan", isAsync: true });
+    expect(taskManager.all()[0]?.status).toBe("completed");
   });
 
   it("父 abort → 直接中止还在跑的前台子代理(没有自动转后台这条路,ESC 立刻生效,不用等超时)", async () => {
@@ -225,6 +252,7 @@ describe("agent tool", () => {
     const all = taskManager.all();
     expect(all).toHaveLength(1);
     expect(all[0]!.status).toBe("completed");
+    expect(all[0]!.messages).toContainEqual(expect.objectContaining({ role: "assistant", content: "单任务结果" }));
   });
 
   it("前台任务抛错 → taskManager 结算为 failed(不留 running),错误照常抛给调用方", async () => {

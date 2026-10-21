@@ -31,6 +31,9 @@ export const taskSendTool = defineTool({
   }),
   handler: async (args, ctx) => {
     if (!ctx.sendToTask) return "当前环境不支持后台任务消息。";
+    if (ctx.taskManager?.get(args.id)?.status === "canceling") {
+      return msg(`${args.id} 正在取消,请等待执行器退出后再恢复。`, `${args.id} is canceling; wait for executor exit before resuming.`);
+    }
     if (ctx.sendToTask(args.id, args.message)) {
       return msg(`已发送给 ${args.id}(下一回合边界生效)。`, `Sent to ${args.id} (effective at next turn boundary).`);
     }

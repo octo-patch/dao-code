@@ -1,15 +1,20 @@
 // 后台任务管理器 + 通知队列:让子代理可异步后台跑,主循环不阻塞;完成后把结果作为
 // <task-notification> 入队,主循环在后续回合注入给模型(CC 的异步任务 + 消息队列模型)。
 
+import { randomUUID } from "node:crypto";
+import { isTerminal, type ExecutionEvent, type ExecutionSnapshot, type ExecutionStatus, type MessageKind } from "./background_types.js";
 import type { ChatMessage } from "../client/types.js";
 
 export interface BgTask {
   id: string;
+  runId: string;
+  kind: "manual" | "agent" | "promise";
   description: string;
-  status: "running" | "completed" | "failed" | "canceled";
+  status: ExecutionStatus;
   result?: string;
   error?: string;
   startedAt: number;
+  background?: boolean; // 真正异步运行的任务;手动待办和前台任务不靠完成通知唤醒
   endedAt?: number;
   // 新增:进度/摘要/agent 类型
   summary?: string;
@@ -18,6 +23,8 @@ export interface BgTask {
 }
 
 export interface TaskManager {
+  restore(snapshot: ExecutionSnapshot, messages?: ChatMessage[]): void;
+  clearRestored(): void;
   // 后台启动一个任务(run 收到 signal 与自身 id),立即返回 task id。
   launch(description: string, run: (signal: AbortSignal, id: string) => Promise<string>): string;
   // 接管一个已在运行的 promise,交给 TaskManager 追踪:完成/失败时入队通知。不可取消。
@@ -27,7 +34,7 @@ export interface TaskManager {
   // 手动更新一个任务(仅对 create() 建的、或已结束的任务生效;运行中的 launch/adopt 任务由 promise 驱动,
   // 不接受手动改 status,防止和自动结算打架——但 description 任何时候都能改)。
   // status 改为 completed/failed 时,和 promise 结算路径一样入队 <task-notification>。
-  update(id: string, patch: { status?: "completed" | "failed" | "canceled"; result?: string; description?: string }): boolean;
+  update(id: string, patch: { status?: "completed" | "failed" | "canceled"; result?: string; description?: string }, runId?: string): boolean;
   // 前台任务在"没有转后台、正常跑完"这条路径上结算:running -> completed,但不入队 <task-notification>
   // (结果已经作为工具调用本身的返回值同步交给父代理了,再入队会在下一回合边界重复投递同一个结果)。
   // 只做状态收尾,好让 cancelAll()/TaskStop 别把一个早就跑完的前台任务当成还在运行的任务去"中止"。
@@ -36,7 +43,7 @@ export interface TaskManager {
   // 给运行中的任务追加一条消息(SendMessage),由其在下一个工具回合边界消费。
   send(id: string, message: string): boolean;
   // 运行中任务给父代理发一条 mid-run 消息(进度/发现/提问):入通知队列 + 触发 onChange。
-  emitFromTask(id: string, message: string): boolean;
+  emitFromTask(id: string, message: string, kind?: MessageKind, runId?: string): boolean;
   // 取出并清空某任务的待消费消息(子代理 runTurn 在回合边界调用)。
   drainPending(id: string): string[];
   drainNotifications(): string[]; // 取出并清空待通知(已完成/失败任务的 XML 通知)
@@ -46,6 +53,7 @@ export interface TaskManager {
   get(id: string): BgTask | undefined;
   cancel(id: string): boolean;
   cancelAll(): void;
+  subscribe(cb: (event: ExecutionEvent) => void): () => void;
   onChange(cb: () => void): void; // 任务状态变化(启动/完成/失败/取消)时回调,驱动 UI 刷新与通知处理
   // 前台 agent 注册。taskId 恒等于 agentId(与 registerAsyncAgent 用同一套 id 空间)——此前这里
   // 另起一个 task-N 计数器,和子代理自己的 agentId 是两套不相干的 id,导致 TaskSend/cancel 用
@@ -56,11 +64,11 @@ export interface TaskManager {
   // (Agent 工具的 background 参数),真要中途打断一个跑太久的前台调用,用户自己 ESC。
   registerAgentForeground(opts: { agentId: string; description: string }): { taskId: string; abortController: AbortController };
   // 新增:后台 agent 注册(独立 AbortController)
-  registerAsyncAgent(opts: { agentId: string; description: string }): { agentId: string; abortController: AbortController };
+  registerAsyncAgent(opts: { agentId: string; description: string }): { agentId: string; runId: string; abortController: AbortController };
   // 新增:更新任务摘要
-  updateSummary(taskId: string, summary: string): boolean;
+  updateSummary(taskId: string, summary: string, runId?: string): boolean;
   // 新增:追加消息到任务的实时消息列表
-  appendMessage(taskId: string, message: ChatMessage): boolean;
+  appendMessage(taskId: string, message: ChatMessage, runId?: string): boolean;
 }
 
 // 转义注入文本里的 XML 元字符:description/result/message 来自用户任务或子代理输出,
@@ -103,17 +111,37 @@ export function createTaskManager(): TaskManager {
   let counter = 0;
   let onChangeCb: (() => void) | undefined;
   const notify = () => onChangeCb?.();
+  const listeners = new Set<(event: ExecutionEvent) => void>();
+  const publish = (t: BgTask, type: ExecutionEvent["type"], message?: string, requiresAttention = false) => {
+    if (t.kind === "manual") { notify(); return; }
+    const event: ExecutionEvent = { type, message, requiresAttention, snapshot: {
+      taskId: t.id, runId: t.runId, kind: "agent", background: !!t.background,
+      description: t.description, status: t.status, result: t.result ?? t.error, progress: t.summary,
+    } };
+    for (const listener of listeners) listener(event);
+    notify();
+  };
+  const finish = (t: BgTask, status: "completed" | "failed", result: string) => {
+    if (tasks.get(t.id) !== t || isTerminal(t.status)) return;
+    t.status = t.status === "canceling" ? "canceled" : status;
+    if (t.status === "completed") t.result = result; else t.error = result;
+    t.endedAt = Date.now();
+    controllers.delete(t.id);
+    if (t.background && !listeners.size) notifications.push(notificationXml(t));
+    publish(t, t.status);
+    gcFinished();
+  };
 
   // 已结束任务保留供 TaskList(include_finished) 查历史,但无限累积会泄漏内存。
   // 超过上限时删掉最老的已结束任务及其 controllers/pending 残留。
   const MAX_FINISHED_TASKS = 200;
   const gcFinished = () => {
     let finished = 0;
-    for (const t of tasks.values()) if (t.status !== "running") finished++;
+    for (const t of tasks.values()) if (isTerminal(t.status)) finished++;
     if (finished <= MAX_FINISHED_TASKS) return;
     // 按 endedAt 升序排已结束任务,删最老的直到不超限
     const old = [...tasks.values()]
-      .filter((t) => t.status !== "running")
+      .filter((t) => isTerminal(t.status))
       .sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0));
     const toRemove = old.slice(0, finished - MAX_FINISHED_TASKS);
     for (const t of toRemove) {
@@ -127,97 +155,65 @@ export function createTaskManager(): TaskManager {
     const t = tasks.get(id);
     if (!t || t.status !== "running") return false;
     const ac = controllers.get(id);
-    ac?.abort(); // 手动建的任务(create())没有 controller,无进程可 abort,仍走下面的状态转移
-    t.status = "canceled";
-    t.endedAt = Date.now();
-    controllers.delete(id); // 已结束,controller 不再需要
-    gcFinished();
-    notify();
+    if (t.kind !== "manual" && !ac) return false; // adopt 的 promise 无可取消执行器
+    if (t.kind === "manual") { t.status = "canceled"; t.endedAt = Date.now(); }
+    else t.status = "canceling";
+    ac?.abort();
+    publish(t, "progress");
     return true;
   };
 
   return {
+    clearRestored() { if(controllers.size) throw new Error("仍有子代理运行，不能切换会话。"); tasks.clear();pending.clear();notifications.length=0; },
+    restore(s,messages) { tasks.set(s.taskId,{id:s.taskId,runId:s.runId,kind:"agent",description:s.description,status:s.status,result:s.result,background:true,startedAt:Date.now(),messages}); },
     launch(description, run) {
       const id = `task-${++counter}`;
       const ac = new AbortController();
-      const t: BgTask = { id, description, status: "running", startedAt: Date.now() };
+      const t: BgTask = { id, runId: randomUUID(), kind: "promise", description, status: "running", startedAt: Date.now(), background: true };
       tasks.set(id, t);
       controllers.set(id, ac);
-      notify();
-      run(ac.signal, id).then(
-        (result) => {
-          if (t.status !== "running") return; // 已被取消
-          t.status = "completed";
-          t.result = result;
-          t.endedAt = Date.now();
-          controllers.delete(id);
-          gcFinished();
-          notifications.push(notificationXml(t));
-          notify();
-        },
-        (e) => {
-          if (t.status !== "running") return;
-          t.status = "failed";
-          t.error = e instanceof Error ? e.message : String(e);
-          t.endedAt = Date.now();
-          controllers.delete(id);
-          gcFinished();
-          notifications.push(notificationXml(t));
-          notify();
-        },
+      publish(t, "started");
+      let execution: Promise<string>;
+      try { execution = run(ac.signal, id); } catch (error) { execution = Promise.reject(error); }
+      execution.then(
+        (result) => finish(t, "completed", result),
+        (e) => finish(t, "failed", e instanceof Error ? e.message : String(e)),
       );
       return id;
     },
     adopt(description, promise) {
       const id = `task-${++counter}`;
-      const t: BgTask = { id, description, status: "running", startedAt: Date.now() };
+      const t: BgTask = { id, runId: randomUUID(), kind: "promise", description, status: "running", startedAt: Date.now(), background: true };
       tasks.set(id, t);
-      notify();
+      publish(t, "started");
       promise.then(
-        (result) => {
-          if (t.status !== "running") return; // 已被 update()/cancel() 手动结束,不再覆盖(补齐与 launch() 一致的防御)
-          t.status = "completed";
-          t.result = result;
-          t.endedAt = Date.now();
-          controllers.delete(id);
-          gcFinished();
-          notifications.push(notificationXml(t));
-          notify();
-        },
-        (e) => {
-          if (t.status !== "running") return;
-          t.status = "failed";
-          t.error = e instanceof Error ? e.message : String(e);
-          t.endedAt = Date.now();
-          controllers.delete(id);
-          gcFinished();
-          notifications.push(notificationXml(t));
-          notify();
-        },
+        (result) => finish(t, "completed", result),
+        (e) => finish(t, "failed", e instanceof Error ? e.message : String(e)),
       );
       return id;
     },
     create(description) {
       const id = `task-${++counter}`;
-      const t: BgTask = { id, description, status: "running", startedAt: Date.now() };
+      const t: BgTask = { id, runId: randomUUID(), kind: "manual", description, status: "running", startedAt: Date.now() };
       tasks.set(id, t);
       notify();
       return id;
     },
-    update(id, patch) {
+    update(id, patch, runId) {
       const t = tasks.get(id);
-      if (!t) return false;
+      if (!t || (runId && t.runId !== runId)) return false;
       if (patch.description !== undefined) t.description = patch.description;
       if (patch.status !== undefined) {
-        if (t.status !== "running") return false; // 已结束的任务不可再改状态(防止和自动结算的通知重复)
-        t.status = patch.status;
+        if (isTerminal(t.status)) return false; // 已结束的任务不可再改状态(防止和自动结算的通知重复)
+        t.status = t.status === "canceling" ? "canceled" : patch.status;
         t.endedAt = Date.now();
         controllers.delete(id);
         if (patch.result !== undefined) {
           if (t.status === "completed") t.result = patch.result;
           else t.error = patch.result;
         }
-        notifications.push(notificationXml(t));
+        if (t.kind !== "manual" && !listeners.size) notifications.push(notificationXml(t));
+        publish(t, t.status);
         gcFinished();
       }
       notify();
@@ -225,8 +221,8 @@ export function createTaskManager(): TaskManager {
     },
     settle(id, status = "completed") {
       const t = tasks.get(id);
-      if (!t || t.status !== "running") return false;
-      t.status = status;
+      if (!t || isTerminal(t.status)) return false;
+      t.status = t.status === "canceling" ? "canceled" : status;
       t.endedAt = Date.now();
       controllers.delete(id);
       gcFinished();
@@ -239,11 +235,12 @@ export function createTaskManager(): TaskManager {
       (pending.get(id) ?? pending.set(id, []).get(id)!).push(message);
       return true;
     },
-    emitFromTask(id, message) {
+    emitFromTask(id, message, kind = "attention", runId) {
       const t = tasks.get(id);
-      if (!t || t.status !== "running") return false;
-      notifications.push(taskMessageXml(t, message));
-      notify();
+      if (!t || t.status !== "running" || (runId && t.runId !== runId)) return false;
+      if (kind === "attention" && !listeners.size) notifications.push(taskMessageXml(t, message));
+      if (kind === "progress") t.summary = message;
+      publish(t, kind === "progress" ? "progress" : "message", message, kind === "attention");
       return true;
     },
     drainPending(id) {
@@ -259,7 +256,7 @@ export function createTaskManager(): TaskManager {
       return notifications.length > 0;
     },
     running() {
-      return [...tasks.values()].filter((t) => t.status === "running");
+      return [...tasks.values()].filter((t) => !isTerminal(t.status));
     },
     all() {
       return [...tasks.values()];
@@ -273,13 +270,14 @@ export function createTaskManager(): TaskManager {
       // 不在 controllers 里,只遍历 controllers 会漏掉它们,导致退出时这些任务永远挂着 running。
       for (const t of tasks.values()) if (t.status === "running") cancelOne(t.id);
     },
+    subscribe(cb) { listeners.add(cb); return () => { listeners.delete(cb); }; },
     onChange(cb) {
       onChangeCb = cb;
     },
     registerAgentForeground(opts) {
       const id = opts.agentId;
       const ac = new AbortController();
-      tasks.set(id, { id, description: opts.description, status: "running", startedAt: Date.now() });
+      tasks.set(id, { id, runId: randomUUID(), kind: "agent", description: opts.description, status: "running", startedAt: Date.now() });
       controllers.set(id, ac);
       notify();
       return { taskId: id, abortController: ac };
@@ -287,21 +285,22 @@ export function createTaskManager(): TaskManager {
     registerAsyncAgent(opts) {
       const id = opts.agentId;
       const ac = new AbortController();
-      tasks.set(id, { id, description: opts.description, status: "running", startedAt: Date.now() });
+      tasks.set(id, { id, runId: randomUUID(), kind: "agent", description: opts.description, status: "running", startedAt: Date.now(), background: true });
       controllers.set(id, ac);
       notify();
-      return { agentId: id, abortController: ac };
+      publish(tasks.get(id)!, "started");
+      return { agentId: id, runId: tasks.get(id)!.runId, abortController: ac };
     },
-    updateSummary(taskId, summary) {
+    updateSummary(taskId, summary, runId) {
       const t = tasks.get(taskId);
-      if (!t) return false;
+      if (!t || (runId && t.runId !== runId)) return false;
       t.summary = summary;
-      notify();
+      publish(t, "progress", summary);
       return true;
     },
-    appendMessage(taskId, message) {
+    appendMessage(taskId, message, runId) {
       const t = tasks.get(taskId);
-      if (!t) return false;
+      if (!t || (runId && t.runId !== runId)) return false;
       if (!t.messages) t.messages = [];
       t.messages.push(message);
       return true;

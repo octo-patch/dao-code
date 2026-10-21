@@ -166,6 +166,8 @@ dao
 - `@` to reference a file: type `@` + a path fragment to list matches, `Tab` to complete.
 - Write/exec operations go through the approval gate (`[y] once  [a] remember (write allow rule)  [n] deny`); you can also pre-allow or block with allow/ask/deny rules in `.dao/settings.json` (see "Extension system · Permissions"); `/yolo` or `--yolo` auto-approves everything (deny still blocks).
 
+Press **Ctrl+T** during execution to inspect subagent status, elapsed time, tool-call count and recent output. The panel reads local records every second without model requests. Use `↑/↓` to select a task, `PgUp/PgDn` for history, and `Esc` or `Ctrl+T` to close without interrupting tasks. Completed and failed tasks remain visible. Use `DAO_SUBAGENT_MAX_TURNS=800 dao` for a larger budget; an agent definition’s `maxTurns` takes precedence.
+
 **One-shot mode** (task as an argument, exits when done, no memory distillation, good for scripts):
 
 ```bash
@@ -299,7 +301,9 @@ The remaining failures are triaged into named root-cause categories (real engine
 | `DEEPSEEK_MODEL` | Default model (deprecated) | `deepseek-v4-pro` |
 | `DAO_THEME` | Force terminal background `light` / `dark` | detected from `COLORFGBG` / OSC 11, else `dark` |
 | `DAO_REASONING_EFFORT` | Reasoning effort | `max` |
-| `DAO_MAX_TURNS` | Max tool turns per turn | `50` |
+| `DAO_MAX_TURNS` | Max model iterations per main-session turn | Unlimited |
+| `DAO_SUBAGENT_MAX_TURNS` | Max subagent model iterations (positive integer; call override > agent definition `maxTurns` > environment) | `500` |
+| `DAO_EXPLORE_MODEL` | Explore model; use an exact gateway-supported ID, or inherit the current main model | `inherit` |
 | `DAO_AUTO_APPROVE` | Skip all approvals (**sandbox/eval only**) | off |
 | `DAO_REFOCUS_EVERY` | Refocuser: re-check direction every N turns on long tasks (`0`=off; only in `--goal` long-task mode) | `3` |
 | `DAO_FAIL_STREAK` | Challenger: review progress after this many consecutive failed turns (interactive only) | `3` |

@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import os from "node:os";
 import { resolveLang, setLang, getLang, t, tips } from "./i18n.js";
 import { zh } from "./messages/zh.js";
 import { en } from "./messages/en.js";
@@ -98,11 +99,9 @@ describe("readUserLang / writeUserLang round-trip", () => {
   it("writes lang and reads it back, preserving other fields", async () => {
     const { writeUserLang, readUserLang } = await import("./i18n.js");
     const fs = await import("node:fs/promises");
-    const os = await import("node:os");
     const path = await import("node:path");
-    const prevHome = process.env.HOME;
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "dao-i18n-"));
-    process.env.HOME = home;
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
     try {
       // 预置一个含其它字段的 settings.json,确认 writeUserLang 合并而非覆盖。
       await fs.mkdir(path.join(home, ".dao"), { recursive: true });
@@ -113,7 +112,7 @@ describe("readUserLang / writeUserLang round-trip", () => {
       expect(obj.lang).toBe("zh");
       expect(obj.permissions).toEqual({ allow: ["x"] }); // 既有字段保留
     } finally {
-      if (prevHome !== undefined) process.env.HOME = prevHome; else delete process.env.HOME;
+      homedir.mockRestore();
       await fs.rm(home, { recursive: true, force: true });
     }
   });

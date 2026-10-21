@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { BUNDLED_AGENTS, GENERAL_PURPOSE_AGENT, EXPLORE_AGENT, PLAN_AGENT, VERIFY_AGENT } from "./bundled_agents.js";
 
 describe("BUNDLED_AGENTS", () => {
@@ -16,6 +16,7 @@ describe("BUNDLED_AGENTS", () => {
 });
 
 describe("EXPLORE_AGENT", () => {
+  afterEach(() => vi.unstubAllEnvs());
   it("disallowedTools 含 agent/edit/write", () => {
     expect(EXPLORE_AGENT.disallowedTools).toContain("Agent");
     expect(EXPLORE_AGENT.disallowedTools).toContain("Edit");
@@ -24,8 +25,13 @@ describe("EXPLORE_AGENT", () => {
   it("omitClaudeMd = true", () => {
     expect(EXPLORE_AGENT.omitClaudeMd).toBe(true);
   });
-  it("model = flash", () => {
-    expect(EXPLORE_AGENT.model).toContain("flash");
+  it("未配置模型时继承主模型，不猜测网关支持的模型名", () => {
+    vi.stubEnv("DAO_EXPLORE_MODEL", "");
+    expect(EXPLORE_AGENT.model).toBe("inherit");
+  });
+  it("显式模型配置保留完整网关 ID", () => {
+    vi.stubEnv("DAO_EXPLORE_MODEL", " GLM-5.3-Flash-joybuilder ");
+    expect(EXPLORE_AGENT.model).toBe("GLM-5.3-Flash-joybuilder");
   });
 });
 

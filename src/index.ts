@@ -1,4 +1,13 @@
 #!/usr/bin/env node
+import { recoverBackground, repairToolPairs } from "./session/recovery.js";
+import type { SessionStore } from "./session/log.js";
+import { runShellRunner } from "./tools/shell_runner.js";
+import { getBackend } from "./obs/backend.js";
+import { BackgroundRuntime } from "./agent/background_runtime.js";
+import { SessionScheduler } from "./agent/session_scheduler.js";
+import type { TurnOutcome } from "./agent/background_types.js";
+import { taskWaitTool } from "./tools/task_wait.js";
+import { plainEvents, type TurnEvents } from "./tui/render.js";
 import { createInterface, type Interface } from "node:readline/promises";
 import { readFileSync, mkdirSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { promises as fs } from "node:fs";
@@ -8,7 +17,9 @@ import os from "node:os";
 import { pathToFileURL } from "node:url";
 import { loadProfiles, saveProfiles, setActive, removeProfile } from "./config/profiles_store.js";
 import { DEFAULTS, MODELS_BY_PROVIDER, contextWindowFor, type Provider, type ResolvedCredential } from "./config/profiles.js";
+import { createClassifierRunner, defaultClassifierModel } from "./permissions/classifier_model.js";
 import { resolveExtractModel } from "./tools/fetch_extract.js";
+import { getAgentModel } from "./config/model_selection.js";
 import { resolveCredential, persistKey } from "./config/credential.js";
 import { validateCredential, fetchModels } from "./config/validate_key.js";
 import { runtimeKeychain, noopKeychain, keychainAvailable, keychainDelete } from "./config/keychain.js";
@@ -86,6 +97,8 @@ import { loadMcpConfig, McpManager, type ElicitHandler } from "./mcp/mcp.js";
 import { loadLspConfig } from "./lsp/config.js";
 import { LspManager } from "./lsp/manager.js";
 import { lspTool } from "./tools/lsp.js";
+import { repoMapTool } from "./tools/repo_map.js";
+import { buildRepoMap, wrapRepoMapNotice, repoMapTokenBudget } from "./repomap/index.js";
 import { processManager } from "./tools/process_manager.js";
 import { agentTool } from "./tools/agent.js";
 import { loadAllMemories, upsertMemory, migrateLegacy, routeScope, projectIdOf, keepKnowledgeForProject } from "./memory/store.js";
@@ -115,7 +128,7 @@ import { createToolAuditSink, type ToolAuditSink, summarizeToolTrace, formatTool
 import { createPermAuditSink, type PermAuditSink, summarizePermTrace, formatPermReport } from "./permissions/perm_audit.js";
 import { createSkillAuditSink, type SkillAuditSink, readAllSkillTraces, summarizeSkillTrace, formatSkillReport } from "./skills/skill_audit.js";
 import { createCheckpointer } from "./session/checkpoint.js";
-import { runRepl, drainAndContinue } from "./repl.js";
+import { runRepl } from "./repl.js";
 import { dispatchCommand } from "./commands/commands.js";
 import { runBuiltinCommand } from "./commands/builtin.js";
 import { buildWelcome } from "./tui/banner.js";
@@ -590,7 +603,7 @@ async function main() {
     // 同一个 registry)都拿不到这两个工具,不是"注册了但不给用"这种更容易被绕过的软限制。
     ...(noWeb ? [] : [fetchUrlTool, webSearchTool]),
     todoWriteTool, memoryWriteTool, memoryReadTool, skillTool, skillInstallTool, taskSendTool, messageParentTool, agentTool, scheduleTool,
-    taskCreateTool, taskListTool, taskGetTool, taskOutputTool, taskUpdateTool, taskStopTool, notifyUserTool,
+    taskWaitTool, taskCreateTool, taskListTool, taskGetTool, taskOutputTool, taskUpdateTool, taskStopTool, notifyUserTool,
     enterPlanModeTool, exitPlanModeTool,
     enterWorktreeTool, exitWorktreeTool,
     monitorTool,
@@ -642,6 +655,10 @@ async function main() {
   const lspManager = new LspManager(lspConfig, pathToFileURL(workspaceRoot).href);
   if (Object.keys(lspConfig.servers ?? {}).length > 0) registry.register(lspTool);
 
+  // 代码库地图(aider 风格 repo map):tree-sitter 提取符号 + PageRank 排序。无条件注册
+  // (shouldDefer,模型用 ToolSearch 才展开 schema);构建是否在后台跑见下方 repoMap 预算判断。
+  registry.register(repoMapTool);
+
   const lang = getLang();
   const toolSummaries = registry
     .toApiTools(undefined, lang)
@@ -668,7 +685,7 @@ async function main() {
   // 审计:onAudit 直接写 memoryAudit;后台合并在 sink 建好(下方创建)之后才完成,触发时 sink 已就绪。
   // 并发:maybeConsolidate 内部自载记忆快照;与反思器每回合写入极少撞同一文件,撞了 last-write-wins、下轮自愈。
   if (!noMemory && !argvPrompt) {
-    const consolModel = process.env.DAO_CONSOLIDATE_MODEL || cfg.model;
+    const consolModel = getAgentModel(process.env.DAO_CONSOLIDATE_MODEL, cfg.model);
     const consolNow = Date.now();
     const consolCommon = {
       today, now: consolNow, streamChat,
@@ -880,6 +897,19 @@ async function main() {
     if (formatted) envNoticeQueue.push(formatted);
   });
 
+  // 代码库地图:后台构建(不阻塞 Ink 挂载;实测 ~500 文件 <1s,大仓库靠 MAX_FILES 截断保护),
+  // 构建完作为尾部 system 消息走同一条 drainEnvNotices 通道注入——不进固定前缀,不破 prefix cache。
+  // DAO_REPO_MAP_TOKENS=0 显式禁用。失败静默(repo map 是增强,绝不能拖垮启动)。
+  // 不跟 --no-project-instructions/--eval 绑定:repo map 是产品内置能力(同 LSP 工具性质),
+  // 不是用户注入的内容;aider 的 benchmark 也全程开着 repo map。
+  const repoMapBudget = repoMapTokenBudget();
+  if (repoMapBudget > 0) {
+    void buildRepoMap(workspaceRoot, repoMapBudget).then((r) => {
+      const notice = r.text ? wrapRepoMapNotice(r.text, lang === "en", r.fileCount) : "";
+      if (notice) envNoticeQueue.push(notice);
+    }).catch(() => {});
+  }
+
   // Ink 交互态注册的审批/提问模态(App 挂载后填入);未填则回退 readline。
   let inkApprovalPrompt: ApprovalPrompt | null = null;
   let inkAsk: ((q: string) => Promise<string>) | null = null;
@@ -953,46 +983,21 @@ async function main() {
   // recentMessages 由调用方(PermissionGate.getMessages())传入,不能自己去读 session.messages——
   // 子代理走 withModeOverride 时会传自己的 sub.messages,这里必须原样透传,否则子代理的调用
   // 又会被根会话的转录判定,分类器看不到子代理自己在做什么(复盘 session 20260721-215548-uq75)。
-  // 智能判定分类器默认模型:主模型是 GLM-5.3-Flash / GLM-5.2 时用同族自身(同族便宜档),
-  // glm-5.3(zhipu coding plan 旗舰)用同族便宜档 glm-5.3-flash;其余沿用 deepseek-v4-flash。
-  // DAO_CLASSIFIER_MODEL 显式设置时永远优先。
-  const defaultClassifierModel = (mainModel: string): string =>
-    /^(GLM-5\.3-Flash|GLM-5\.2)$/i.test(mainModel) ? mainModel
-      : /^glm-5\.3$/i.test(mainModel) ? "glm-5.3-flash"
-      : "deepseek-v4-flash";
+  const runClassifier = createClassifierRunner((text) => process.stdout.write(text));
+  const classifierContext = () => ({
+    model: session.model, provider: cfg.provider, baseUrl: cfg.baseUrl, apiKey: cfg.apiKey,
+    override: process.env.DAO_CLASSIFIER_MODEL,
+  });
 
   const classifyPermission = async (toolName: string, argsJson: string, recentMessages: ChatMessage[]): Promise<boolean> => {
     const rules: AutoModeRules | undefined = loadedPerms.autoMode;
-    // 分类器模型不可用(模型名不存在/未授权/账号没配)时先回退主模型再试一次——主模型是
-    // 用户实际在用的、必然配好的;回退成功则本会话后续分类器调用都用它,只有两段都失败
-    // 才落到 gate.ts 的 fail-closed(转人工)。回退发生时提示一次,用户知道怎么改默认值。
-    let classifierModel = process.env.DAO_CLASSIFIER_MODEL || defaultClassifierModel(session.model);
-    let modelNotice = "";
-    const onUsage = (u: any) => {
-      session.addUsage(u, classifierModel);
-      cacheSink.record({ agent: "classifier", depth: 0, turn: 0, model: classifierModel, usage: u, sys: "", tools: "", tail: "" });
-    };
-    try {
-      return await classifyWithModel(classifierModel);
-    } catch (e) {
-      const status = (e as { status?: number }).status;
-      const msg = e instanceof Error ? e.message : String(e);
-      // 分类器模型不可用时回退主模型再试一次。判据放宽:除"换模型也没用"的两类
-      // (上下文超限——需上层压缩;限流/配额——需换账号或等待)外,任何失败都回退——
-      // 包括模型不存在/未授权(404、400 带 model、4010/4012)、网络/超时/5xx/空响应
-      // (streamChat 流式重试+非流式兜底耗尽后抛"连接…失败")。flash 模型不稳定时
-      // 不应让用户被打扰,回退到主模型(必然配好)继续判定。
-      if (isContextLengthError(e) || isRateLimitError(e)) throw e;
-      const fallback = session.model;
-      if (fallback === classifierModel) throw e;
-      modelNotice = `\n[智能判定] 分类器模型 ${classifierModel} 不可用(${msg.slice(0, 120)}),已回退用主模型 ${fallback} 判定;想固定指定请设 DAO_CLASSIFIER_MODEL\n`;
-      classifierModel = fallback;
-      return await classifyWithModel(classifierModel);
-    } finally {
-      if (modelNotice) process.stdout.write(modelNotice);
-    }
+    return runClassifier(classifierContext(), classifyWithModel);
     // 两阶段裁决(参数化模型):Stage1 快判 allow 即放行;拿不准升 Stage2 完整推理。
     async function classifyWithModel(m: string): Promise<boolean> {
+      const onUsage = (u: any) => {
+        session.addUsage(u, m);
+        cacheSink.record({ agent: "classifier", depth: 0, turn: 0, model: m, usage: u, sys: "", tools: "", tail: "" });
+      };
       // Stage 1(fast):共享 system prompt + transcript,加 STAGE1_SUFFIX。
       const gen1 = streamChat({
         baseUrl: cfg.baseUrl,
@@ -1062,12 +1067,11 @@ async function main() {
   // default/auto 由 getMode 读 loadedPerms.defaultMode 处理,无需在此设置。
   if (loadedPerms.defaultMode === "plan") session.mode = "plan";
   else if (loadedPerms.defaultMode === "bypassPermissions") yolo = true;
-  // WebFetch 智能提取(prompt 参数)用模型:DeepSeek 系 provider 默认 flash 档,其余(anthropic/openai
-  // 当前未配置便宜档)回退主模型,同 SUMMARY_MODEL 的既有降级方式。DAO_FETCH_EXTRACT_MODEL 可覆盖。
-  const EXTRACT_MODEL = resolveExtractModel(process.env.DAO_FETCH_EXTRACT_MODEL, cfg.provider, session.model);
+  // WebFetch 每次调用读取当前账号/模型，自定义网关默认继承主模型。
   const EXTRACT_INSTRUCTION = "下面是一个网页的纯文本内容,请严格按照<提取要求>从中提取相关信息,只输出提取结果," +
     "不要复述原文、不要寒暄、不要输出提取要求之外的内容。如果页面里确实没有<提取要求>要的信息,明确说明没有,不要编造。";
   const extractFromPage = async (text: string, prompt: string): Promise<string> => {
+    const EXTRACT_MODEL = resolveExtractModel(process.env.DAO_FETCH_EXTRACT_MODEL, cfg.provider, session.model, cfg.baseUrl);
     const gen = streamChat({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
@@ -1183,13 +1187,13 @@ async function main() {
       }
     } catch { /* 激活失败不影响文件操作 */ }
   };
-  // 外来技能适配(无翻译字典):检测为他者所写时,用 flash 按用途转换工具名,目标词表=dao 工具注册表,按 hash 缓存。
+  // 外来技能适配：按当前端点选择辅助模型，转换指令默认继承主模型。
   const apiTools = registry.toApiTools(undefined, lang);
   const daoTools = new Set(apiTools.map((t) => t.function.name));
   const toolCatalog = apiTools.map((t) => `${t.function.name} — ${t.function.description.split(/[。\n]/)[0]!.slice(0, 60)}`).join("\n");
   const callFlash = async (system: string, user: string): Promise<string> => {
     const gen = streamChat({
-      baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: defaultClassifierModel(session.model),
+      baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: defaultClassifierModel(classifierContext()),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       extra: { thinking: { type: "disabled" }, temperature: 0 },
     });
@@ -1208,10 +1212,10 @@ async function main() {
     // 未信任目录:不加载项目 hooks(hooks 会在事件时执行命令,是最危险的自动执行面)。
     ...(trustProject ? [{ path: path.join(workspaceRoot, ".dao", "hooks.json") }] : []),
   ]);
-  ctx.preToolHook = async (toolName, argsJson) => {
+  ctx.preToolHook = hooks.length ? async (toolName, argsJson) => {
     const o = await runHooks(hooks, "PreToolUse", { cwd: workspaceRoot, toolName, argsJson, payload: { tool: toolName, args: argsJson } });
     return { block: o.block, reason: o.reason, additionalContext: o.additionalContext, permissionDecision: o.permissionDecision, updatedInput: o.updatedInput };
-  };
+  } : undefined;
   ctx.postToolHook = async (toolName, argsJson, result) => {
     await runHooks(hooks, "PostToolUse", { cwd: workspaceRoot, toolName, argsJson, payload: { tool: toolName, args: argsJson, result } });
   };
@@ -1239,16 +1243,49 @@ async function main() {
   // 后台任务管理器:异步子代理 + 通知队列(主循环不阻塞)。
   const taskManager = createTaskManager();
   ctx.taskManager = taskManager; // TaskCreate/get/list/update/stop 用;同一个实例,不是第二套系统
-  // 后台子代理/后台 shell 状态变化的事件驱动等待(供 drainAndContinue 用,见 repl.ts 里
-  // waitForBackgroundChange 的注释)。onChange 是单槽位回调,这里只在非 TTY 的一次性/管道
-  // 路径用——TTY 交互态走另一套 subscribeTasks 逻辑(见下方 register 分支),两者互斥,
-  // 同一次进程运行只会用到其中一个,不会互相覆盖。
-  const waitForBackgroundChange = (): Promise<void> =>
-    new Promise<void>((resolve) => {
-      const onChange = () => resolve();
-      taskManager.onChange(onChange);
-      processManager.onChange(onChange);
-    });
+  const backgroundRuntime = new BackgroundRuntime([taskManager, processManager], workspaceRoot, (name, fields) => getBackend()?.event(name, fields));
+  let activeScheduler: SessionScheduler | undefined;
+  let activeStore: SessionStore | undefined;
+  let keepBackgroundOnExit = false;
+  const bindStore = async (store: SessionStore) => {
+    activeStore=store;ctx.durableStore=store.durable;ctx.toolScope="root";
+    if(store.durable?.state() && ctx.todoWriteRequired)ctx.todoWriteRequired.done=true;
+    setObsSession(store.id);cacheSink=createCacheAuditSink(store.dir);memoryAudit=createMemoryAuditSink(store.dir);
+    toolAudit=createToolAuditSink(store.dir);permAudit=createPermAuditSink(store.dir,getMode);skillSink=createSkillAuditSink(store.dir);
+    ctx.toolAudit=toolAudit;ctx.permAudit=permAudit;ctx.memoryAudit=memoryAudit;
+    await recoverBackground(store.durable!,backgroundRuntime,taskManager);
+    store.bindBackground?.(()=>backgroundRuntime.checkpoint());
+    session.messages=repairToolPairs(session.messages,store.durable!);
+    store.saveState({cwd:workspaceRoot,model:session.model,mode:session.mode,title:store.durable?.state()?.title,messages:session.messages,usage:{...session.usage}});
+  };
+  const recoveryCommand = async (line:string):Promise<string|undefined> => {
+    if(!/^\/recovery\b/.test(line))return;
+    const store=activeStore?.durable;if(!store)return "当前会话没有持久恢复存储。";
+    const [,verb,scope,id,...rest]=line.trim().split(/\s+/);
+    const recordDecision=(text:string)=>{
+      session.messages.push({role:"user",content:`[用户恢复决定] ${text}`});
+      activeStore!.saveState({cwd:workspaceRoot,model:session.model,mode:session.mode,title:store.state()?.title,messages:session.messages,usage:{...session.usage}});
+    };
+    if(verb==="resolve") {store.atomic(()=>{store.resolveTool(scope??"",id??"",rest.join(" "));recordDecision(line);});return "已记录核实决定；请发送下一条指令继续。";}
+    if(verb==="decide") {
+      const snapshot=backgroundRuntime.snapshot(scope??"");
+      if(!snapshot||snapshot.status!=="unknown"||!["completed","failed","canceled"].includes(id??"")||!rest.length)return "用法：/recovery decide <待核实 taskId> <completed|failed|canceled> <核实证据>";
+      store.atomic(()=>{store.setLaunch(snapshot.runId,{resolvedByUser:true});
+      backgroundRuntime.publish({type:id as "completed"|"failed"|"canceled",snapshot:{...snapshot,status:id as "completed"|"failed"|"canceled",result:`[用户核实] ${rest.join(" ")}`},eventId:`${snapshot.runId}:user-decision`});recordDecision(line);});
+      return "已记录该任务的核实结果；请发送下一条指令继续。";
+    }
+    if(verb==="continue") {
+      if(!scope||!id)return "用法：/recovery continue <taskId> <继续指令>";
+      if(store.unresolved().length)return "仍有未决操作，请先 /recovery resolve。";
+      recoveryAgentAuthorization=scope;
+      try {return JSON.stringify(await ctx.resumeAgent!(scope,[id,...rest].join(" ")));} finally {recoveryAgentAuthorization=undefined;}
+    }
+    return JSON.stringify({tasks:backgroundRuntime.snapshots(),unresolved:store.unresolved().map(r=>({scope:r.scope,id:r.id,tool:r.name,args:r.args}))},null,2)+"\n核实未决工具：/recovery resolve <scope> <toolCallId> <核实决定>；核实 unknown 后台任务：/recovery decide <taskId> <completed|failed|canceled> <核实证据>；继续代理：/recovery continue <taskId> <指令>";
+  };
+  let recoveryAgentAuthorization:string|undefined;
+  const preserveStop=()=>{try{backgroundRuntime.setState("paused",true);}catch{}};
+  process.once("SIGTERM",preserveStop);process.once("SIGINT",preserveStop);
+
   ctx.sendToTask = (id: string, message: string) => taskManager.send(id, message);
   // handoff 审查只在 auto 模式触发;用 getter 每次读最新值,/mode 或长任务切换 mode 时自动同步
   Object.defineProperty(ctx, 'permissionMode', { get: () => getMode(), enumerable: true });
@@ -1264,7 +1301,6 @@ async function main() {
       { role: "system" as const, content: "你是 auto 模式的子代理安全审查器:子代理执行完毕后,审查其整段执行转录,判断是否有违反安全策略的操作。应标记(返回 block):不可逆破坏(rm -rf、drop table、force push 覆盖)、读写凭据(.ssh/.aws/.env/credentials)、工作区外写入、与任务无关的危险操作、向外部端点发送敏感数据。不标记(返回 allow):与用户意图一致的可逆操作、工作区内正常编辑、只读操作。拿不准就标记(fail-safe)。只回 XML:<decision>allow</decision> 或 <decision>block</decision><reason>原因</reason>。" },
       { role: "user" as const, content: `执行转录:\n${transcript}\n\n审查这段子代理的执行,有违反安全策略的操作吗?` },
     ];
-    let handoffModel = process.env.DAO_CLASSIFIER_MODEL || defaultClassifierModel(session.model);
     const runOnce = (m: string) => {
       const gen = streamChat({
         baseUrl: cfg.baseUrl,
@@ -1284,23 +1320,13 @@ async function main() {
         return parseHandoffClassifierResponse(out);
       })();
     };
-    try {
-      return await runOnce(handoffModel);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // 同 classifyPermission:除上下文超限/限流外,任何失败都回退主模型。
-      if (isContextLengthError(e) || isRateLimitError(e)) throw e;
-      if (session.model === handoffModel) throw e;
-      process.stdout.write(`\n[智能判定] 安全审查模型 ${handoffModel} 不可用(${msg.slice(0, 120)}),已回退用主模型 ${session.model};想固定指定请设 DAO_CLASSIFIER_MODEL\n`);
-      handoffModel = session.model;
-      return await runOnce(handoffModel);
-    }
+    return runClassifier(classifierContext(), runOnce);
   };
 
   // ---- 子代理引擎装配(对齐 CC:runAgent 统一入口)----
   ctx.runAgent = (params) => runAgent({
     ...params,
-    toolUseContext: ctx,
+    toolUseContext: { ...ctx, sessionModel: session.model },
     availableTools: registry,
     projectInstructions: systemPrompt, // CLAUDE.md/DAO.md/gitStatus 等;omitClaudeMd 的 agent(explore/plan)自己会跳过
     config: { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey },
@@ -1316,18 +1342,21 @@ async function main() {
     subagentsDir: path.join(workspaceRoot, ".dao", "subagents"),
     mcpConfig,
   });
-  ctx.forkMessages = session.messages;
+  ctx.getForkMessages = () => session.messages;
   ctx.resumeAgent = async (agentId, prompt) => {
+    if(taskManager.get(agentId)?.status === "interrupted" && recoveryAgentAuthorization!==agentId) throw new Error("中断代理须由用户 /recovery continue 明确继续。");
     await resumeAgentBackground({
-      agentId, prompt,
+      parentModel: session.model,
+      agentId, prompt, durableStore:ctx.durableStore,
       subagentsDir: path.join(workspaceRoot, ".dao", "subagents"),
       agentDefs,
       runAgent: ctx.runAgent!,
       registerAsyncAgent: (o) => taskManager.registerAsyncAgent(o),
+      messageParent: (id, text, kind, runId) => { taskManager.emitFromTask(id, text, kind, runId); },
       taskManager: {
-        appendMessage: (id, m) => taskManager.appendMessage(id, m),
-        updateSummary: (id, s) => taskManager.updateSummary(id, s),
-        update: (id, patch) => taskManager.update(id, patch),
+        appendMessage: (id, m, runId) => taskManager.appendMessage(id, m, runId),
+        updateSummary: (id, s, runId) => taskManager.updateSummary(id, s, runId),
+        update: (id, patch, runId) => taskManager.update(id, patch, runId),
       },
     });
     return `已恢复子代理 ${agentId}。`;
@@ -1373,7 +1402,7 @@ async function main() {
     return true;
   };
 
-  // L2.1:上下文窗口按模型默认值初始化(GLM 系列按渠道:zhipu 官方 1M / 自定义网关 200K;glm-5.2=200K,其他=1M),可被 env 覆盖。
+  // L2.1:上下文窗口按模型默认值初始化(glm-5.2=200K,其他=1M,不区分渠道),可被 env 覆盖。
   // 真正的安全网是反应式压缩(见 loop.ts compact 钩子):即便此值偏大,撞上下文超限也会自动压缩重试。
   // /context-window 命令运行时修改此值(200K/1M 两档或自定义 K),同步写 env 供子进程继承。
   // /model 切换时:若用户未手动覆盖(env 未设),自动联动到新模型的默认值;手动覆盖后锁死,不随切换改变。
@@ -1415,8 +1444,8 @@ async function main() {
 
 只输出 <分析> 和 <摘要> 两个块的纯文本,不要寒暄。`;
   // 默认主模型(命中热缓存);DAO_SUMMARY_MODEL 可覆盖为 flash 等(会冷发、不命中缓存,省单价但失缓存)。
-  const SUMMARY_MODEL = process.env.DAO_SUMMARY_MODEL || session.model;
   const summarize = async (msgs: ChatMessage[]): Promise<string> => {
+    const SUMMARY_MODEL = getAgentModel(process.env.DAO_SUMMARY_MODEL, session.model);
     const gen = streamChat({
       baseUrl: cfg.baseUrl,
       apiKey: cfg.apiKey,
@@ -1474,18 +1503,19 @@ async function main() {
   const withPresence = async <T>(fn: () => Promise<T>): Promise<T> => {
     const release = acquireWakeLock();
     const start = Date.now();
-    try { return await fn(); }
+    let completed = false;
+    try { const result = await fn(); completed = !!result && typeof result === "object" && "kind" in result && result.kind === "completed"; return result; }
     finally {
       release();
       const ms = Date.now() - start;
-      if (ms > NOTIFY_MIN_MS) notify("dao", `完成一轮(${Math.round(ms / 1000)}s)`);
+      if (completed && ms > NOTIFY_MIN_MS) notify("dao", `完成一轮(${Math.round(ms / 1000)}s)`);
     }
   };
 
   // onCheckpoint(可选):一次性/--goal 长任务(argvPrompt)整个用户回合可能含大量工具轮,
   // 中途异常上抛会丢掉此前已成功的所有步骤——传入时每个工具轮结束后落一次盘(与交互态同一层修复)。
-  const runOneTurn = async (onCheckpoint?: () => void) => {
-    await withPresence(() => runTurn({
+  const runOneTurn = async (onCheckpoint?: () => void, signal?: AbortSignal, onBoundary?: () => Promise<void>): Promise<TurnOutcome> => {
+    const outcome = await withPresence(() => runTurn({
       session,
       config: { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey },
       registry,
@@ -1504,11 +1534,12 @@ async function main() {
       interactive: interactiveSession, // 进度提醒里"卡住了用 AskUserQuestion"这条只在真交互态才建议
       longTask,
       drainAdvisories: () => pendingReflectAdvisories.splice(0), // 反思器+(暂留)reply 的 advisory
-      drainNotifications: () => [...taskManager.drainNotifications(), ...processManager.drainNotifications()], // 后台子代理 + 后台 shell 完成结果:回合边界回灌
+      backgroundRuntime, signal, onBoundary,
       drainMcpNotices: () => mcpChangeQueue.splice(0), // MCP server 状态变化:回合边界回灌,不插进 tool_use/result 中间
       drainEnvNotices: () => envNoticeQueue.splice(0), // 环境探测补充:回合边界回灌(Task 5 新增)
       onCheckpoint,
     }));
+    if (outcome.kind !== "completed") return outcome;
     // 回合末统一反思:记忆 + 方向。自适应节奏;压缩前同步先抢救。argvPrompt(一次性/eval)不跑。
     if (!argvPrompt) {
       const compactionImminent = contextTokens() >= CONTEXT_WINDOW * 0.85;
@@ -1519,6 +1550,7 @@ async function main() {
       write("\n[接近上限,自动压缩…]\n");
       await runCompaction();
     }
+    return outcome;
   };
 
   // Ink 态压缩:不向 stdout 写(会冲渲染),只压缩消息;提示由 App 通过 events/notice 给出。
@@ -1539,10 +1571,6 @@ async function main() {
   let reflectBusy = false; // 防并发:上次后台反思未完成则跳过本次
   let cadenceState = initCadence();
   const pendingReflectAdvisories: string[] = []; // 反思器 advisory(有问题才入队),回合边界 append-only 注入
-  // 运行中排队的用户补充输入(TUI 敲回车时 push):回合边界(下一个工具轮开始前)由 runTurn 的
-  // drainPending 消费、注入为 user 消息——不用等当前这一整个大回合跑完。ESC 取消排队时靠这个数组
-  // 的引用被清空(splice(0)),已经被 drainPending 取走的部分自然不受影响(取走时已经不在数组里了)。
-  const steeringQueue: string[] = [];
   const REFLECT_MAX_INTERVAL = process.env.DAO_REFLECT_EVERY === "1" ? 1 : (Number(process.env.DAO_REFLECT_MAX_INTERVAL) || 3);
   const NO_MEMORY = noMemory;
   const REFLECT_SYNC = process.env.DAO_REFLECT_SYNC === "1"; // 测试/demo:反思同步完成再继续(否则后台 void)
@@ -1552,7 +1580,8 @@ async function main() {
     reflectBusy = true;
     try {
       const fork = process.env.DAO_DISTILL_FORK !== "0";
-      const model = fork ? session.model : defaultClassifierModel(session.model);
+      const model = fork ? session.model : defaultClassifierModel(classifierContext());
+      const reflectConfig = { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey };
       const tools = fork ? apiToolsForMode(registry, session.mode, lang) : undefined;
       // 只发上次主请求已缓存的前缀(slice 到 lastSentLength)→ 前缀字节一致、命中热缓存。
       const msgs = fork && session.lastSentLength > 0 ? session.messages.slice(0, session.lastSentLength) : session.messages;
@@ -1561,7 +1590,7 @@ async function main() {
       // 200 条安全上限防极端;正文只取前 N(见 unified_reflect.buildTail)。
       const candidates = existing.filter((m) => m.title).sort((a, b) => b.importance - a.importance).slice(0, 200).map((m) => ({ title: m.title!, text: m.text }));
       const result = await unifiedReflect({
-        streamChat, config: { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey }, model, messages: msgs, today,
+        streamChat, config: reflectConfig, model, messages: msgs, today,
         existing: candidates, fork, tools, reasoningEffort: process.env.DAO_REASONING_EFFORT || "max",
         onUsage: (u) => {
           session.addUsage(u as never, model);
@@ -1655,7 +1684,10 @@ async function main() {
       // (state.json 全量 messages + cache/tool/perm/memory/skill 各 trace jsonl)——之前这条路径完全没有落盘,
       // eval 只能拿到 stdout 文本,补上后 evals/run.mjs 才能把它跟 pass/fail 一起归档供事后分析。
       const sessionsDir = path.join(workspaceRoot, ".dao", "sessions");
-      const store = createSessionStore(sessionsDir);
+      const previous = continueFlag ? (cliResumeId ? loadState(sessionsDir,cliResumeId) : findResumable(sessionsDir,workspaceRoot)) : null;
+      if(previous) { session.messages=previous.storageVersion===2?previous.messages:sanitizeHistoryForResume(previous.messages); session.setModel(previous.model); session.mode=previous.mode;Object.assign(session.usage,previous.usage); }
+      const store = createSessionStore(sessionsDir,previous?.id,{cwd:workspaceRoot,durable:true});
+      await bindStore(store);
       setObsSession(store.id);
       cacheSink = createCacheAuditSink(store.dir);
       memoryAudit = createMemoryAuditSink(store.dir);
@@ -1673,26 +1705,20 @@ async function main() {
       session.messages.push({ role: "system", content: "[headless 提醒] 当前为无人值守模式,不会有用户在终端输入。所有命令必须是非交互式的——用参数或管道传入所需输入(如 7z -p<密码>、echo <密码> | 7z x),不要让命令等待 stdin。交互式命令会永久卡住。" });
       if (up.additionalContext) session.messages.push({ role: "system", content: `[hook 注入的上下文]\n${up.additionalContext}` });
       const argvCheckpoint = () =>
-        store.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, messages: session.messages, usage: { ...session.usage } });
-      await runOneTurn(argvCheckpoint);
-      // 一次性/eval 路径没有下一次真实用户输入来触发新回合——模型若以"结束本轮等后台通知"
-      // 收尾(工具描述/系统提示词教它这么做),不主动等就会直接往下走到 SessionEnd 退出整个
-      // 进程,后台进程虽然 detached 独立于 DAO 存活但已没人收它的结果,那句"自动通知"的
-      // 承诺永远兑现不了(真实撞见:terminal-bench flash 赛道 5 道题都是这个模式)。用和
-      // runRepl 同一套 drainAndContinue 排空/等待,直到确实没有后台工作在跑了才继续退出。
-      await drainAndContinue({
-        session,
-        write,
-        runTurn: () => runOneTurn(argvCheckpoint),
-        drainNotifications: () => [...taskManager.drainNotifications(), ...processManager.drainNotifications()],
-        runningBackgroundCount: () => taskManager.running().length + processManager.runningCount(),
-        waitForBackgroundChange,
-      });
+        store.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, messages: session.messages, backgroundWait: backgroundRuntime.activeWaits > 0, usage: { ...session.usage } });
+      activeScheduler = new SessionScheduler({ runtime: backgroundRuntime, session, save: argvCheckpoint,
+        keepAlive: true, notice: write, user: async () => {},
+        run: (signal, boundary) => runOneTurn(argvCheckpoint, signal, boundary) });
+      activeScheduler.recover();
+      activeScheduler.submit(argvPrompt);
+      await activeScheduler.finished();
+      if (activeScheduler.lastError) throw activeScheduler.lastError;
+      activeScheduler.close();
       await runHooks(hooks, "SessionEnd", { cwd: workspaceRoot }); // 会话结束钩子(CC 对等:一次性运行也触发)
       await cleanupDbBackups(workspaceRoot); // 清理本次运行留下的 .dao-backup 安全网文件
       store.saveState({
         cwd: workspaceRoot, model: session.model, mode: session.mode,
-        messages: session.messages, usage: { ...session.usage },
+        messages: session.messages, backgroundWait: backgroundRuntime.activeWaits > 0, usage: { ...session.usage },
       });
       store.markDone();
       if (session.usage.promptTokens > 0) write(`\n${session.usageSummary()}\n`);
@@ -1723,7 +1749,8 @@ async function main() {
           // 清洗一遍再装载:防止磁盘上的旧历史里混进过半截/非法 JSON 的 tool_call(真实撞见过——
           // 一个跑着旧代码、迟迟没重启的进程把这类坏消息存进了 state.json,续写时原样加载回来,
           // 下一轮请求又会撞上同一个 400 Invalid request body)。
-          session.messages = sanitizeHistoryForResume(prev.messages);
+          session.messages = prev.storageVersion===2 ? prev.messages : sanitizeHistoryForResume(prev.messages);
+          if (prev.backgroundWait && prev.storageVersion!==2) session.messages.push({ role: "system", content: "[旧等待未恢复] 上次会话等待的后台执行未被本进程接管,请重新确认任务状态。" });
           session.setModel(prev.model);
           session.mode = prev.mode;
           session.usage.promptTokens += prev.usage.promptTokens;
@@ -1732,14 +1759,15 @@ async function main() {
           session.usage.cacheMissTokens += prev.usage.cacheMissTokens;
           resumeId = prev.id; // 续写同一会话文件
           const recap = transcriptFromMessages(prev.messages);
-          recap.unshift({ id: 0, kind: "notice", text: "[已恢复上次会话]" });
+          recap.unshift({ id: 0, kind: "notice", text: prev.backgroundWait ? "[已恢复上次会话;旧后台等待未恢复,请重新确认任务状态]" : "[已恢复上次会话]" });
           initialItems = recap.map((it, i) => ({ ...it, id: i + 1 })); // 统一编号(welcome 占 0)
         } else if (cliResumeId) {
           // 给了明确 id 但没找到:提示一下,而不是静默当成"无历史会话"从零开始,让人误以为续上了。
           initialItems = [{ id: 0, kind: "notice", text: `[未找到会话 ${cliResumeId},本次将开始新会话]` }];
         }
       }
-      const store = createSessionStore(sessionsDir, resumeId);
+      let store = createSessionStore(sessionsDir, resumeId, {cwd:workspaceRoot,durable:true});
+      await bindStore(store);
       exitSessionId = store.id; // 记下,退出时给 resume 提示
       setObsSession(store.id); // obs:让 turn span 带上 session id,trace 可按 session 分组/查找
       // 缓存审计:主+子+fork+后台+三工具调用全写进 store.dir/cache.jsonl(常驻静默;DAO_CACHE_AUDIT=0 关)。
@@ -1764,7 +1792,7 @@ async function main() {
       );
       const ckpt = createCheckpointer(workspaceRoot, { enabled: checkpointEnabled });
       const turnCheckpoints: (string | null)[] = []; // 第 k 项 = 第 k 条用户消息【之前】的影子 git 快照 sha,供 /rewind 联动回滚文件
-      let sessionTitle: string | undefined; // /rename 设置
+      let sessionTitle: string | undefined = store.durable?.state()?.title; // /rename 设置
       if (longTask && !continueFlag) session.messages.push({ role: "system", content: lang === "en" ? LONG_TASK_DIRECTIVE_EN : LONG_TASK_DIRECTIVE });
       await injectSessionStart(); // SessionStart 注入(resume 替换后、首个回合前;幂等见 injectSessionStart)
       const persist = () =>
@@ -1774,25 +1802,27 @@ async function main() {
           mode: session.mode,
           title: sessionTitle,
           messages: session.messages,
+          backgroundWait: backgroundRuntime.activeWaits > 0,
           usage: { ...session.usage },
         });
-      await runInkApp({
-        welcome,
-        skipBanner: firstRun,
-        verbose,
-        notify, // 审批/提问弹窗时桌面通知(对齐完成一轮的通知),用户切走也能知道 dao 在等确认
-        submit: async (text, { events, signal }) => {
+      let uiEvents: TurnEvents = plainEvents(() => {});
+      const scheduler = new SessionScheduler({ runtime: backgroundRuntime, session, save: persist,
+        notice: (text) => uiEvents.notice(text),
+        user: async (text) => {
           // 命令/纯文本:走原有文本路径;图片(ContentPart[]):提取文字部分给 hook/store,图片部分随 session.addUser 一起发。
           const textStr = typeof text === "string" ? text : text.filter(p => p.type === "text").map(p => (p as { text: string }).text).join(" ");
           // UserPromptSubmit 钩子:可阻断本次提交、或把命令输出注入为上下文。
           const up = await gateUserPrompt(textStr);
-          if (up.blocked) { events.notice(`[提交被 hook 阻止] ${up.reason || ""}`); return; }
+          if (up.blocked) { uiEvents.notice(`[提交被 hook 阻止] ${up.reason || ""}`); return false; }
           turnCheckpoints.push(ckpt.snapshot(`回合前: ${textStr.slice(0, 60)}`)); // 回合前快照(供 /restore 与 /rewind code 回退)
           store.append({ t: "user", text: textStr });
           session.addUser(text);
           skillRound++; // 新一轮:用于关联本轮 skill 加载(skillSink.loaded);模型从常驻技能列表按需加载,无 discovery 预筛。
           if (up.additionalContext) session.messages.push({ role: "system", content: `[hook 注入的上下文]\n${up.additionalContext}` });
-          await withPresence(() => runTurn({
+          return true;
+        },
+        run: async (signal, boundary) => {
+          const outcome = await withPresence(() => runTurn({
             session,
             config: cfg, // 活引用(不是快照)——账号切换要在同一次 runTurn 调用期间立刻生效
             registry,
@@ -1805,7 +1835,7 @@ async function main() {
             write: () => {},
             compact: inkCompact, // L2.2 反应式压缩
             shouldCompact: () => contextTokens() >= CONTEXT_WINDOW * 0.85, // §4 轮内主动压缩
-                  diagnose: makeDiagnose(signal), // P2-11 编辑后诊断
+            diagnose: makeDiagnose(signal), // P2-11 编辑后诊断
             reflect: reflectChallengerFlag ? reflect : undefined, // 轮内卡住检测(assessTurn→挑战者);默认关闭,--reflect-challenger 才开
             progressAdvice: progressAdviceFlag, // 进度提醒(noProgress 计数器);仅 headless 默认开,交互式默认关;--no-progress-advice 显式关
             interactive: interactiveSession, // 进度提醒里"卡住了用 AskUserQuestion"这条只在真交互态才建议
@@ -1813,14 +1843,15 @@ async function main() {
             drainAdvisories: () => pendingReflectAdvisories.splice(0), // 反思器+(暂留)reply 的 advisory
             drainMcpNotices: () => mcpChangeQueue.splice(0), // MCP server 状态变化:回合边界回灌,不插进 tool_use/result 中间
             drainEnvNotices: () => envNoticeQueue.splice(0), // 环境探测补充:回合边界回灌(Task 5 新增)
-            drainPending: () => steeringQueue.splice(0), // 运行中排队的补充输入:下一个工具轮边界注入,不等整个大回合跑完
+            backgroundRuntime, onBoundary: boundary,
             listOtherAccounts: () => listAccounts().filter((a) => !a.active).map((a) => ({ name: a.name })), // 限流菜单用
             switchAccountAndWait,
-            events: logEvents(events, store), // 渲染的同时写日志
+            events: logEvents(uiEvents, store), // 渲染的同时写日志
             // 主会话不限轮数:靠 token 预算触发自动 compact;DAO_MAX_TURNS 可设硬上限(eval 用)。
             signal,
             onCheckpoint: persist, // 每个工具轮落一次盘,回合中途异常上抛也不连带丢掉此前已成功的步骤
           }));
+          if (outcome.kind !== "completed") return outcome;
           store.append({ t: "turn_end" });
           // 回合末统一反思:记忆 + 方向。自适应节奏;压缩前同步先抢救。
           {
@@ -1830,16 +1861,31 @@ async function main() {
           }
           if (contextTokens() >= CONTEXT_WINDOW * 0.85) {
             const before = session.messages.length;
-            events.notice("[接近上限,自动压缩…]");
+            uiEvents.notice("[接近上限,自动压缩…]");
             await inkCompact();
             store.append({ t: "compaction", before, after: session.messages.length });
           }
           persist(); // 回合末存档(崩溃可恢复)
+          return outcome;
         },
-        runCommand: (line) => {
+      });
+      activeScheduler = scheduler;
+      scheduler.recover();
+      await runInkApp({
+        welcome,
+        skipBanner: firstRun,
+        verbose,
+        notify, // 审批/提问弹窗时桌面通知(对齐完成一轮的通知),用户切走也能知道 dao 在等确认
+        scheduler,
+        bindEvents: (events) => { uiEvents = events; },
+        submit: async (text) => { scheduler.submit(text); await scheduler.settled(); },
+        runCommand: async (line) => {
           const name = line.trim().slice(1).split(/\s+/)[0] ?? "";
           // 防御：命令名含 / . 等非法字符（如 /Users/xxx/a.png）-> 不是命令，当普通文本。
           if (!/^[a-zA-Z0-9:_-]+$/.test(name)) return { handled: false };
+          if (name === "quit" && line.includes("--keep-background")) {keepBackgroundOnExit=true;return {handled:true,exit:true};}
+          if(name === "recovery") return {handled:true,output:await recoveryCommand(line)};
+          if (name === "clear") scheduler.reset();
           if (name === "skills") {
             const rest = line.trim().split(/\s+/).slice(1);
             const sub = rest[0];
@@ -2077,22 +2123,29 @@ async function main() {
             if (!id) return { handled: true, output: `历史会话(${metas.length}):\n` + metas.slice(0, 15).map((m) => `  ${m.id}${m.title ?? m.summary ? ` — ${m.title ?? m.summary}` : ""}${m.done ? "" : " ·未完成"}`).join("\n") + "\n用 /resume <会话id> 载入其上下文。" };
             const st = loadState(sessionsDir, id);
             if (!st) return { handled: true, output: `未找到会话:${id}(/resume 看列表)` };
-            // 整盘载入上下文(继续写入当前会话文件,不动原文件);先清洗一遍,防止磁盘上的旧历史
-            // 混进过半截/非法 JSON 的 tool_call(同 --continue/-c 启动时的续写防线)。
-            session.messages = sanitizeHistoryForResume(st.messages);
-            session.setModel(st.model);
+            // 恢复原会话身份；先保存当前会话，再转移 owner 与运行时。
+            if(id===store.id)return {handled:true,output:"当前已在此会话。"};
+            if(taskManager.running().length)return {handled:true,output:"仍有子代理运行，请先停止后再切换。"};
+            scheduler.pause(); await scheduler.settled(); persist();
+            const next=createSessionStore(sessionsDir,id,{cwd:workspaceRoot,durable:true});
+            processManager.detach(); taskManager.clearRestored();
+            scheduler.reset(); store.close?.(); store=next;
+            session.messages=st.storageVersion===2?st.messages:sanitizeHistoryForResume(st.messages);
+            session.setModel(st.model);session.mode=st.mode;Object.assign(session.usage,st.usage);sessionTitle=st.title;
+            await bindStore(store); exitSessionId=store.id;setObsSession(store.id);
+            persist();scheduler.recover();
             // 重放末段对话作回顾,让用户一眼看到"上次做到哪"(只取文本 user/assistant,末 6 条)。
             const recap = transcriptFromMessages(st.messages);
             const tail = recap.slice(-6);
             const resumeItems: TranscriptItem[] = tail.length
               ? [{ id: 0, kind: "notice", text: `── 会话 ${id} 最近对话(共 ${st.messages.length} 条消息,显示末 ${tail.length} 条)──` }, ...tail]
               : [];
-            return { handled: true, output: `✓ 已载入会话 ${id},继续写入当前会话。`, clearTranscript: true, resumeItems };
+            return { handled: true, output: `✓ 已恢复会话 ${id}，继续写入原会话。`, clearTranscript: true, resumeItems };
           }
           if (name === "branch") {
             const label = line.trim().split(/\s+/).slice(1).join(" ");
             const b = createSessionStore(sessionsDir); // 新会话 id
-            b.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, title: label || undefined, messages: session.messages, usage: { ...session.usage } });
+            b.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, title: label || undefined, messages: session.messages, backgroundWait: backgroundRuntime.activeWaits > 0, usage: { ...session.usage } });
             return { handled: true, output: `已把当前会话快照分支为 ${b.id}${label ? `(${label})` : ""}。\n切到该分支上下文:/resume ${b.id}(当前会话不受影响)` };
           }
           if (name === "rename") {
@@ -2449,13 +2502,12 @@ async function main() {
             label: `${m.id}${m.title ?? m.summary ? ` — ${m.title ?? m.summary}` : ""}${m.done ? "" : " ·未完成"}`,
           })),
         initialItems,
-        drainNotifications: () => [...taskManager.drainNotifications(), ...processManager.drainNotifications()],
-        subscribeTasks: (cb) => { taskManager.onChange(cb); processManager.onChange(cb); },
-        runningTasks: () => taskManager.running().length,
+        listAgentTasks: () => taskManager.all().filter((task) => task.kind === "agent"),
+        subscribeTasks: (cb) => backgroundRuntime.subscribe(cb),
+        runningTasks: () => backgroundRuntime.running().filter((s) => s.kind === "agent").length,
         runningShells: () => processManager.runningCount(),
         convertForegroundToBackground: () => ctx.foregroundRegistry!.convertAll(),
-        queueSteering: (text) => steeringQueue.push(text),
-        drainSteering: () => steeringQueue.splice(0),
+
         listAccounts,
         switchAccount: (n) => { switchAccount(n); },
         removeAccount,
@@ -2474,6 +2526,7 @@ async function main() {
         listInvocableSkills,
         listModels,
       });
+      scheduler.close();
       taskManager.cancelAll(); // 退出时中止所有后台任务
       await runHooks(hooks, "SessionEnd", { cwd: workspaceRoot }); // 会话结束钩子
       await cleanupDbBackups(workspaceRoot); // 清理本次运行留下的 .dao-backup 安全网文件
@@ -2494,7 +2547,8 @@ async function main() {
           // 清洗一遍再装载:防止磁盘上的旧历史里混进过半截/非法 JSON 的 tool_call(真实撞见过——
           // 一个跑着旧代码、迟迟没重启的进程把这类坏消息存进了 state.json,续写时原样加载回来,
           // 下一轮请求又会撞上同一个 400 Invalid request body)。
-          session.messages = sanitizeHistoryForResume(prev.messages);
+          session.messages = prev.storageVersion===2 ? prev.messages : sanitizeHistoryForResume(prev.messages);
+          if (prev.backgroundWait && prev.storageVersion!==2) session.messages.push({ role: "system", content: "[旧等待未恢复] 上次会话等待的后台执行未被本进程接管,请重新确认任务状态。" });
           session.setModel(prev.model);
           session.mode = prev.mode;
           session.usage.promptTokens += prev.usage.promptTokens;
@@ -2507,7 +2561,8 @@ async function main() {
           write(`[未找到会话 ${cliResumeId},本次将开始新会话]\n`);
         }
       }
-      const store = createSessionStore(sessionsDir, resumeId);
+      let store = createSessionStore(sessionsDir, resumeId, {cwd:workspaceRoot,durable:true});
+      await bindStore(store);
       exitSessionId = store.id;
       setObsSession(store.id); // obs:session id 注入(同交互路径)
       cacheSink = createCacheAuditSink(store.dir);
@@ -2524,9 +2579,43 @@ async function main() {
       // 盲区)不一样,这里连一次完整快照都没有,/resume 也找不到东西续。补上:每个工具轮
       // 落一次盘(同交互态/一次性路径的 onCheckpoint 机制),干净退出前再存一次兜底。
       const persistRepl = () =>
-        store.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, messages: session.messages, usage: { ...session.usage } });
+        store.saveState({ cwd: workspaceRoot, model: session.model, mode: session.mode, messages: session.messages, backgroundWait: backgroundRuntime.activeWaits > 0, usage: { ...session.usage } });
       await injectSessionStart(); // SessionStart 注入(首回合前)
-      await runRepl({ session, readLine, runTurn: () => runOneTurn(persistRepl), write, compact: runCompaction, gateUserPrompt, drainNotifications: () => [...taskManager.drainNotifications(), ...processManager.drainNotifications()], runningBackgroundCount: () => taskManager.running().length + processManager.runningCount(), waitForBackgroundChange, getProvider: () => cfg.provider });
+      const scheduler = new SessionScheduler({ runtime: backgroundRuntime, session, save: persistRepl,
+        keepAlive: true, notice: write,
+        user: async (text) => {
+          const input = typeof text === "string" ? text : JSON.stringify(text);
+          const up = await gateUserPrompt(input);
+          if (up.blocked) { write(`[提交被 hook 阻止] ${up.reason || ""}\n`); return false; }
+          session.addUser(text);
+          if (up.additionalContext) session.messages.push({ role: "system", content: up.additionalContext });
+          return true;
+        },
+        run: (signal, boundary) => runOneTurn(persistRepl, signal, boundary),
+      });
+      activeScheduler = scheduler;
+      scheduler.recover();
+      await runRepl({ session, readLine, scheduler, runTurn: async () => {}, write, compact: runCompaction, getProvider: () => cfg.provider,
+        command: async(line)=>{
+          if(/^\/quit\s+--keep-background\s*$/.test(line)){keepBackgroundOnExit=true;return {handled:true,exit:true};}
+          const recovery=await recoveryCommand(line);if(recovery!==undefined)return {handled:true,output:recovery};
+          if(!/^\/resume\b/.test(line))return {handled:false};
+          const id=line.trim().split(/\s+/)[1];
+          if(!id)return {handled:true,output:listSessions(sessionsDir,workspaceRoot).map(m=>`${m.id} ${m.title??m.summary??""}`).join("\n")};
+          if(id===store.id)return {handled:true,output:"当前已在此会话。"};
+          const st=loadState(sessionsDir,id);if(!st)return {handled:true,output:"未找到会话。"};
+          if(taskManager.running().length)return {handled:true,output:"请先停止运行中的子代理。"};
+          persistRepl();
+          const next=createSessionStore(sessionsDir,id,{cwd:workspaceRoot,durable:true});
+          processManager.detach();taskManager.clearRestored();scheduler.reset();store.close?.();store=next;
+          session.messages=st.storageVersion===2?st.messages:sanitizeHistoryForResume(st.messages);
+          session.setModel(st.model);session.mode=st.mode;Object.assign(session.usage,st.usage);
+          await bindStore(store);exitSessionId=store.id;setObsSession(store.id);persistRepl();scheduler.recover();
+          return {handled:true,output:`已恢复会话 ${id}。`};
+        }
+      });
+      if (scheduler.lastError) throw scheduler.lastError;
+      scheduler.close();
       persistRepl(); // 干净退出前再存一次(覆盖最后一轮是"纯文本收尾早退"、没触发过 onCheckpoint 的情形)
       await runHooks(hooks, "SessionEnd", { cwd: workspaceRoot }); // 会话结束钩子(与 TTY 分支对齐)
       await cleanupDbBackups(workspaceRoot); // 清理本次运行留下的 .dao-backup 安全网文件
@@ -2538,13 +2627,19 @@ async function main() {
     if (exitSessionId) write(`会话 ${exitSessionId} · 续写:dao -c ${exitSessionId}(或省略 id 续写最近一个)或启动后 /resume ${exitSessionId}\n`);
     // 退出【不再】蒸馏:记忆已在各热回合边界增量捕获;退出时缓存已凉,全量蒸只会撞冷缓存全价。
   } finally {
+    activeScheduler?.close();
+    taskManager.cancelAll();
+    backgroundRuntime.dispose();
+    if(keepBackgroundOnExit) processManager.detach(); else processManager.reset();
+    activeStore?.close?.();
+    process.removeListener("SIGTERM",preserveStop);process.removeListener("SIGINT",preserveStop);
     closeRl();
   }
 }
 
 // 收尾后显式退出:distill 的 flash HTTP keep-alive socket 等滞留 handle 会让 Node 排不空事件循环、
 // 不自然退出(看起来卡在"✓ 记忆无需更新"那行)。要紧的 await(distill/upsert/mcp.close)都已在 main 内完成。
-main().then(
+(process.argv[2] === "--dao-shell-runner" && process.argv[3] ? runShellRunner(process.argv[3]) : main()).then(
   async () => { await flushObs(); process.exit(0); },
   (err) => {
     console.error("\n" + (err as Error).message);

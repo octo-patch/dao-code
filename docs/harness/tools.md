@@ -78,6 +78,7 @@ interface Tool {
 
 **子代理**
 - `agent` —— 派发独立子任务给子代理(单个/并行)`src/tools/agent.ts`
+- `task_wait` —— 主会话显式等待后台 Agent/Shell,`ids` 去重后 1–32 个,`mode` 默认 any,可用 all;必须独占调用批次,plan 模式可用。`src/tools/task_wait.ts`
 - `task_send` —— 给后台子代理追加指令 `src/tools/task_send.ts`
 - `message_parent` —— 后台子代理向父代理发中途消息 `src/tools/message_parent.ts`
 

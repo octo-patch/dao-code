@@ -8,13 +8,14 @@ import { classifyHandoffIfNeeded } from "./agent_handoff.js";
 import type { CacheSafeParams } from "./runAgent.js";
 
 export interface AsyncAgentTaskManager {
-  appendMessage: (taskId: string, message: ChatMessage) => boolean;
-  updateSummary: (taskId: string, summary: string) => boolean;
-  update: (taskId: string, patch: { status?: "completed" | "failed" | "canceled"; result?: string }) => boolean;
+  appendMessage: (taskId: string, message: ChatMessage, runId?: string) => boolean;
+  updateSummary: (taskId: string, summary: string, runId?: string) => boolean;
+  update: (taskId: string, patch: { status?: "completed" | "failed" | "canceled"; result?: string }, runId?: string) => boolean;
 }
 
 export interface RunAsyncAgentLifecycleOpts {
   taskId: string;
+  runId?: string;
   agentId: string;
   agentType?: string;
   isBuiltInAgent?: boolean;
@@ -55,13 +56,13 @@ export async function runAsyncAgentLifecycle(opts: RunAsyncAgentLifecycleOpts): 
         opts.taskId,
         opts.agentId,
         { systemPrompt: params.systemPrompt, messages: params.forkContextMessages, model: opts.model },
-        (taskId, summary) => opts.taskManager.updateSummary(taskId, summary),
+        (taskId, summary) => opts.taskManager.updateSummary(taskId, summary, opts.runId),
       );
     });
 
     for await (const msg of stream) {
       messages.push(msg);
-      opts.taskManager.appendMessage(opts.taskId, msg);
+      opts.taskManager.appendMessage(opts.taskId, msg, opts.runId);
     }
 
     const result = finalize();
@@ -78,14 +79,14 @@ export async function runAsyncAgentLifecycle(opts: RunAsyncAgentLifecycleOpts): 
       });
       if (warning) text = `${warning}\n\n${text}`;
     }
-    opts.taskManager.update(opts.taskId, { status: "completed", result: text });
+    opts.taskManager.update(opts.taskId, { status: opts.abortSignal?.aborted ? "canceled" : "completed", result: text }, opts.runId);
   } catch (e) {
     const errMsg = e instanceof Error ? e.message : String(e);
     const partialText = finalize().content.map((c) => c.text).join("\n");
     opts.taskManager.update(opts.taskId, {
-      status: "failed",
+      status: opts.abortSignal?.aborted ? "canceled" : "failed",
       result: partialText ? `${errMsg}\n\n(部分输出)\n${partialText}` : errMsg,
-    });
+    }, opts.runId);
   } finally {
     summaryHandle?.stop();
   }

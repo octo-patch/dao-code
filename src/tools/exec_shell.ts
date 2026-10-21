@@ -253,7 +253,7 @@ function runForeground(
       child.stderr?.off("data", onStderr);
       const id = processManager.adopt(child, command, cwd, { stdout, stderr });
       resolve({
-        stdout: `已转后台(id=${id})。进程完成后会自动通知你——做完别的事后可以用 BashOutput 看一眼进度趋势,发现异常用 KillShell 终止。`,
+        stdout: `已转后台(id=${id})。进程完成后会自动通知你——主会话无独立工作时单独调用 TaskWait 等待此 id;BashOutput 仅用于具体进度查询。`,
         stderr: "", code: 0, aborted: false, elapsedMs: Date.now() - startTime, converted: true,
       });
     });
@@ -278,11 +278,11 @@ export const execShellTool = defineTool({
     "输出在内存里最多攒 10MB,超了会截断并提示改用更精确的命令或重定向到文件后再查——命令本身别指望它能把一个几十MB" +
     "的输出原样倒给你。\n" +
     "长耗时命令策略:执行前自判命令是否可能耗时超过 180 秒(npm install、build、test suite、大数据处理等)。" +
-    "如果是,优先 background 执行--不只是\"起后台\",而是:做完别的事后用 BashOutput 做 checkpoint 式进度检查," +
+    "如果是,优先 background 执行--不只是\"起后台\",而是:做完独立工作后主会话单独调用 TaskWait 等待;需排查时用 BashOutput," +
     "看输出趋势判断是否正常推进;发现异常(连续报错、长时间无输出、偏离预期)用 KillShell 终止。" +
     "无进度输出但可拆解的命令,拆成小步骤分步跑。都不行再前台跑,让它自然结束——这个分支意味着你已经确认" +
     "它会自己退出,不是在赌一个数字。" +
-    "持续关注型场景(如等某条 ERROR 出现)可考虑 Monitor 工具,它主动推送输出;一般 checkpoint 式检查用 BashOutput 即可。\n" +
+    "持续关注型场景(如等某条 ERROR 出现)可考虑 Monitor 工具,它主动推送输出;具体排查用 BashOutput,等待用 TaskWait。\n" +
     "查文件内容用 Grep、查文件名/路径用 Glob、读文件用 Read——不要用本工具拼 grep/rg/find/cat/head/tail," +
     "专用工具有护栏(大小限制、二进制探测)且不占审批。同理,简单文本/日志搜索也别现写 python3 -c 内联脚本模拟" +
     "grep——Grep 工具一次就到位;真需要 JSON/结构化解析等 Grep 做不到的逻辑,优先 Write 成 .py 文件执行,而不是" +
@@ -312,12 +312,12 @@ export const execShellTool = defineTool({
     "command or redirect to a file and inspect that instead — don't expect a raw multi-MB output to come back intact.\n" +
     "Long-running command strategy: before executing, judge whether the command may take over 180 seconds (npm install, build, test suite, " +
     "large data processing, etc.). If so, prefer background execution - not just \"start it in background\", but: after doing other work, " +
-    "use BashOutput for checkpoint-style progress checks, watching the output trend to judge whether it's advancing normally; if you spot " +
+    "the main session calls TaskWait alone when no independent work remains. Use BashOutput for specific investigations; if you spot " +
     "anomalies (repeated errors, long silence, diverging from expectation) use KillShell to terminate. For commands " +
     "with no progress output but decomposable, break into smaller steps. If neither works, run foreground and let it finish naturally — reaching this " +
     "branch means you've already concluded it will exit on its own, not that you're betting on a number. " +
     "For continuous-attention scenarios (like waiting for an ERROR line to appear) consider the Monitor tool, which pushes output to you " +
-    "proactively; for general checkpoint-style checks, BashOutput suffices.\n" +
+    "proactively; use BashOutput for concrete investigations and TaskWait for waiting.\n" +
     "Use Grep for content search, Glob for filename/path search, Read for reading files — do not shell out to grep/rg/find/cat/head/tail; the dedicated " +
     "tools have guardrails (size limits, binary detection) and skip approval. Likewise, don't write inline python3 -c scripts to reimplement grep for " +
     "simple text/log search — the Grep tool gets there in one shot. For logic Grep genuinely can't do (JSON/structured parsing), prefer Write-ing a helper " +
@@ -363,9 +363,9 @@ export const execShellTool = defineTool({
       const seconds = parseFloat(sleepMatch[1]!);
       if (seconds >= 2) {
         return `不要用 sleep 阻塞等待。后台 shell(background=true)和后台子代理完成时会自动通知你--` +
-          `结束本轮或去做别的事,结果到了自动回灌。\n` +
+          `先做独立工作,无独立工作时主会话单独调用 TaskWait。\n` +
           `如果你确实需要等待(如等端口可用、等容器启动),用 Bash 的 background 参数起后台命令,` +
-          `做完别的事后用 BashOutput 检查进度。\n` +
+          `主会话用 TaskWait 等待此后台 id,无需重复查询。\n` +
           `你刚才的命令等了 ${seconds} 秒--这段时间整个 dao 会话被完全阻塞,无法响应用户输入。`;
       }
     }
@@ -374,8 +374,8 @@ export const execShellTool = defineTool({
       // python-inline 小文件拦截提前返回、命令根本没跑,那种情况不该白白备份一次)。
       const dbBackupNotice = backupDbFilesBeforeExec(args.command, ctx.cwd ?? ctx.workspaceRoot);
       ctx.pendingUnverifiedWrites?.clear(); // 真实发起了一次执行——不判定是否针对某个具体文件,任何一次执行都算已有反馈
-      const id = processManager.start(args.command, (ctx.cwd ?? ctx.workspaceRoot));
-      const started = `已在后台启动(id=${id})。进程完成后会自动通知你--做完别的事后可以用 BashOutput 看一眼进度趋势,发现异常用 KillShell 终止。不是循环轮询,是 checkpoint 式检查。`;
+      const id = await processManager.startManaged(args.command, (ctx.cwd ?? ctx.workspaceRoot));
+      const started = `已在后台启动(id=${id})。进程完成后会自动通知你--先做其他独立工作,无独立工作时主会话单独调用 TaskWait 等待此 id。BashOutput 仅用于具体进度查询。`;
       return dbBackupNotice ? `${dbBackupNotice}\n${started}` : started;
     }
     const isPythonInline = PYTHON_INLINE_RE.test(args.command);

@@ -1,6 +1,6 @@
 {
   "name": "dao-code",
-  "version": "0.5.9",
+  "version": "0.5.14",
   "description": "Dao Code —— 道家美学的 DeepSeek V4 终端编码 agent(Ink TUI · 太极欢迎屏 · 流式+工具+审批 · 持久记忆 · prompt-cache 感知)",
   "author": "tigicion",
   "type": "module",
@@ -66,14 +66,18 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.11.1",
     "cli-highlight": "^2.1.11",
     "ink": "^7.0.5",
     "react": "^19.2.7",
+    "tree-sitter-wasms": "^0.1.13",
     "vscode-jsonrpc": "^9.0.1",
+    "web-tree-sitter": "^0.25.10",
     "zod": "^3.23.0",
     "zod-to-json-schema": "^3.23.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.2.17",
     "eslint": "^9.39.4",

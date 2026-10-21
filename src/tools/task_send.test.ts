@@ -1,3 +1,4 @@
+import { createTaskManager } from "../agent/tasks.js";
 import { describe, it, expect } from "vitest";
 import { taskSendTool } from "./task_send.js";
 
@@ -48,4 +49,17 @@ describe("TaskSend", () => {
     expect(out).toContain("无法恢复");
     expect(out).toContain("一次性 agent");
   });
+});
+
+
+it("does not resume an executor still canceling", async () => {
+  const taskManager = createTaskManager();
+  const task = taskManager.registerAsyncAgent({ agentId: "canceling", description: "job" });
+  taskManager.cancel(task.agentId);
+  let resumed = false;
+  const out = await taskSendTool.handler({ id: task.agentId, message: "again" }, {
+    workspaceRoot: "/w", taskManager, sendToTask: (id, message) => taskManager.send(id, message),
+    resumeAgent: async () => { resumed = true; return "resumed"; },
+  });
+  expect(out).toContain("正在取消"); expect(resumed).toBe(false);
 });

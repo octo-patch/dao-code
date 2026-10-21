@@ -1,18 +1,19 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hasProjectConfig, isTrusted, addTrusted, shouldTrustProject } from "./trust.js";
+let hasProjectConfig: typeof import("./trust.js").hasProjectConfig, isTrusted: typeof import("./trust.js").isTrusted, addTrusted: typeof import("./trust.js").addTrusted, shouldTrustProject: typeof import("./trust.js").shouldTrustProject;
 
-let home: string, root: string, prevHome: string | undefined, prevTrust: string | undefined;
+let home: string, root: string, prevTrust: string | undefined;
 beforeEach(async () => {
   home = await fs.mkdtemp(path.join(os.tmpdir(), "dao-home-"));
   root = await fs.mkdtemp(path.join(os.tmpdir(), "dao-proj-"));
-  prevHome = process.env.HOME; prevTrust = process.env.DAO_TRUST;
-  process.env.HOME = home; delete process.env.DAO_TRUST;
+  prevTrust = process.env.DAO_TRUST; delete process.env.DAO_TRUST;
+  vi.spyOn(os,"homedir").mockReturnValue(home);vi.resetModules();
+  ({hasProjectConfig,isTrusted,addTrusted,shouldTrustProject}=await import("./trust.js"));
 });
 afterEach(async () => {
-  process.env.HOME = prevHome; if (prevTrust !== undefined) process.env.DAO_TRUST = prevTrust; else delete process.env.DAO_TRUST;
+  vi.restoreAllMocks();if (prevTrust !== undefined) process.env.DAO_TRUST = prevTrust; else delete process.env.DAO_TRUST;
   await fs.rm(home, { recursive: true, force: true });
   await fs.rm(root, { recursive: true, force: true });
 });

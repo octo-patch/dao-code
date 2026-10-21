@@ -1,11 +1,17 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { dispatchCommand } from "./commands.js";
 import { Session } from "../session/session.js";
-import { setLang, getLang } from "../i18n/i18n.js";
+import { setLang, getLang, switchLang } from "../i18n/i18n.js";
 
-// /lang 测试会写 ~/.dao/settings.json(真实持久化路径,测试环境属可接受副作用);
-// 用例内显式 setLang 起点,避免依赖文件残留状态。
-afterEach(() => setLang("zh"));
+// 命令测试只验证切换行为;持久化由 i18n 测试覆盖,禁止写入开发者的真实配置。
+vi.mock("../i18n/i18n.js", async (original) => {
+  const actual = await original<typeof import("../i18n/i18n.js")>();
+  return { ...actual, switchLang: vi.fn(async (lang: Parameters<typeof actual.setLang>[0]) => actual.setLang(lang)) };
+});
+afterEach(() => {
+  setLang("zh");
+  vi.clearAllMocks();
+});
 
 function sess() {
   return new Session("SYS", "deepseek-v4-pro");
@@ -165,9 +171,11 @@ describe("dispatchCommand", () => {
     const r = dispatchCommand("/lang zh", sess());
     expect(r.handled).toBe(true);
     expect(r.output).toContain("中文");
+    expect(switchLang).toHaveBeenCalledWith("zh");
     await vi.waitFor(() => expect(getLang()).toBe("zh")); // switchLang 异步持久化,语言先行生效
     const r2 = dispatchCommand("/lang en", sess());
     expect(r2.output).toContain("English");
+    expect(switchLang).toHaveBeenLastCalledWith("en");
     await vi.waitFor(() => expect(getLang()).toBe("en"));
   });
 
@@ -185,6 +193,7 @@ describe("dispatchCommand", () => {
     expect(r.handled).toBe(true);
     expect(r.output).toContain("zh / en");
     expect(getLang()).toBe("zh");
+    expect(switchLang).not.toHaveBeenCalled();
   });
 
   it("unknown command is handled with a hint", () => {

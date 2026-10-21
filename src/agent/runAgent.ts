@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { subagentMaxTurns } from "./turn_budget.js";
+import { getAgentModel } from "../config/model_selection.js";
+export { getAgentModel } from "../config/model_selection.js";
 import path from "node:path";
 import type { ChatMessage } from "../client/types.js";
 import type { ToolContext, Tool } from "../tools/types.js";
@@ -61,7 +64,7 @@ export interface RunAgentParams {
    *  agentDef.omitClaudeMd!==true 时拼进子代理 system prompt,省 token 的一次性 agent(explore/plan)不拼。 */
   projectInstructions?: string;
   /** 后台子代理给父发 mid-run 消息的出口(MessageParent 工具用);前台子代理不传 */
-  messageParent?: (message: string) => void;
+  messageParent?: (message: string, kind?: import("../agent/background_types.js").MessageKind) => void;
   /** 缓存安全参数回调(后台摘要用) */
   onCacheSafeParams?: (params: CacheSafeParams) => void;
   /** 每条消息回调(活性检测用) */
@@ -76,7 +79,7 @@ export interface RunAgentParams {
   /** 审批门 */
   gate?: TurnDeps["gate"];
   /** runTurn 函数 */
-  runTurn?: (deps: TurnDeps) => Promise<void>;
+  runTurn?: (deps: TurnDeps) => Promise<void | import("./background_types.js").TurnOutcome>;
   /** 输出函数 */
   write?: (s: string) => void;
   /** 转录写入回调 */
@@ -93,25 +96,6 @@ export interface RunAgentParams {
 export interface CacheSafeParams {
   systemPrompt: string;
   forkContextMessages: ChatMessage[];
-}
-
-// ---- 模型解析 ----
-
-/**
- * 解析 agent 模型(参考 getAgentModel)。
- * 优先级:调用级 model > agent 定义 model > inherit(父模型)
- */
-export function getAgentModel(
-  agentModel: string | undefined,
-  parentModel: string,
-  overrideModel: string | undefined,
-): string {
-  // 调用级覆盖优先
-  if (overrideModel) return overrideModel;
-  // agent 定义指定了模型(且不是 inherit)
-  if (agentModel && agentModel !== "inherit") return agentModel;
-  // 默认继承父模型
-  return parentModel;
 }
 
 // ---- 子代理上下文 ----
@@ -192,7 +176,7 @@ export async function* runAgent(params: RunAgentParams): AsyncGenerator<ChatMess
 
   // ---- 阶段 1:参数解析 ----
 
-  const parentModel = toolUseContext.sessionModel ?? "deepseek-v4-pro";
+  const parentModel = toolUseContext.sessionModel;
   const resolvedModel = getAgentModel(agentDef.model, parentModel, modelOverride);
   const agentId = override?.agentId ?? createAgentId();
 
@@ -415,9 +399,13 @@ ${skill.body}` });
 
   // 子代理 ToolContext:独立 readFiles/readMeta(不污染父);worktreePath 存在时覆盖工作区根
   const subDepth = (toolUseContext.subagentDepth ?? 0) + 1;
+  const durableRunId = toolUseContext.taskManager?.get(agentId)?.runId ?? agentId;
+  const saveAgent = () => toolUseContext.durableStore?.saveAgent({taskId:agentId,runId:durableRunId,messages:sub.messages,metadata:{agentType:agentDef.agentType,description,worktreePath,model:resolvedModel}});
+  saveAgent();
   const subCtx: ToolContext = {
     ...toolUseContext,
     subagentDepth: subDepth,
+    toolScope: durableRunId,
     readFiles: new Set<string>(),
     readMeta: new Map<string, { mtime: number; size: number }>(),
     pendingUnverifiedWrites: new Set<string>(),
@@ -453,8 +441,9 @@ ${skill.body}` });
 
       // runTurn 在后台跑,往 sub.messages push 消息;push 时 withPushNotifier 同步唤醒下面的查询循环
       const runTurnPromise = (async () => {
-        await runTurn({
+        const outcome = await runTurn({
           session: sub,
+          onCheckpoint: saveAgent,
           config,
           registry: resolvedTools,
           ctx: subCtx,
@@ -466,10 +455,13 @@ ${skill.body}` });
           drainPending,
           background: true, // 子代理:遇 529 不重试/不回退
           selfChallenge: true, // 子代理跑确定性卡住检测
-          maxTurns: maxTurnsOverride ?? agentDef.maxTurns ?? 200,
+          maxTurns: subagentMaxTurns(maxTurnsOverride, agentDef.maxTurns),
           ...(agentDef.effort ? { reasoningEffort: agentDef.effort } : {}),
           ...(auditSink ? { auditSink, auditId: { agent: "sub" as const, subId: agentId, depth: subDepth } } : {}),
         });
+        if (outcome?.kind === "failed") throw outcome.error;
+        if (outcome?.kind === "waiting") throw new Error("子代理不支持嵌套等待");
+        if (outcome?.kind === "interrupted") throw new Error("子代理已中断");
       })();
 
       // 事件驱动:每轮先把已产出的消息 yield 完,再"睡到下一次 push 或 runTurn 结束"为止——

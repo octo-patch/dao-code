@@ -13,6 +13,7 @@
 - `tools/` — 所有工具(`defineTool({name,description,capability,approval,schema,handler})`);执行器 `execute.ts`(按 capability 并发/串行 + 审批)。还有 `sandbox.ts`(安全沙箱)、`ssrf.ts`(SSRF 防护)、`safe_env.ts`。
 - `permissions/` — CC 1:1 权限引擎(`engine.ts` 决策、`rules.ts` `Tool(specifier)` 匹配、`identity.ts` 工具名映射、`settings.ts` 规则来源合并)。
 - `prompt/system_prompt.ts` — 系统 prompt(含项目指令插槽 `{project_instruction_files}`)。
+- `repomap/` — 代码库地图(aider 风格):tree-sitter WASM 提取符号 + PageRank 排序 + token 预算裁剪;启动时后台构建、尾部 system 消息注入(不进固定前缀,保 prefix cache)。wasm 双环境加载:bun compile 走 `wasm-assets.ts` 静态内嵌,node/tsx 走 node_modules resolve——**别在 wasm-assets.ts 之外静态 import `.wasm`**(node 下直接崩)。
 - `memory/` — 三层记忆 + 蒸馏(distill)。`skills/`、`plugins.ts` — 技能/插件加载。
 - `session/` — 会话持久化(`log.ts`)、影子 git 检查点(`checkpoint.ts`)。
 - `tui/app/App.tsx` — Ink 主组件(转录、输入、斜杠命令、审批模态)。`commands/` — 斜杠命令(`builtin.ts` prompt 命令 + `commands.ts` dispatch)。
@@ -49,6 +50,7 @@ npm run typecheck && npm run lint && npm test
 | `DAO_THEME` | 终端主题 `light`/`dark` | 自动检测 |
 | `DAO_AUTO_APPROVE` | 跳过审批(仅沙箱/评估) | off |
 | `DAO_REFLECT` | `0` 全局关闭反思层 | on |
+| `DAO_REPO_MAP_TOKENS` | 代码库地图 token 预算;`0` 禁用 | `2048` |
 
 ## 坑(踩过的)
 - **bun 二进制重签名**:`cp` 后必须 `codesign --force --sign -`(`bundle:install` 已含),否则 arm64 启动即 `zsh: killed`。

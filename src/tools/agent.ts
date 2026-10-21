@@ -7,22 +7,12 @@ import { finalizeAgentTool } from "../agent/agent_tools.js";
 import { runAsyncAgentLifecycle, type AsyncAgentTaskManager } from "../agent/agent_lifecycle.js";
 import { classifyHandoffIfNeeded } from "../agent/agent_handoff.js";
 import type { ForegroundRegistry } from "../tui/foreground_registry.js";
+import { getAgentModel } from "../config/model_selection.js";
 
-// 子代理模型名归一化:模型常把 "deepseek-v4-pro" 写成 "deepseek-v4"/"pro"/"flash" -> raw 传 API 会失败。
-// 已知模型名(含 kimi-k2.6/glm-5.2 等多 provider)原样保留;deepseek 简称归一;无法识别 -> undefined(继承父模型)。
-import { MODELS_BY_PROVIDER } from "../config/profiles.js";
-
-const ALL_KNOWN_MODELS = new Set(
-  Object.values(MODELS_BY_PROVIDER).flat().map((m) => m.toLowerCase()),
-);
-
+// 模型 ID 只去除首尾空白；不根据父模型或简称猜测网关支持的其他模型。
 export function normalizeModel(m: string | undefined): string | undefined {
-  if (!m) return undefined;
-  const s = m.trim().toLowerCase();
-  if (ALL_KNOWN_MODELS.has(s)) return m.trim();
-  if (s.includes("flash")) return "deepseek-v4-flash";
-  if (s.includes("pro")) return "deepseek-v4-pro";
-  return undefined;
+  const selected = m?.trim();
+  return selected?.toLowerCase() === "inherit" ? "inherit" : selected || undefined;
 }
 
 function randomAgentId(): string {
@@ -39,17 +29,14 @@ const AGENT_TOOL_PROMPT_ZH =
   "耗时长被自动转后台);跟下一步没有依赖才用 background:true。并行最多 10 个同时跑、其余排队。\n" +
   "四个可选调用方式互斥:isolate(git worktree 隔离改文件)、fork(继承完整上下文+复用前缀缓存,近乎免费)、" +
   "model(临时换模型省钱,但会让前缀缓存失效)、mode=plan(只读规划)。fork 与 model/mode 天生冲突。" +
-  "agent_type 指定子代理类型(见系统 prompt 的'可用子代理类型');省略则用通用子代理。\n" +
+  "agent_type 指定子代理类型(见系统 prompt 的'可用子代理类型');省略则用通用子代理。explore 默认继承主模型，不要猜测或改写网关模型 ID。\n" +
   "拿到结果后留个心眼:子代理返回的是它自称做了什么,不是你亲眼确认过的事实。" +
   "涉及代码改动的子任务,回来后亲自复核关键结论,不要原样转述子代理的自述。" +
   "别重复子代理正在做的工作:如果你把一项调查派给了子代理,就不要自己也去跑同样的搜索。\n" +
   "何时不该用:要读某个具体文件路径,直接 Read;要搜某个类/函数定义,直接 Grep/Glob;" +
   "只需在 2-3 个文件里搜代码,直接 Read。这些简单搜索不值得派子代理。\n" +
-  "长耗时子任务策略:派发前自判子任务是否可能耗时超过 180 秒。如果是,优先 background:true 后台派--" +
-  "不只是\"起后台等通知\",而是:做完别的事后用 TaskOutput 做 checkpoint 式进度检查," +
-  "看子代理的中间消息/思考判断是否在正常推进;发现趋势偏离预期用 TaskStop 终止," +
-  "分析已产生的中间结果,调整策略再重新派发。前台子代理耗时过长时同理--" +
-  "可以先用 TaskOutput 看中间进度,趋势不对就 TaskStop。\n" +
+  "后台子任务完成后会自动通知。先做其他独立工作;没有其他工作时单独调用 TaskWait 等待所需任务,不要连续调用 TaskOutput/TaskGet/TaskList。" +
+  "仅在用户询问进度或有具体排查需要时用 TaskOutput 查看中间消息,发现偏离任务目标时可用 TaskStop 终止。\n" +
   "写 prompt 的指引:像给刚进门的聪明同事 brief--子代理没看过当前对话,不知道你试过什么、为什么这个任务重要。" +
   "说清目标与背景、已排除的方向、需要判断而非窄指令的上下文。需要短回复就说『200 字以内回报』。" +
   "查/定位:给确切命令;调查:给问题而非规定步骤。别写『基于你的发现修复 bug』--那是把综合判断推给子代理;" +
@@ -69,17 +56,14 @@ const AGENT_TOOL_PROMPT_EN =
   "background:true only when the result has no bearing on your next step. At most 10 parallel, the rest queue.\n" +
   "Four optional modes are mutually exclusive: isolate (git worktree isolation), fork (inherits full context + reuses prefix cache, nearly free), " +
   "model (temporarily switch models - invalidates prefix cache), mode=plan (read-only planning). fork conflicts with model/mode. " +
-  "agent_type selects a subagent type (see 'Available Subagent Types' in system prompt); omit for generic subagent.\n" +
+  "agent_type selects a subagent type (see 'Available Subagent Types' in system prompt); omit for generic subagent. Explore inherits the main model by default; do not guess or rewrite gateway model IDs.\n" +
   "Trust but verify: a subagent's summary describes what it claims it did, not what you've confirmed. " +
   "For code-change subtasks, verify key results yourself before reporting. " +
   "Don't duplicate work that subagents are already doing - if you delegate research to a subagent, do not also perform the same searches yourself.\n" +
   "When NOT to use: to read a specific file path, use Read directly; to search for a class/function definition, use Grep/Glob directly; " +
   "to search within 2-3 specific files, use Read directly. These simple searches don't warrant a subagent.\n" +
-  "Long-running subtask strategy: before dispatching, judge whether the subtask may take over 180 seconds. If so, prefer background:true - " +
-  "not just \"start it in background and wait for notification\", but: after doing other work, use TaskOutput for checkpoint-style progress " +
-  "checks, looking at the subagent's intermediate messages/reasoning to judge whether it's advancing normally; if the trend diverges from " +
-  "expectation, use TaskStop to terminate, analyze the intermediate results produced, adjust strategy and re-dispatch. The same applies " +
-  "to foreground subagents taking too long - use TaskOutput to check intermediate progress first, and TaskStop if the trend looks wrong.\n" +
+  "Background tasks notify you automatically on completion. Do independent work first; if none remains, call TaskWait alone for the required task IDs. " +
+  "Do not repeatedly call TaskOutput/TaskGet/TaskList. Check intermediate progress only for a user request or a concrete investigation; use TaskStop if needed.\n" +
   "Writing the prompt: brief the agent like a smart colleague who just walked into the room - it hasn't seen this conversation. " +
   "Explain what you're trying to accomplish and why. Describe what you've already learned or ruled out. " +
   "Give enough context for judgment calls. If you need a short response, say so. Lookups: hand over the exact command. " +
@@ -173,7 +157,7 @@ export const agentTool = defineTool({
     model: z
       .string()
       .optional()
-      .describe("调用级模型覆盖(如 deepseek-v4-flash 省钱跑廉价子任务)。注意:换模型会让前缀缓存失效——只在任务足够廉价时才划算。与 fork 互斥。"),
+      .describe("调用级模型覆盖:填写当前网关支持的完整模型 ID，不能猜测模型名。inherit 表示使用当前主模型。省略则使用 agent 定义(explore 默认继承主模型)。与 fork 互斥，换模型会让前缀缓存失效。"),
     mode: z
       .enum(["normal", "plan"])
       .optional()
@@ -205,9 +189,6 @@ export const agentTool = defineTool({
     if (args.fork && (args.model || args.mode)) {
       return "fork 与 model/mode 覆盖互斥:fork 的价值是复用父代理的前缀缓存,而换模型/改模式会让该缓存失效、fork 失去意义。请去掉 model/mode,或改用普通子代理(去掉 fork)。";
     }
-    if (args.background && (args.model || args.mode)) {
-      return "后台子代理暂不支持 model/mode 覆盖(后续版本补)。若要换模型跑后台:去掉 model/mode,或为该用途定义一个带 model 的 agent_type 再用 background。";
-    }
 
     const runAgent = ctx.runAgent;
     const fork = !!args.fork;
@@ -219,14 +200,14 @@ export const agentTool = defineTool({
     const isolationMode = args.isolation ?? (args.isolate ? "worktree" : undefined) ?? agentDef.isolation;
     const isolate = !fork && isolationMode === "worktree" && !!ctx.createWorktree;
     const isRemote = !fork && isolationMode === "remote";
-    const reqModel = normalizeModel(args.model); // 归一化/兜底:无效模型名不透传给 API
+    const reqModel = normalizeModel(args.model);
     const reqMode = args.mode;
 
     const taskManagerAdapter: AsyncAgentTaskManager | undefined = ctx.taskManager
       ? {
-          appendMessage: (id, m) => ctx.taskManager!.appendMessage(id, m),
-          updateSummary: (id, s) => ctx.taskManager!.updateSummary(id, s),
-          update: (id, patch) => ctx.taskManager!.update(id, patch),
+          appendMessage: (id, m, runId) => ctx.taskManager!.appendMessage(id, m, runId),
+          updateSummary: (id, s, runId) => ctx.taskManager!.updateSummary(id, s, runId),
+          update: (id, patch, runId) => ctx.taskManager!.update(id, patch, runId),
         }
       : undefined;
 
@@ -234,6 +215,7 @@ export const agentTool = defineTool({
     const runOne = async (t: string): Promise<string> => {
       const agentId = randomAgentId();
       const shouldRunAsync = !!args.background || !!agentDef.background;
+      const resolvedModelForDisplay = getAgentModel(agentDef.model, ctx.sessionModel, reqModel);
 
       let worktree: { root: string; branch: string; cleanup: () => void; hasChanges: () => boolean; hasUnpushedCommits: () => boolean } | undefined;
       // isolation: worktree 和 remote 都创建 git worktree(隔离的工作副本)。
@@ -245,9 +227,8 @@ export const agentTool = defineTool({
 
       const promptMessages: ChatMessage[] = fork ? [] : [{ role: "user", content: t }];
       const forkContextMessages = fork
-        ? buildForkContextMessages(ctx.forkMessages ?? [], `[fork 子任务:只做这件事并返回结论,不要改动主任务状态] ${t}`)
+        ? buildForkContextMessages(ctx.getForkMessages?.() ?? ctx.forkMessages ?? [], `[fork 子任务:只做这件事并返回结论,不要改动主任务状态] ${t}`)
         : undefined;
-      const resolvedModelForDisplay = reqModel ?? agentDef.model ?? "deepseek-v4-pro";
       const isBuiltInAgent = agentDef.source === "built-in";
 
       // ---- 异步(后台)路径 ----
@@ -255,7 +236,7 @@ export const agentTool = defineTool({
         if (!ctx.taskManager || !taskManagerAdapter) return "当前环境不支持后台子代理。";
         const bg = ctx.taskManager.registerAsyncAgent({ agentId, description: t.slice(0, 50) });
         void runAsyncAgentLifecycle({
-          taskId: bg.agentId,
+          taskId: bg.agentId, runId: bg.runId,
           agentId,
           agentType: agentDef.agentType,
           isBuiltInAgent,
@@ -265,14 +246,14 @@ export const agentTool = defineTool({
             agentDef, promptMessages, forkContextMessages, useExactTools: fork,
             isAsync: true, override: { abortController: bg.abortController, agentId },
             worktreePath: worktree?.root, model: reqModel, mode: reqMode, onCacheSafeParams,
-            messageParent: (m) => { ctx.taskManager!.emitFromTask(bg.agentId, m); },
+            messageParent: (m, kind) => { ctx.taskManager!.emitFromTask(bg.agentId, m, kind, bg.runId); },
           }),
           taskManager: taskManagerAdapter,
           classifyFn: ctx.handoffClassifyFn,
           permissionMode: ctx.permissionMode,
           abortSignal: bg.abortController.signal,
         });
-        return `已后台启动子代理${type ? `(类型 ${type})` : ""}(${bg.agentId});完成后会自动通知你结果。你可以先继续别的事或结束本轮。`;
+        return `已后台启动子代理${type ? `(类型 ${type})` : ""}(${bg.agentId});完成后会自动通知你结果。先做其他独立工作,无独立工作时单独调用 TaskWait 等待此 id。`;
       }
 
       // ---- 同步路径:前台就是前台,同步等到跑完,不会被任何计时器悄悄转后台 ----
@@ -308,7 +289,7 @@ export const agentTool = defineTool({
         const gen = runAgent({
           agentDef, promptMessages, forkContextMessages, useExactTools: fork,
           isAsync: false, override: { agentId, abortController }, worktreePath: worktree?.root, model: reqModel, mode: reqMode,
-          messageParent: (m) => { ctx.taskManager!.emitFromTask(fg.taskId, m); },
+          messageParent: (m, kind) => { ctx.taskManager!.emitFromTask(fg.taskId, m, kind); },
         });
         try {
           let converted = false;
@@ -320,6 +301,7 @@ export const agentTool = defineTool({
             if (outcome.kind === "convert") { converted = true; break; }
             if (outcome.r.done) break;
             messages.push(outcome.r.value);
+            ctx.taskManager.appendMessage(fg.taskId, outcome.r.value);
           }
           registry?.unregister(agentId);
 
@@ -338,7 +320,7 @@ export const agentTool = defineTool({
             const newAgentId = randomAgentId();
             const bg = ctx.taskManager.registerAsyncAgent({ agentId: newAgentId, description: t.slice(0, 50) });
             void runAsyncAgentLifecycle({
-              taskId: bg.agentId,
+              taskId: bg.agentId, runId: bg.runId,
               agentId: newAgentId,
               agentType: agentDef.agentType,
               isBuiltInAgent,
@@ -352,14 +334,14 @@ export const agentTool = defineTool({
                 agentDef, promptMessages: [], forkContextMessages: messages, useExactTools: fork,
                 isAsync: true, override: { abortController: bg.abortController, agentId: newAgentId },
                 worktreePath: worktree?.root, model: reqModel, mode: reqMode, onCacheSafeParams,
-                messageParent: (m) => { ctx.taskManager!.emitFromTask(bg.agentId, m); },
+                messageParent: (m, kind) => { ctx.taskManager!.emitFromTask(bg.agentId, m, kind, bg.runId); },
               }),
               taskManager: taskManagerAdapter,
               classifyFn: ctx.handoffClassifyFn,
               permissionMode: ctx.permissionMode,
               abortSignal: bg.abortController.signal,
             });
-            return `已转后台(${bg.agentId});完成后会自动通知你结果。你可以先继续别的事或结束本轮。`;
+            return `已转后台(${bg.agentId});完成后会自动通知你结果。先做其他独立工作,无独立工作时单独调用 TaskWait 等待此 id。`;
           }
 
           detachParentAbort?.(); // 正常跑完:摘掉父信号监听器,不留在父 signal 上等永远不会来的 abort

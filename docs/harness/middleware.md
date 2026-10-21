@@ -29,11 +29,13 @@ dao-code 里没有一个模块直接叫"middleware"。这个词借自 AHE 论文
 `runTurn()` 每个模型回合(`for t<maxTurns`)依次做:
 
 1. 判断是否需要"轮内主动压缩"(`shouldCompact()→compact()`,171-176 行)
-2. 消费三类回合边界追加(SendMessage / 异步挑战者 advisory / 后台任务结果,178-197 行)
+2. 在安全边界由 SessionScheduler 注入用户补充及后台事件,再追加 SendMessage / 异步挑战者 advisory 等上下文
 3. 调模型拿 assistant + tool_calls(199 行)
 4. 按 plan/normal 模式派发执行(218-251 行,内部即触发 hooks)
-5. 编辑后诊断回灌(254-260 行)
+5. TaskWait 先保存配对工具结果,返回 waiting 交给调度器;其他工具继续编辑后诊断回灌
 6. 反思层健康评估:`assessTurn()` 判定卡住/漂移,决定是否 fork `deps.reflect(challenger|refocuser)`(274-295 行)
+
+`runTurn` 返回 completed/waiting/interrupted/failed。waiting 不触发回合完成通知或回合末反思;失败由调度器暂停,子代理执行器将 failed 传递为失败结算。
 
 `compact` 是被动注入的依赖(反应式压缩在 `requestAssistant` 里 144-149 行捕获"上下文超限"异常重试);`reflect` 只在这里被"决策"是否调用,真正的模型侧 fork 逻辑在 `index.ts`。
 
@@ -71,3 +73,12 @@ dao-code 里没有一个模块直接叫"middleware"。这个词借自 AHE 论文
 ## 7. 可观测性旁路(`src/obs/`)
 
 `init.ts`/`backend.ts`/`attrs.ts`/`wrap.ts`,对 Laminar 一类后端做 span 包装:`wrapStreamChat`/`wrapRunTurn`/`wrapToolExec`(`obs/wrap.ts`)分别包一层 LLM 调用、回合、工具执行,记录 token/cache 命中等属性。和上述模块是"旁路观测"关系——不参与控制流决策,只在 loop/execute 外面套一层 span 记录,`isObsOn()` 关闭时零开销直接透传。
+
+
+## 持久执行与恢复边界
+
+`DurableStore` 是 V2 唯一权威存储：工具意图先于 handler 和工具钩子副作用，结果逐工具提交；assistant 的调用消息先保存，崩溃后用已知结果补齐配对，未知操作保留阻塞记录。子代理使用各自 runId 作为工具 scope，可靠检查点不依赖尽力写入的 JSONL。
+
+`recoverBackground` 在启动调度器前获取 owner、装载事件、核实 runner 收据/存活身份、标记进程内代理中断、修复工具配对。只有核实后的等待可以激活；恢复错误和持久化错误均暂停。`BackgroundDelivery` 与 ready TaskWait 的消费 ID 和消息检查点在同一事务中保存，重启不按“最大 seq”跳过尚未投递事件。
+
+Shell runner 的 `manifest.json`、启动许可、不可重复的 `start.claim`、`terminal.json` 和 stdout/stderr 位于会话 runs 目录。控制连接使用随机能力令牌与 ownerEpoch；取消先持久化，再由 runner 观察真实 close 确认。运行时不使用模型轮询或无界重连。

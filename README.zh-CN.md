@@ -79,7 +79,7 @@ Dao Code(命令 `dao`)是终端原生的 AI 编码助手:在你的终端里读�
 
 ### 🪢 长任务稳健
 
-会话日志 + 崩溃恢复(`dao -c`);**影子 git 检查点**(`/restore` `/rewind`,独立快照、不碰你的 `.git`);todo 穿越压缩防目标漂移;DoD 验收(`/dod` + `verify_done`);卡死检测止损;并行 / 后台 / worktree 隔离子代理 + 子↔父双向通信;`--goal` 长任务自主模式。
+会话日志 + 崩溃恢复(`dao -c`，支持后台 Shell 接回、离线结果导入、持久等待；`/recovery` 核实未知结果);**影子 git 检查点**(`/restore` `/rewind`,独立快照、不碰你的 `.git`);todo 穿越压缩防目标漂移;DoD 验收(`/dod` + `verify_done`);卡死检测止损;并行 / 后台 / worktree 隔离子代理 + 子↔父双向通信;`--goal` 长任务自主模式。
 
 ### 🎐 道家美学的终端体验
 
@@ -167,6 +167,8 @@ dao
 - 行内编辑:`←/→` 移光标、`Ctrl-A/E` 行首尾、`Ctrl-W` 删词、`Backspace/Delete` 按光标删;支持粘贴(不自动提交)。
 - `@` 引用文件:输入 `@` + 路径片段,列出匹配文件,`Tab` 补全。
 - 写/执行类操作经审批门(`[y]本次 [a]记住(写 allow 规则) [n]拒绝`);也可在 `.dao/settings.json` 用 allow/ask/deny 规则预先放行或拦截(见「扩展系统 · 权限控制」);`/yolo` 或 `--yolo` 全自动批准(deny 仍拦)。
+
+运行中按 **Ctrl+T** 查看子 agent 执行情况:状态、耗时、工具调用次数和最近输出(每秒读取本地记录,不请求模型)。`↑/↓` 切换任务,`PgUp/PgDn` 翻看历史,`Esc` 或 `Ctrl+T` 关闭面板且不打断任务。已完成和失败的任务也保留在列表中。需要更大预算时可运行 `DAO_SUBAGENT_MAX_TURNS=800 dao`;单个 agent 定义中的 `maxTurns` 优先于该变量。
 
 **一次性模式**(把任务作为参数,跑完即退,不蒸馏记忆,适合脚本):
 
@@ -301,7 +303,9 @@ EVAL_RUNS=1 node evals/run.mjs # 冒烟
 | `DEEPSEEK_MODEL` | 默认模型(已弃用) | `deepseek-v4-pro` |
 | `DAO_THEME` | `light` / `dark` 强制终端背景 | 据 `COLORFGBG` / OSC 11 探测,否则 `dark` |
 | `DAO_REASONING_EFFORT` | 思考强度 | `max` |
-| `DAO_MAX_TURNS` | 单回合最大工具轮数 | `50` |
+| `DAO_MAX_TURNS` | 主会话单回合最大模型轮数 | 不限 |
+| `DAO_SUBAGENT_MAX_TURNS` | 子 agent 最大模型轮数(正整数;调用级覆盖 > agent 定义 `maxTurns` > 此变量) | `500` |
+| `DAO_EXPLORE_MODEL` | 探查子代理模型;填写网关支持的完整模型 ID，不配置则跟随当前主模型 | `inherit` |
 | `DAO_AUTO_APPROVE` | 跳过所有审批(**仅限沙箱/eval**) | 关 |
 | `DAO_REFOCUS_EVERY` | 纠偏者:长任务每 N 轮复核方向(`0`=关;仅 `--goal` 长任务生效) | `3` |
 | `DAO_FAIL_STREAK` | 挑战者:连续失败达此轮数 → 审视进展(交互式生效) | `3` |

@@ -166,12 +166,15 @@ describe("supportsVision", () => {
 });
 
 describe("contextWindowFor", () => {
-  it("GLM 系列官方渠道一律 1M(zhipu/volcengine/qianfan 及无渠道信息调用)", () => {
-    expect(contextWindowFor("glm-5.2")).toBe(1_000_000);
+  it("仅 glm-5.2 为 200K,忽略大小写且不区分渠道", () => {
+    expect(contextWindowFor("glm-5.2")).toBe(200_000);
+    expect(contextWindowFor("GLM-5.2")).toBe(200_000);
+    expect(contextWindowFor("glm-5.2", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(200_000);
+    expect(contextWindowFor("glm-5.2", "qianfan", DEFAULTS.qianfan.baseUrl)).toBe(200_000);
     expect(contextWindowFor("GLM-5.3-Flash")).toBe(1_000_000);
     expect(contextWindowFor("glm-5.3-flash")).toBe(1_000_000);
     expect(contextWindowFor("glm-5.3")).toBe(1_000_000);
-    expect(contextWindowFor("glm-5.2", "volcengine", DEFAULTS.volcengine.baseUrl)).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.2", "volcengine", DEFAULTS.volcengine.baseUrl)).toBe(200_000);
     expect(contextWindowFor("glm-5.1", "qianfan", DEFAULTS.qianfan.baseUrl)).toBe(1_000_000);
   });
   it("GLM 系列按渠道区分:zhipu 官方 coding plan 按官方文档一律 1M", () => {
@@ -179,10 +182,10 @@ describe("contextWindowFor", () => {
     expect(contextWindowFor("glm-5.3-flash", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(1_000_000);
     expect(contextWindowFor("GLM-5.3-Flash", "zhipu", DEFAULTS.zhipu.baseUrl)).toBe(1_000_000);
   });
-  it("GLM 系列在自定义网关(provider 记 deepseek、baseUrl 非官方)上保守 200K", () => {
-    expect(contextWindowFor("glm-5.3", "deepseek", "http://llm-gw.jd.local/v1")).toBe(200_000);
-    expect(contextWindowFor("GLM-5.3-joybuilder", "deepseek", "http://llm-gw.jd.local/v1")).toBe(200_000);
-    expect(contextWindowFor("glm-5.3-flash", "deepseek", "https://gw.example.com/v1")).toBe(200_000);
+  it("自定义网关同样仅 glm-5.2 为 200K,GLM-5.3-joybuilder 为 1M", () => {
+    expect(contextWindowFor("glm-5.3", "deepseek", "http://llm-gw.jd.local/v1")).toBe(1_000_000);
+    expect(contextWindowFor("GLM-5.3-joybuilder", "deepseek", "http://llm-gw.jd.local/v1")).toBe(1_000_000);
+    expect(contextWindowFor("glm-5.3-flash", "deepseek", "https://gw.example.com/v1")).toBe(1_000_000);
     expect(contextWindowFor("glm-5.2", "deepseek", "https://gw.example.com/v1")).toBe(200_000);
   });
   it("deepseek 官方 baseUrl 不触发网关保守值(GLM 系列按 1M)", () => {

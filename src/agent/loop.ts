@@ -1,3 +1,6 @@
+import { WaitControl, type BackgroundRuntime } from "./background_runtime.js";
+import { repairToolPairs } from "../session/recovery.js";
+import type { TurnOutcome } from "./background_types.js";
 import type {
   AssistantMessage,
   ChatMessage,
@@ -141,11 +144,36 @@ export interface TurnDeps {
   // persist()),回合中途崩溃(如触发了某个未预料的 API 错误)会连带丢掉这一整个回合里此前
   // 已经成功的所有工具调用——哪怕只有最后一步真正出了问题。省略=不额外存档(子代理/一次性
   // 运行没有独立会话文件,不需要这层)。
-  onCheckpoint?: () => void;
+  onCheckpoint?: () => void | Promise<void>;
+  backgroundRuntime?: BackgroundRuntime;
+  onBoundary?: () => Promise<void>;
 }
 
 // 在已有的 session.messages 上跑一个用户回合,直到模型不再请求工具。
-export async function runTurn(deps: TurnDeps): Promise<void> {
+export async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
+  const control = deps.backgroundRuntime && !deps.background ? new WaitControl(deps.backgroundRuntime) : undefined;
+  try { return await runTurnInner(deps, control); }
+  catch (error) {
+    control?.rollback();
+    if (deps.ctx.durableStore) {
+      const scope = deps.ctx.toolScope ?? "root";
+      try {
+        deps.session.messages = repairToolPairs(deps.session.messages, deps.ctx.durableStore, scope);
+      } catch {
+        deps.session.messages = repairToolPairs(deps.session.messages);
+      }
+      // Only this turn has stopped; background agents may still be executing tools.
+      try { deps.ctx.durableStore.markInterruptedTools(scope); } catch { /* retain the original failure */ }
+      try { await deps.onCheckpoint?.(); } catch { /* keep repaired history in memory if storage is unavailable */ }
+    }
+    return deps.signal?.aborted
+      ? { kind: "interrupted", reason: "user" }
+      : { kind: "failed", error: error instanceof Error ? error : new Error(String(error)) };
+  }
+  finally { control?.rollback(); }
+}
+
+async function runTurnInner(deps: TurnDeps, control?: WaitControl): Promise<TurnOutcome> {
   const { session, signal } = deps;
   const events = deps.events ?? plainEvents(deps.write);
   // 工具 ctx:直接在调用方长期持有的 deps.ctx 上原地补 signal + 当前模型名,不再 spread 出一份
@@ -154,7 +182,10 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
   // 消息、index.ts 再次调用 runTurn 时又会从没被污染过的原始 ctx 重新开始,worktree 状态悄悄
   // 消失。signal 每回合都要按当前值覆盖(没有就删掉),否则上一回合的旧 signal(已经不会再被
   // abort,但语义上已经过期)会残留到下一回合,被 Bash/fetch 等工具误当成"这一回合也可能被取消"。
-  const toolCtx = deps.ctx;
+  const toolCtx = control ? new Proxy(deps.ctx, {
+    get: (target, key) => key === "requestTaskWait" ? (request: import("./background_types.js").WaitRequest) => control.request(request) : key === "rollbackTaskWait" ? () => control.rollback() : Reflect.get(target, key),
+    set: (target, key, value) => Reflect.set(target, key, value),
+  }) : deps.ctx;
   toolCtx.sessionModel = session.model;
   if (signal) toolCtx.signal = signal;
   else delete toolCtx.signal;
@@ -178,14 +209,9 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
   // (真实 trace 里模型面对"该动手了"的压力时也调用过 Skill(make-plan) 这类元工具,
   // 但那发生在撞上限、触发强制重试之前,不是对强制约束本身的观测规避)。
   const PROGRESS_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "Bash"]);
-  // 轮询类工具(查后台进度,本身不产出/不改动任何东西)默认不算"推进"——防的是模型靠反复
-  // 调用这类空转工具把"卡住"计数器刷零(同 TodoWrite 那个漏洞同源)。但如果此刻真的还有
-  // 后台进程/子代理在跑,且这一轮【只】调用了轮询类工具,这就是系统提示词教的正确动作
-  // (做完别的事后回来 BashOutput/TaskOutput 做 checkpoint 式检查),不该被判成"卡住"——
-  // 真实撞见:regex-chess 起了后台自对弈验证脚本后连续 29 次被"进度提醒"催,期间全部是
-  // 合规的 checkpoint 轮询,3600 秒预算被这套"轮询不算进度"和"没有阻塞等待原语"的组合
-  // 实打实吃掉一大块,最终撞上硬超时。
-  const POLL_TOOLS = new Set(["BashOutput", "TaskOutput", "TaskGet"]);
+  // 单次后台进度检查允许;连续纯查询则交还控制给通知驱动的 UI/REPL,避免模型空转。
+  const POLL_TOOLS = new Set(["BashOutput", "TaskOutput", "TaskGet", "TaskList"]);
+
   // 预算耗尽后那一次强制重试里,允许模型选的工具。此刻的状态按定义就是"整个输出预算烧在推理上
   // 却没动手",缺的不是信息是动作;Bash 在功能上已经涵盖读文件/搜索(cat/grep/ls),所以排除
   // Read/Grep/Glob 并不剥夺查看能力,只是要求这个动作走一条同时也能产出东西的通道。
@@ -254,6 +280,7 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
         tail: cheapHash(tailRaw),
       });
       try {
+        deps.backgroundRuntime?.modelRequested();
         const gen = deps.streamChat({
           baseUrl: deps.config.baseUrl,
           apiKey: deps.config.apiKey,
@@ -388,12 +415,12 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
   let budgetWarned = false;
   let emptyTruncation = false; // 本次 requestAssistant 是否命中"reasoning 耗尽预算、content 全程为空"
   for (let t = 0; t < maxTurns; t++) {
-    if (signal?.aborted) return; // 上一轮工具执行后被取消,直接收尾
+    if (signal?.aborted) return { kind: "interrupted", reason: "user" }; // 上一轮工具执行后被取消,直接收尾
     // P3-17 预算【可选提醒】:设了 budgetCNY 且累计成本超过它 → 提醒一次(不停);
     // 仅当显式 DAO_MAX_BUDGET_HARD=1 才硬停。默认不拦,把决定权留给用户。
     if (session.overBudget()) {
       if (!budgetWarned) { budgetWarned = true; events.notice(`\n[成本提醒] 本会话累计约 ¥${session.costCNY().toFixed(2)},已超阈值 ¥${session.budgetCNY}。\n`); }
-      if (process.env.DAO_MAX_BUDGET_HARD === "1") { events.notice(`[已达硬预算上限,停止]\n`); return; }
+      if (process.env.DAO_MAX_BUDGET_HARD === "1") { events.notice(`[已达硬预算上限,停止]\n`); return { kind: "failed", error: new Error("已达硬预算上限") }; }
     }
     // §4 轮内主动压缩:长回合中途逼近上限 → 先压再进下一轮(粒度到工具轮,不等回合末)。
     // t>0:首轮的入口大小已由回合间压缩兜过,只处理本回合内增长。
@@ -403,6 +430,8 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
     }
     // SendMessage/运行中排队输入:回合边界消费追加的指令(注入为 user 消息)。userMessage 事件让渲染层
     // 在真正注入的这一刻(而不是用户敲回车排队的那一刻)才展示,时间点对得上模型实际看到它的时机。
+    await deps.onBoundary?.();
+    if (signal?.aborted) return { kind: "interrupted", reason: "user" };
     if (deps.drainPending) {
       for (const m of deps.drainPending()) {
         session.messages.push({ role: "user", content: `[追加指令] ${m}` });
@@ -457,7 +486,7 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
       // 返回空),白等一轮往返,还甩出两条"模型空响应/连续两次空响应"的误导性提示——这里直接
       // 收尾。注意:只在真空手时提前退出;若这一轮已经有 content/tool_calls(答完/工具调用后
       // 才 abort),必须继续走下面的正常入库 + 补齐取消态 tool 结果流程,不能跳过。
-      if (signal?.aborted && toolCalls.length === 0 && !hasContent) return;
+      if (signal?.aborted && toolCalls.length === 0 && !hasContent) return { kind: "interrupted", reason: "user" };
       // 空内容且无工具调用的回合(只有 reasoning、或被打断)不能直接入库——否则下一轮
       // DeepSeek 会 400「content or tool_calls must be set」直接崩会话。但也不能悄悄当成
       // "模型主动决定收尾了"就地结束:蒸馏过 iteration 4 两道题(large-scale-text-editing、
@@ -474,6 +503,7 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
         let emptyRetries = 0;
         let wasEmptyTruncation = emptyTruncation;
         while (toolCalls.length === 0 && !hasContent && emptyRetries < MAX_EMPTY_RETRIES) {
+          if (signal?.aborted) return { kind: "interrupted", reason: "user" };
           if (wasEmptyTruncation) {
             events.notice("\n[思考耗尽输出预算,提示收敛后重试…]\n");
             session.messages.push({
@@ -572,7 +602,7 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
           events.notice(wasEmptyTruncation
             ? "\n[强制工具调用+加大预算后仍是空响应,结束本轮]\n"
             : `\n[连续 ${emptyRetries + 1} 次空响应,结束本轮]\n`);
-          return;
+          return { kind: "failed", error: new Error("模型持续空响应") };
         }
       }
     } catch (e) {
@@ -591,14 +621,16 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
           : "[模型请求持续失败(疑似过载/超时/网络问题),重试一次仍未恢复。本次运行到此结束,已保留的上下文和任务清单不受影响。]";
         session.messages.push({ role: "assistant", content: note });
         events.notice(`\n${note}\n`);
-        return;
+        return { kind: "failed", error: e };
       }
       throw e;
     }
     // 执行仍用原始 assistant/toolCalls(dispatch 报错信息不受影响);落库换成清洗过的版本。
     session.messages.push(sanitizeForHistory(assistant));
+    if (deps.ctx.durableStore && toolCalls.length) await deps.onCheckpoint?.();
     if (toolCalls.length === 0) {
-      return; // 纯文本回合(含被打断只剩 content):直接结束
+      await deps.onCheckpoint?.();
+      return signal?.aborted ? { kind: "interrupted", reason: "user" } : { kind: "completed" }; // 纯文本回合(含被打断只剩 content):直接结束
     }
     // 取消发生在记录 assistant(tool_calls) 之后、执行之前(模型已答完、用户随即 ESC):
     // 必须为每个 tool_call 补一条 tool 结果,否则下一轮历史里 assistant(tool_calls) 悬空,
@@ -607,7 +639,8 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
       session.messages.push(
         ...toolCalls.map((tc): ToolMessage => ({ role: "tool", tool_call_id: tc.id, content: "[已取消] 用户中断本回合,未执行该工具。" })),
       );
-      return;
+      await deps.onCheckpoint?.();
+      return { kind: "interrupted", reason: "user" };
     }
 
     let turnToolMessages: ToolMessage[] = []; // 本轮工具结果(供反思层算失败信号)
@@ -644,6 +677,24 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
       }
       turnToolMessages = toolMessages;
       session.messages.push(...toolMessages);
+    }
+
+    if (control?.pending) {
+      const ok = toolCalls.length === 1 && toolCalls[0]!.function.name === "TaskWait" && turnToolMessages.length === 1;
+      if (!ok || signal?.aborted) control.rollback();
+      else {
+        if (!deps.onCheckpoint) throw new Error("TaskWait 需要会话保存接口。");
+        try { await deps.onCheckpoint(); }
+        catch (error) {
+          // The tool result has not reached the model. Preserve pairing, but do not
+          // present unsaved ready data twice when the inbox is retried later.
+          turnToolMessages[0]!.content = "Error: 等待状态保存失败,未激活等待;后台结果仍待投递。";
+          throw error;
+        }
+        if (signal?.aborted) { control.rollback(); return { kind: "interrupted", reason: "user" }; }
+        const wait = control.commit();
+        if (wait) return { kind: "waiting", wait };
+      }
     }
 
     // auto 模式分类器熔断跳闸:此前是静默降级到全人工审批、30 分钟后静默恢复,用户完全
@@ -739,7 +790,8 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
     // 每个工具轮落一次盘:即便下一轮请求异常上抛(如触发了未预料的 API 错误)导致整个回合
     // 没能跑完,这一轮及之前已经成功的工具调用也不会连带作废——回合末的 persist() 只是
     // 再确认一次最终状态,不是唯一一次存档。
-    deps.onCheckpoint?.();
+    await deps.onCheckpoint?.();
   }
   events.notice("\n[已达最大轮数,停止]\n");
+  return { kind: "failed", error: new Error("已达最大轮数") };
 }

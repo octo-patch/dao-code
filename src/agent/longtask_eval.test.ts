@@ -63,11 +63,11 @@ describe("长任务韧性 eval", () => {
     expect(s.messages.at(-1)!.role).toBe("assistant"); // 收尾消息,不是裸异常
   });
 
-  it("致命错误不被吞:400 bad request 直接上抛(不重试)", async () => {
+  it("致命错误不被吞:400 bad request 返回 failed(不重试)", async () => {
     let calls = 0;
     const streamChat = () => { calls++; return boom("DeepSeek API error 400: bad request"); };
     const s = new Session("SYS", "pro"); s.addUser("go");
-    await expect(runTurn(deps(s, { streamChat }))).rejects.toThrow(/400/);
+    await expect(runTurn(deps(s, { streamChat }))).resolves.toMatchObject({ kind: "failed", error: expect.objectContaining({ message: expect.stringContaining("400") }) });
     expect(calls).toBe(1); // 致命:不在 loop 层重试
   });
 

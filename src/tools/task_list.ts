@@ -3,6 +3,9 @@ import { defineTool } from "./types.js";
 import type { BgTask } from "../agent/tasks.js";
 
 const ICON: Record<BgTask["status"], string> = {
+  interrupted: "已中断",
+  unknown: "待核实",
+  canceling: "取消中",
   running: "▶",
   completed: "☑",
   failed: "✗",

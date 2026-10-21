@@ -29,15 +29,16 @@ describe("TaskManager", () => {
     expect(notes[0]).toContain("炸了");
   });
 
-  it("cancel 中止运行中的任务,不再入队完成通知", async () => {
+  it("cancel 请求后等待执行器确认,只入队 canceled", async () => {
     const tm = createTaskManager();
     const id = tm.launch("长任务", (signal) => new Promise((_res, rej) => {
       signal.addEventListener("abort", () => rej(new Error("aborted")));
     }));
     expect(tm.cancel(id)).toBe(true);
-    expect(tm.get(id)?.status).toBe("canceled");
+    expect(tm.get(id)?.status).toBe("canceling");
     await tick();
-    expect(tm.hasPending()).toBe(false); // 取消的不入完成/失败通知
+    expect(tm.get(id)?.status).toBe("canceled");
+    expect(tm.drainNotifications()).toEqual([expect.stringContaining("canceled")]);
   });
 
   it("adopt 接管已运行 promise → 完成入队通知", async () => {
@@ -135,14 +136,14 @@ describe("create/update:手动任务(不背靠 promise)", () => {
     expect(tm.get(id)?.status).toBe("running");
   });
 
-  it("update 改 status→completed:入队通知,和 launch/adopt 一致", () => {
+  it("手动待办完成仅改状态,不产生后台完成通知", () => {
     const tm = createTaskManager();
     const id = tm.create("手动任务");
     expect(tm.update(id, { status: "completed", result: "手动填的结论" })).toBe(true);
     expect(tm.get(id)?.status).toBe("completed");
     const notes = tm.drainNotifications();
-    expect(notes[0]).toContain("手动填的结论");
-    expect(notes[0]).toContain("completed");
+    expect(notes).toEqual([]);
+    expect(tm.get(id)?.result).toBe("手动填的结论");
   });
 
   it("已结束的任务不可再 update status(防重复结算)", () => {
@@ -172,7 +173,7 @@ describe("create/update:手动任务(不背靠 promise)", () => {
     tm.launch("子代理任务", async () => "done");
     expect(tm.running()).toHaveLength(3);
     tm.cancelAll();
-    expect(tm.running()).toHaveLength(0);
+    expect(tm.running().every((t) => t.status === "canceling")).toBe(true);
     // create 建的任务也被 cancel,不是永远挂着 running
     for (const t of tm.all()) expect(t.status).not.toBe("running");
   });
@@ -221,6 +222,8 @@ describe("registerAgentForeground:taskId 与 agentId 统一,cancel 真实生效"
     const { taskId, abortController } = tm.registerAgentForeground({ agentId: "agent-xyz123", description: "跑一个" });
     expect(tm.cancel(taskId)).toBe(true);
     expect(abortController.signal.aborted).toBe(true);
+    expect(tm.get(taskId)?.status).toBe("canceling");
+    tm.settle(taskId);
     expect(tm.get(taskId)?.status).toBe("canceled");
   });
 

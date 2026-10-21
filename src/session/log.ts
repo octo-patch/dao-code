@@ -1,4 +1,5 @@
-import { appendFileSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync, realpathSync } from "node:fs";
+import { DurableStore, readDurableState, type BackgroundCheckpoint } from "./durable_store.js";
+import { renameSync, appendFileSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 // 规范化路径(解符号链接,如 macOS /var→/private/var),失败则原样返回,用于 cwd 比较。
@@ -25,6 +26,7 @@ export type SessionEvent =
   | { t: "turn_end" };
 
 export interface PersistedState {
+  storageVersion?: 2;
   id: string;
   cwd: string;
   model: string;
@@ -34,6 +36,7 @@ export interface PersistedState {
   usage: { promptTokens: number; completionTokens: number; cacheHitTokens: number; cacheMissTokens: number };
   updatedAt: number;
   done: boolean;
+  backgroundWait?: boolean;
 }
 
 // P3-29 Lite-Log:轻量元信息(不含 messages),供 /resume 秒列与可恢复扫描,不必解析整份 state.json。
@@ -65,6 +68,9 @@ export interface SessionStore {
   append(e: SessionEvent): void;
   saveState(s: Omit<PersistedState, "id" | "updatedAt" | "done">): void;
   markDone(): void;
+  durable?: DurableStore;
+  bindBackground?(get: () => BackgroundCheckpoint): void;
+  close?(): void;
 }
 
 function genId(): string {
@@ -74,21 +80,28 @@ function genId(): string {
   return `${stamp}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-export function createSessionStore(baseDir: string, id?: string): SessionStore {
+export function createSessionStore(baseDir: string, id?: string, options?: { cwd: string; durable: true }): SessionStore {
   const sid = id ?? genId();
   const dir = path.join(baseDir, sid);
   try { mkdirSync(dir, { recursive: true }); } catch {}
+  const durable = options ? new DurableStore(dir,sid,options.cwd) : undefined;
+  let background: (() => BackgroundCheckpoint) | undefined;
   const eventsPath = path.join(dir, "events.jsonl");
   const statePath = path.join(dir, "state.json");
   const metaPath = path.join(dir, "meta.json");
-  let last: PersistedState | null = null;
+  let last: PersistedState | null = durable?.state() ?? null;
   const flush = () => {
     if (!last) return;
-    try { writeFileSync(statePath, JSON.stringify(last)); } catch {}
+    durable?.save(last,background?.());
+    // V2 exports are history only: old binaries must not auto-resume live V2 work.
+    try {
+      writeFileSync(statePath + ".tmp", JSON.stringify(durable ? {...last,done:true,formatVersion:2} : last));
+      renameSync(statePath + ".tmp", statePath);
+    } catch(error) { if(!durable)throw error; }
     // 同步写轻量 meta(秒列用):只含元信息,不含 messages。
     try {
       const meta: SessionMeta = {
-        id: last.id, cwd: last.cwd, title: last.title, updatedAt: last.updatedAt, done: last.done,
+        id: last.id, cwd: last.cwd, title: last.title, updatedAt: last.updatedAt, done: durable ? true : last.done,
         messageCount: last.messages.length,
         userMessageCount: last.messages.filter((m) => m.role === "user").length,
         summary: firstUserExcerpt(last.messages),
@@ -98,21 +111,28 @@ export function createSessionStore(baseDir: string, id?: string): SessionStore {
   };
   return {
     id: sid,
-    dir,
+    dir, durable,
+    bindBackground(get) { background=get; },
+    close() { durable?.close(); },
     append(e) {
       try { appendFileSync(eventsPath, JSON.stringify({ ...e, ts: Date.now() }) + "\n"); } catch {}
     },
     saveState(s) {
-      last = { id: sid, updatedAt: Date.now(), done: false, ...s };
+      last = { id: sid, updatedAt: Date.now(), done: false, ...s, ...(durable ? {storageVersion:2 as const} : {}) };
       flush();
     },
     markDone() {
-      if (last) { last = { ...last, done: true, updatedAt: Date.now() }; flush(); }
+      if (last) {
+        const b=background?.();
+        const pending=b && (b.wait || b.events.length || [...new Map(b.runs.map(r=>[r.taskId,r])).values()].some(r=>["running","canceling","unknown","interrupted"].includes(r.status)) || b.state === "paused");
+        last = { ...last, done: !pending, updatedAt: Date.now() }; flush();
+      }
     },
   };
 }
 
 export function loadState(baseDir: string, id: string): PersistedState | null {
+  if(existsSync(path.join(baseDir,id,"session.db"))) return readDurableState(path.join(baseDir,id)) ?? null;
   try {
     return JSON.parse(readFileSync(path.join(baseDir, id, "state.json"), "utf8")) as PersistedState;
   } catch {
@@ -155,6 +175,10 @@ export function logEvents(inner: TurnEvents, store: SessionStore): TurnEvents {
 
 // 轻量读取会话元信息(秒列用)。优先 meta.json;旧会话无 meta 时回退从 state.json 派生(兼容)。
 export function loadMeta(baseDir: string, id: string): SessionMeta | null {
+  if(existsSync(path.join(baseDir,id,"session.db"))) {
+    const st=loadState(baseDir,id);
+    return st ? {id:st.id,cwd:st.cwd,title:st.title,updatedAt:st.updatedAt,done:st.done,messageCount:st.messages.length,userMessageCount:st.messages.filter(m=>m.role==="user").length,summary:firstUserExcerpt(st.messages)} : null;
+  }
   try {
     return JSON.parse(readFileSync(path.join(baseDir, id, "meta.json"), "utf8")) as SessionMeta;
   } catch {

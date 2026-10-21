@@ -1,4 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
+import { AgentTasksPanel } from "./AgentTasksPanel.js";
+import { commandNeedsPause } from "../../commands/scheduling.js";
 import { Box, Text, Static, useApp, useInput, usePaste, useStdout } from "ink";
 import { highlight } from "cli-highlight";
 import { promises as fs } from "node:fs";
@@ -212,6 +214,7 @@ export function App(deps: AppDeps) {
     setApproval({ requests: next.requests, resolve: next.resolve });
     const first = next.requests[0];
     if (first) {
+      deps.tabAttention?.mark();
       const suffix = next.requests.length > 1 ? `等${next.requests.length}项` : "";
       deps.notify?.("dao", `待确认:${first.toolName}${suffix}`);
     }
@@ -306,6 +309,8 @@ export function App(deps: AppDeps) {
   const busyRef = useRef(false);
   useEffect(() => { busyRef.current = busy; }, [busy]);
   const [taskTick, setTaskTick] = useState(0); // 后台任务状态变化计数(驱动通知处理/计数刷新)
+  const [agentTasksOpen, setAgentTasksOpen] = useState(false);
+  const [schedulerStatus, setSchedulerStatus] = useState(deps.scheduler?.status());
   const [bgRunning, setBgRunning] = useState(0);
   const [bgShells, setBgShells] = useState(0);
   const [queued, setQueued] = useState<string[]>([]); // 运行中排队的用户输入(steering)
@@ -352,6 +357,7 @@ export function App(deps: AppDeps) {
     const askUser = (question: string) =>
       new Promise<string>((resolve) => {
         setAsk({ question, resolve });
+        deps.tabAttention?.mark();
         deps.notify?.("dao", `待回答:${question.slice(0, 60)}`);
       });
     const askChoice = (question: string, options: string[], multi?: boolean) =>
@@ -369,6 +375,7 @@ export function App(deps: AppDeps) {
         const cleaned = options.filter((o) => !reserved.has(norm(o)));
         setChoice({ question, options: cleaned, multi: !!multi, resolve });
         setChoiceIdx(0); setChoiceChecked(new Set()); setChoiceWarn(false);
+        deps.tabAttention?.mark();
         deps.notify?.("dao", `待选择:${question.slice(0, 60)}`);
       });
     deps.register({ approvalPrompt, askUser, askChoice });
@@ -465,6 +472,11 @@ export function App(deps: AppDeps) {
     // 内容直接落到下面当普通文本发送,让模型看到原文自己判断,而不是被命令分发拦在半路报错。
     const looksLikeSlashCommand = /^\/[^\s/]+(\s|$)/.test(text);
     if (typeof full === "string" && looksLikeSlashCommand) {
+      // Only commands that may mutate execution/history need to stop the turn.
+      if (commandNeedsPause(full)) {
+        deps.scheduler?.pause();
+        await deps.scheduler?.settled();
+      }
       const name = text.slice(1).split(/\s+/)[0];
       if (name === "theme") {
         const next = bg === "dark" ? "light" : "dark";
@@ -502,7 +514,14 @@ export function App(deps: AppDeps) {
         const ms = Number(m[1]) * (m[2] === "h" ? 3600000 : m[2] === "m" ? 60000 : 1000);
         if (loopRef.current) clearInterval(loopRef.current.timer);
         // 到点把 prompt 排队(去重:同一 prompt 未消费完不重复排),空闲时自动跑。
-        const timer = setInterval(() => setQueued((q) => (q.includes(loopPrompt) ? q : [...q, loopPrompt])), ms);
+        const timer = setInterval(() => {
+          if (deps.scheduler) {
+            if (!deps.scheduler.hasQueued(loopPrompt)) {
+              deps.scheduler.submit(loopPrompt);
+              pushItem({ id: nextId(), kind: "user", text: pastePreview(loopPrompt) });
+            }
+          } else setQueued((q) => (q.includes(loopPrompt) ? q : [...q, loopPrompt]));
+        }, ms);
         loopRef.current = { prompt: loopPrompt, timer };
         pushItem({ id: nextId(), kind: "notice", text: t("ui.loop.started", arg, loopPrompt.slice(0, 40)) });
         return;
@@ -525,7 +544,8 @@ export function App(deps: AppDeps) {
       if (name === "skills" && !text.trim().split(/\s+/)[1] && deps.listSkills) { openSkillPicker(); return; }
       // /model 无参 → 弹模型选择器(当前 provider 下可选模型);带参(如 /model deepseek-v4-flash)落到 runCommand 文本路径。
       if (name === "model" && !text.trim().split(/\s+/)[1] && deps.listModels) { openModelPicker(); return; }
-      const res = deps.runCommand(full);
+      let res: Awaited<ReturnType<typeof deps.runCommand>>;
+      try {res=await deps.runCommand(full);}catch(error){pushItem({id:nextId(),kind:"notice",text:String(error)});return;}
       if (res.exit) { exit(); return; }
       if (res.compact) {
         const compactingId = nextId();
@@ -610,6 +630,8 @@ export function App(deps: AppDeps) {
 
   // 跑一个回合(用户输入 / 后台任务通知共用):管理 busy/live/中断/出错。
   async function runAgentTurn(text: string | ContentPart[]) {
+    deps.tabAttention?.clear();
+    if (deps.scheduler) { deps.scheduler.submit(text); await deps.scheduler.settled(); return; }
     setBusy(true);
     setStartedAt(Date.now());
     wordBaseRef.current = Math.floor(Math.random() * DAO_VERBS.length); // 每回合换一个道家动词起点
@@ -619,6 +641,7 @@ export function App(deps: AppDeps) {
     controllerRef.current = controller;
     try {
       await deps.submit(text, { events: makeEvents(), signal: controller.signal });
+      if (!controller.signal.aborted) deps.tabAttention?.mark();
     } catch (e) {
       pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.error", (e as Error).message) });
     } finally {
@@ -632,7 +655,7 @@ export function App(deps: AppDeps) {
   // 后台任务完成 → 空闲时把 <task-notification> 作为新回合自动喂给模型继续处理。
   const procRef = useRef(false);
   async function processNotifications() {
-    if (procRef.current || busyRef.current) return;
+    if (deps.scheduler || procRef.current || busyRef.current) return;
     // 正常情况下排队输入在上一个回合的下一个工具轮边界就被 drainPending 消费掉了(见 runAgentTurn
     // 里 events.userMessage),这里是兜底:极窄的竞态窗口(模型刚给出最终答案、回合已经收尾,
     // 但用户在这之间敲了回车)会让输入漏在队列里没被那个已经结束的回合消费——直接从真实队列
@@ -665,7 +688,29 @@ export function App(deps: AppDeps) {
 
   // 订阅后台任务变化:bump taskTick(驱动下面的 effect)。
   useEffect(() => {
-    deps.subscribeTasks?.(() => setTaskTick((t) => t + 1));
+    return deps.subscribeTasks?.(() => setTaskTick((t) => t + 1));
+  }, []);
+  useEffect(() => {
+    deps.bindEvents?.(makeEvents());
+    let wasRunning = false;
+    return deps.scheduler?.subscribe((status) => {
+      setSchedulerStatus(status);
+      const running = status.state === "running";
+      busyRef.current = running;
+      setBusy(running);
+      if (running && !wasRunning) {
+        deps.tabAttention?.clear();
+        setStartedAt(Date.now());
+        reasoningRef.current = "";
+        setLive({ reasoning: "", content: "", tools: [], toolCount: 0, lastActivity: "" });
+      } else if (!running) {
+        setLive(null);
+        setStatus(deps.getStatus());
+        // 等后台任务时只是让出回合,尚未完成;暂停/中断也不能报完成。
+        if (wasRunning && status.state === "idle") deps.tabAttention?.mark();
+      }
+      wasRunning = running;
+    });
   }, []);
   // 任务变化或回合结束时:刷新运行计数;空闲则处理待注入的通知(自动续跑)。
   useEffect(() => {
@@ -677,15 +722,17 @@ export function App(deps: AppDeps) {
 
   // 后台 shell 存在时定期轮询(进程退出不触发 taskTick,需主动刷新计数)。
   useEffect(() => {
-    if (bgShells === 0) return;
+    if (deps.scheduler || bgShells === 0) return;
     const t = setInterval(() => setBgShells(deps.runningShells?.() ?? 0), 2000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bgShells]);
 
   // 选中会话 → 委派 /resume <id>(载入逻辑在 index),并应用其结果(重置 transcript + 提示)。
-  const loadResume = (id: string) => {
-    const res = deps.runCommand("/resume " + id);
+  const loadResume = async (id: string) => {
+    try {
+    deps.scheduler?.pause(); await deps.scheduler?.settled();
+    const res = await deps.runCommand("/resume " + id);
     if (res.clearTranscript) {
       setItems(welcomeCommitted.current ? [{ id: 0, kind: "welcome" }] : []);
       setStaticKey((k) => k + 1);
@@ -694,6 +741,7 @@ export function App(deps: AppDeps) {
     if (res.resumeItems?.length) for (const it of res.resumeItems) pushItem({ ...it, id: nextId() }); // 重放末段对话
     if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
     setStatus(deps.getStatus());
+    }catch(error){pushItem({id:nextId(),kind:"notice",text:String(error)});}
   };
 
   // 单行输入(复用 ask 覆盖层):粘贴 key / 起名都走它;回车提交,空 = 取消。
@@ -784,6 +832,10 @@ export function App(deps: AppDeps) {
   };
 
   useInput((ch, key) => {
+    // Ink 会去掉焦点序列的 ESC 前缀。先消费,防止 [I/[O 混进输入或触发模态操作。
+    if (ch === "[I") { deps.tabAttention?.clear(); return; }
+    if (ch === "[O") return;
+    deps.tabAttention?.clear(); // 不支持焦点事件的终端,首次按键也能清除。
     if (accountPick) {
       const accts = accountPick.items, nA = accts.length;
       // switch 模式额外两行动作:➕添加 / 🗑删除;delete 模式只列账户。
@@ -839,9 +891,10 @@ export function App(deps: AppDeps) {
         if (i < 0 || i >= n) return;
         const m = items[i]!.model;
         setModelPick(null);
-        const res = deps.runCommand("/model " + m);
+        void Promise.resolve(deps.runCommand("/model " + m)).then(res=>{
         if (res.output) pushItem({ id: nextId(), kind: "notice", text: res.output });
         setStatus(deps.getStatus());
+        }).catch(error=>pushItem({id:nextId(),kind:"notice",text:String(error)}));
         return;
       }
       return;
@@ -893,7 +946,7 @@ export function App(deps: AppDeps) {
         showingApproval.current = false;
         apDecisions.current = new Map();
         setApproval(null);
-        controllerRef.current?.abort();
+        controllerRef.current?.abort(); deps.scheduler?.pause();
         return;
       }
       const reqAp = approval.requests[apIdx];
@@ -951,7 +1004,7 @@ export function App(deps: AppDeps) {
       const moveBy = (d: number) => setChoiceIdx((i) => { const ni = Math.max(0, Math.min(allOpts.length - 1, i + d)); if (ni === fillIdx) setAskInput(""); return ni; });
       const jumpTo = (ni: number) => { setChoiceIdx(ni); if (ni === fillIdx) setAskInput(""); };
       // ESC 中断:把回合让给用户(先 resolve 避免 tool_call 悬空致 400,再打断)。
-      if (key.escape) { done("[用户中断]"); controllerRef.current?.abort(); return; }
+      if (key.escape) { done("[用户中断]"); controllerRef.current?.abort(); deps.scheduler?.pause(); return; }
 
       // 焦点在"自己输入"行:该行就是内联输入框——按键即编辑(数字/空格也算文本),回车提交,上下移动离开。
       if (choiceIdx === fillIdx) {
@@ -991,7 +1044,7 @@ export function App(deps: AppDeps) {
       return;
     }
     if (ask) {
-      if (key.escape) { ask.resolve("[用户中断]"); setAsk(null); setAskInput(""); controllerRef.current?.abort(); return; }
+      if (key.escape) { ask.resolve("[用户中断]"); setAsk(null); setAskInput(""); controllerRef.current?.abort(); deps.scheduler?.pause(); return; }
       if (key.return) {
         const val = askInput || "(用户未回答)";
         pushItem({ id: nextId(), kind: "user", text: val });
@@ -1001,7 +1054,16 @@ export function App(deps: AppDeps) {
       else if (ch && !key.ctrl && !key.meta) setAskInput((s) => s + ch);
       return;
     }
-    if (key.escape && busy) {
+    // 模型运行或等待期间也可只读查看任务。
+    if (key.ctrl && ch === "t" && deps.listAgentTasks) {
+      setAgentTasksOpen((open) => !open);
+      return;
+    }
+    if (agentTasksOpen && !(key.ctrl && ch === "c")) {
+      if (key.escape) setAgentTasksOpen(false);
+      return;
+    }
+    if (key.escape && (busy || schedulerStatus?.state === "waiting")) {
       // 有还没被消费的排队输入:先只取消这些排队输入,不打断正在跑的回合——第二次 ESC 才真正中断。
       // 取消的内容不回填输入框(和下面"中断当前回合"的回填语义不一样,避免和用户当前草稿混在一起)。
       if (queued.length > 0) {
@@ -1010,7 +1072,7 @@ export function App(deps: AppDeps) {
         pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.steeringCancelled") });
         return;
       }
-      controllerRef.current?.abort();
+      controllerRef.current?.abort(); deps.scheduler?.pause();
       // 回填:输入框为空时,把刚中断的那条提交放回去,方便改了再发(不覆盖已打的新草稿)。
       if (!input.trim() && lastSubmitRef.current) {
         setField({ text: lastSubmitRef.current, cursor: lastSubmitRef.current.length });
@@ -1100,8 +1162,13 @@ export function App(deps: AppDeps) {
         if (v) {
           const ev = expandPastes(v);
           const s = typeof ev === "string" ? ev : JSON.stringify(ev);
-          setQueued((q) => [...q, s]);
-          deps.queueSteering?.(s);
+          if (deps.scheduler) {
+            deps.scheduler.submit(ev);
+            pushItem({ id: nextId(), kind: "user", text: pastePreview(s) });
+          } else {
+            setQueued((q) => [...q, s]);
+            deps.queueSteering?.(s);
+          }
           pushItem({ id: nextId(), kind: "notice", text: t("ui.notice.queued", v.slice(0, 50)) });
         }
         setField({ text: "", cursor: 0 });
@@ -1191,9 +1258,11 @@ export function App(deps: AppDeps) {
 
   // 粘贴:bracketed paste 下整段作一个字符串进来(不经 useInput),原样追加进输入框、不自动提交。
   usePaste((text) => {
+    deps.tabAttention?.clear();
     if (approval) return;
     if (choice) { if (choiceIdx === choice.options.length + (choice.multi ? 1 : 0)) setAskInput((s) => s + text); return; } // 焦点在"自己输入"行才接受粘贴
     if (ask) { setAskInput((s) => s + text); return; }
+    if (agentTasksOpen) return;
     // macOS 空粘贴:剪贴板里有图片(终端发空 bracketed paste 序列)。检测到后读取 PNG → base64 → 存占位符。
     if (process.platform === "darwin" && text.length === 0) {
       void getImageFromClipboard().then(img => {
@@ -1274,7 +1343,7 @@ export function App(deps: AppDeps) {
   return (
     <Box flexDirection="column">
       {/* 会话开始前:欢迎屏在动态区,随终端 resize 实时重排(useTermWidth 订阅)。 */}
-      {items.length === 0 && !deps.skipBanner ? (
+      {items.length === 0 && !deps.skipBanner && !agentTasksOpen ? (
         <Welcome info={deps.welcome.info} caps={deps.welcome.caps} bg={bg} maxim={deps.welcome.maxim} />
       ) : null}
       <Static key={staticKey} items={items}>
@@ -1287,7 +1356,11 @@ export function App(deps: AppDeps) {
         }
       </Static>
 
-      {reviewMode && (
+      {agentTasksOpen && deps.listAgentTasks && !approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick && (
+        <AgentTasksPanel listTasks={deps.listAgentTasks} />
+      )}
+
+      {reviewMode && !agentTasksOpen && (
         <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={c("gold")} paddingX={1}>
           <Text color={c("gold")}>↻ 回看历史对话(共 {reviewMode.length} 条记录)· Esc 返回当前对话</Text>
           {reviewMode.map((it) => (
@@ -1297,7 +1370,7 @@ export function App(deps: AppDeps) {
         </Box>
       )}
 
-      {live && (
+      {live && !agentTasksOpen && (
         <Box flexDirection="column" marginTop={1}>
           {/* 推理预览:只显示思考文本(spinner/动词/耗时统一放下方状态行,避免重复)。 */}
           {live.reasoning && !live.content ? (
@@ -1546,7 +1619,7 @@ export function App(deps: AppDeps) {
         </Box>
       )}
 
-      {!approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick && (
+      {!agentTasksOpen && !approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick && (
         <Box flexDirection="column" marginTop={1}>
           {/* 输入行加圆角边框,交互时清晰可辨(活跃=青玉,运行中=暗);补全/提示行在框外。 */}
           <Box borderStyle="round" borderColor={busy ? c("dim") : c("jade")} paddingX={1}>
@@ -1609,7 +1682,15 @@ export function App(deps: AppDeps) {
       {modeHint && !approval && !ask && !choice && !resumePick && !accountPick && !skillPick && !modelPick && !providerPick && !gwModelPick ? (
         <Text color={c("jade")}>{"  "}{t("ui.modeHint")} {modeHint}</Text>
       ) : null}
-      {bgRunning > 0 ? <Text color={c("gold")}>{t("ui.bgRunning", bgRunning)}</Text> : null}
+      {schedulerStatus?.state === "waiting" ? <Text color={c("gold")}>{t("ui.waitingTasks", schedulerStatus.waiting?.count ?? 0, schedulerStatus.waiting?.mode ?? "any")}</Text> : null}
+      {schedulerStatus?.state === "recovering" ? <Text color={c("gold")}>{t("ui.backgroundRecovering")}</Text> : null}
+      {schedulerStatus?.state === "paused" ? (
+        <Text color={c("gold")}>
+          {t("ui.backgroundPaused")}
+          {schedulerStatus.runningTasks > 0 || bgRunning > 0 || bgShells > 0 ? t("ui.backgroundStillRunning") : ""}
+        </Text>
+      ) : null}
+      {bgRunning > 0 ? <Text color={c("gold")}>{t("ui.bgRunning", bgRunning)}{deps.listAgentTasks ? " · Ctrl+T" : ""}</Text> : null}
       <StatusBar status={status} c={c} bgShells={bgShells} />
     </Box>
   );

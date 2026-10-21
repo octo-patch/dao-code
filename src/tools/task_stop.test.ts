@@ -7,17 +7,17 @@ describe("TaskStop", () => {
     const taskManager = createTaskManager();
     const id = taskManager.create("任务A");
     const out = await taskStopTool.handler({ id }, { workspaceRoot: "/w", taskManager });
-    expect(out).toContain("已停止");
+    expect(out).toContain("已取消");
     expect(taskManager.get(id)?.status).toBe("canceled");
   });
 
-  it("停止真实后台子代理 → 真正中止(不再入队完成通知)", async () => {
+  it("停止真实后台子代理 → 请求取消并由执行器确认", async () => {
     const taskManager = createTaskManager();
     const id = taskManager.launch("长任务", (signal) => new Promise((_res, rej) => {
       signal.addEventListener("abort", () => rej(new Error("aborted")));
     }));
     const out = await taskStopTool.handler({ id }, { workspaceRoot: "/w", taskManager });
-    expect(out).toContain("已停止");
+    expect(out).toContain("已请求取消");
     expect(taskManager.get(id)?.status).toBe("canceled");
   });
 

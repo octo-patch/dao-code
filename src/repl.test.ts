@@ -236,3 +236,56 @@ describe("drainAndContinue 提供 waitForBackgroundChange → 事件驱动等待
     expect(runTurnCalls).toBe(1); // 没有卡住/漏读,正常续跑了
   });
 });
+
+describe('REPL shared scheduler', () => {
+  it.each(['/cost', '/tasks', '/status', '/recovery', '/resume'])('%s preserves waiting and completion still wakes the model', async (command) => {
+    const { BackgroundRuntime } = await import('./agent/background_runtime.js');
+    const { SessionScheduler } = await import('./agent/session_scheduler.js');
+    const { execution, deferred, tick } = await import('./agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const task = execution(runtime); const session = new Session('SYS', 'm');
+    let runs = 0; let reads = 0; const eof = deferred<string | null>();
+    const scheduler = new SessionScheduler({ runtime, session, save: () => {}, user: async () => {},
+      run: async () => ++runs === 1 ? { kind: 'waiting', wait: runtime.prepare({ ids: ['a'], mode: 'all' }).handle } : { kind: 'completed' } });
+    try {
+      scheduler.submit('start'); await scheduler.settled();
+      const repl = runRepl({ scheduler, session, readLine: async () => ++reads === 1 ? command : eof.promise,
+        command: async () => ({ handled: true, output: 'status' }), write: () => {}, compact: async () => {}, runTurn: async () => {} });
+      await tick(); expect(scheduler.status().state).toBe('waiting'); expect(runtime.activeWaits).toBe(1);
+      task.finish(); await scheduler.finished(); expect(runs).toBe(2); expect(runtime.events()).toEqual([]);
+      eof.resolve(null); await repl;
+    } finally { eof.resolve(null); scheduler.close(); }
+  });
+
+  it.each(['/clear', '/compact', '/resume other', '/recovery resolve root tool verified'])('%s still stops execution before mutating history', async (command) => {
+    const { BackgroundRuntime } = await import('./agent/background_runtime.js');
+    const { SessionScheduler } = await import('./agent/session_scheduler.js');
+    const { deferred, tick } = await import('./agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const session = new Session('SYS', 'm');
+    const stopped = deferred<void>(); let signal: AbortSignal | undefined; let handled = false;
+    const scheduler = new SessionScheduler({ runtime, session, save: () => {}, user: async () => {}, run: async s => {
+      signal = s; await stopped.promise; return { kind: 'interrupted', reason: 'user' };
+    } });
+    try {
+      scheduler.submit('start'); await tick();
+      const repl = runRepl({ scheduler, session, readLine: lineFeeder([command]), write: () => {}, compact: async () => {}, runTurn: async () => {},
+        command: async () => { handled = true; return { handled: true }; } });
+      await tick(); expect(signal?.aborted).toBe(true); expect(handled).toBe(false);
+      stopped.resolve(); await repl; expect(handled).toBe(true);
+    } finally { stopped.resolve(); scheduler.close(); }
+  });
+
+  it('background completion wakes while retaining exactly one pending readLine', async () => {
+    const { BackgroundRuntime } = await import('./agent/background_runtime.js');
+    const { SessionScheduler } = await import('./agent/session_scheduler.js');
+    const { execution, deferred, tick } = await import('./agent/background_test_helpers.js');
+    const runtime = new BackgroundRuntime(); const a = execution(runtime); const session = new Session('SYS', 'm');
+    const next = deferred<string | null>(); let reads = 0; let runs = 0;
+    const scheduler = new SessionScheduler({ runtime, session, save: () => {}, user: async (text) => { session.addUser(text); },
+      run: async () => ++runs === 1 ? { kind: 'waiting', wait: runtime.prepare({ ids: ['a'], mode: 'any' }).handle } : { kind: 'completed' } });
+    const repl = runRepl({ scheduler, session, readLine: async () => ++reads === 1 ? 'start' : next.promise,
+      runTurn: async () => { throw new Error('legacy path used'); }, compact: async () => {}, write: () => {} });
+    await tick(); expect(runs).toBe(1); expect(reads).toBe(2);
+    a.finish(); await scheduler.finished(); expect(runs).toBe(2); expect(reads).toBe(2);
+    next.resolve(null); await repl; scheduler.close();
+  });
+});
