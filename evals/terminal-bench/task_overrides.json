@@ -1,0 +1,81 @@
+{
+  "extract-moves-from-video": {
+    "tag": "low_priority",
+    "reason": "视觉题"
+  },
+  "regex-chess": {
+    "tag": "abandoned",
+    "reason": "reasoning不收敛家族,3候选修复(收敛提示/降reasoning_effort/硬max_tokens)已验证机制生效但翻不动reward,无新点子前不重跑。注:0728最新复测(71次工具调用,末次调用后裸推理约77秒)已不再复现零工具调用纯文字空转的原始签名,尚未做专门的post-fix深挖归因,暂沿用家族标签,见evolution-log.md"
+  },
+  "gpt2-codegolf": {
+    "tag": "abandoned",
+    "reason": "reasoning不收敛家族(同regex-chess)。注:0728最新复测(18次工具调用,末次调用后裸推理约32秒)已不再复现零工具调用纯文字空转的原始签名,尚未做专门的post-fix深挖归因,暂沿用家族标签,见evolution-log.md"
+  },
+  "feal-linear-cryptanalysis": {
+    "tag": "abandoned",
+    "reason": "0729真实复测(huoshan1账号)不再是reasoning不收敛签名:12次工具调用(Read×6/Bash×2/TodoWrite/Write×2/Bash),首次工具调用发生在进程启动37秒后,末次工具调用后只裸推理了16秒(占1800s预算不到1%),不是整段沉默。推理正确推导了线性逼近偏差,临近结束才写出并测试部分攻击代码,是多轮密钥恢复的数学/工程复杂度没能在预算内做完,不是停止落盘。见evolution-log.md"
+  },
+  "path-tracing": {
+    "tag": "abandoned",
+    "reason": "0727 post-fix真实复测不再是reasoning不收敛签名:AgentTimeoutError≈1922s,109条消息/54次工具调用(Bash 42/Read 4/Write 3/Edit 1等),0个纯文字回合。verifier 3/5通过,失败在test_runs_and_produces_output/test_image_similarity——这次确实执行了编译出的二进制(msg 85),但三次改写image.c(msg 79/89/95)全部没有fopen调用、全篇不含'reconstructed'字符串,程序全程printf到stdout,从未按任务原文要求写入指定输出文件。四处反停滞修复均未触发,是独立于反停滞机制之外一个持续复现的规范遵循bug。2026-07-31根因定位到底:官方镜像alexgshaw/path-tracing:20251031的Dockerfile只删了/app/orig.c源码,忘删编译出的/app/orig二进制(真实的任务环境泄漏,非DAO制造)——DAO自己0726新增的env_snapshot顶层目录快字段探测(probeTopLevelDir,commit efa42dd)会在第一条系统消息就把这个泄漏文件的名字直接递给模型('Top-level entries: image.ppm, orig'),模型因此在写完基础版本后又去反汇编这个二进制追求更高精度,把预算耗在这条弯路上,导致收尾阶段(把printf版本转成正式fopen版本)的时间被挤没。真实复测(2026-07-15 iter9-2048)对照:该版本预生成env_snapshot,系统提示词里没有这段目录信息,全程未碰/app/orig,纯经验拟合image.ppm像素数据,49%预算内写出可用版本,后段有充裕缓冲做收尾。诊断实验:本地临时改harbor缓存的Dockerfile删掉/app/orig、--force-build本地重建镜像复测,reward=1.0(5/5全过,含test_runs_and_produces_output),confirm了因果关系。但官方评测用的是registry上的固定镜像(alexgshaw/path-tracing:20251031),我们改不了,本地实验结果不能代表真实评测口径,tag维持abandoned。见evolution-log.md。"
+  },
+  "torch-pipeline-parallelism": {
+    "tag": "abandoned",
+    "reason": "0728最新复测(retest-toolsearch-torch-pipeline-parallelism-0728)仅6次工具调用、末次调用后裸推理约19秒,已不再是零工具调用纯文字空转的原始签名,但尚未像write-compressor/path-tracing/feal-differential-cryptanalysis那样做过专门的post-fix深挖归因,暂沿用家族标签,见evolution-log.md"
+  },
+  "raman-fitting": {
+    "tag": "abandoned",
+    "reason": "真实精度差距:根因已精确定位到模型单位换算假设空间遗漏倒数变换(波长nm→波数cm⁻¹的1e7/x换算),只试了加减法族假设。连续5次+独立样本判定真实难度,本次进一步排除框架层可低成本修复的可能(n=1过窄领域知识缺口,写进提示词有过拟合单题风险),无新点子前不重复占用队列头部,见evolution-log.md"
+  },
+  "torch-tensor-parallelism": {
+    "tag": "abandoned",
+    "reason": "声称完成但未验证家族第4例(同sanitize-git-repo/dna-insert):独立复核确认system_prompt.ts的Verification Discipline节已明确覆盖此场景(含预判性反驳'The code looks correct→run it'),模型仍完整绕过,是意图-行动脱节而非规则缺口,跟regex-chess/dim锚定同属对通用提示词干预抵抗力强的模式,无新点子前不占队列头部,见evolution-log.md"
+  },
+  "crack-7z-hash": {
+    "caveat": "agent/harbor_dao_agent.py 在装机阶段把 john 真实密码字典(约170万条)裁剪成前5000条,是对任务环境本身的修改(不是DAO代码/行为的改动)。这题的reward不能跟官方terminal-bench难度下的结果直接比较——通过也只代表在被人为简化过的字典下通过。"
+  },
+  "train-fasttext": {
+    "tag": "abandoned",
+    "reason": "两个真实框架bug(exec_shell timeout机制/autotune优先)已修复验证,但任务本身卡在硬件限制(容器仅1核,fastText/autotune严重依赖多线程)+模型对fastText dim参数的记忆性锚定(6/6冷启动采样都是dim=100,两轮不同措辞快速验证0/19未绕开,结合学术文献确认是anchoring effect,对通用提示词干预有实证抵抗力)。人工决定放弃,见evolution-log.md"
+  },
+  "dna-insert": {
+    "tag": "abandoned",
+    "reason": "根因精确定位:判分脚本靠在最终引物拼接串里搜索已知'插入片段'子串来反推退火区边界,但模型每次都靠肉眼读上下文/逐位扫描去定位input/output两条质粒序列的插入位置——插入片段前两个碱基恰好和原序列对应位置重复,导致定位结果比真实插入点(0-indexed 213)晚2个碱基(报成215),两次完全独立的历史尝试(推理路径完全不同,一次误判成'替换+插入'、一次正确判断'纯插入')最终写出的引物序列却逐字节相同,证明这是和推理路径无关的机械性错误,不是'真实难度'(此前2026-07-24 commit 2aa2dca那条记录曾误判为真实难度,本轮已更正)。围绕'定位两个可能不等长/结构不同的数据的差异点应优先用专门工具而非手写扫描'这条通用原则,先后设计v1~v6共6轮候选提示词/验证方式:v1单轮孤立验证通过但真实复测(0724-fix)失败(模型确认长度不同后仍写同类扫描脚本);v2/v3(重建校验)单轮重放受限于该题推理极长、预算跟不上,未获得干净结论;v4(通用原则+Bash工具边界,不含重建校验)单独测试未见行为变化;v5(措辞精简+验证纪律新增条,内省后按模型自己建议的'行为自查'句式重写)在真实卡点重放仍未绕开;关键方法论发现——基线(未改动提示词)本身在'全新开局'测试下就存在单样本方差(同一问题不同次采样,时而选对齐算法、时而选朴素扫描),导致单样本A/B对比从统计上无法可靠归因,与regex-chess/gpt2-codegolf等'reasoning不收敛家族'同源;v6(精简后的最终版本,补上专门工具原则的Bash工具边界句)发起第2次真实复测(0724-fix-r2)仍失败,且Tm数值(68.194043/62.750252)与另一历史批次完全一致,判定为同一路径的稳定复现。按debug-evolve止损规则(连续2次真实复测失败),用户2026-07-24确认标记abandoned;三处提示词改动(Action Discipline专门工具原则+Bash工具边界+Verification Discipline新增条)均未能在这道题上验证生效,已回退不提交,不影响其它任务。见evolution-log.md"
+  },
+  "path-tracing-reverse": {
+    "tag": "abandoned",
+    "reason": "round1修复一处真实框架bug(空截断恢复提醒工具名对齐+脚本语言泛化),round3/round5修复两处Verification Discipline缺口(diff前路径别名自比较、结构性参数多源交叉验证),均从真实trace抓到确凿bug并真实复测验证过。2026-07-25用户追问\"为什么不能装反编译器\"带出新卡点,重新打开一轮:内省诊断(三层+外部案例openai/codex#3692)确认模型会凭\"sandboxed environment\"这个自我泛化的标签、未经任何验证命令就放弃gdb/反编译器路径;Tier1候选(提示词加一条\"假设的限制需要先验证\")真实复测确认候选在窄目标上生效(模型这次主动执行which gdb,round3记录的相机/球心混淆未复现),但任务级仍未通过(相似度0.9160)——败因是round3已诊断、round5已尝试修复但仍会复现的另一个错误(方向光被误建模成点光源)。候选已回退。之后测试专用\"安装工具的工具\"(两版设计,EnsureCapability/InstallTool共18次重放)采纳率0/18,模型始终停在\"查一下在不在\"未曾试装,说明卡点是\"验证只做一半\"的判断本身,不是入口形式(Bash vs 专用工具)。五次真实复测(0.9689→0.9165→0.9651→0.7188→0.9160)横跨两轮,无随改动轮次递增趋势,每次败于不同/已知错误类别。用户2026-07-25再次确认放弃,判定为任务本身要求的长链条数值推导(相机FOV/球心半径/光源类型方向/颜色缩放/棋盘格公式/阴影epsilon)全部严丝合缝的真实难度,不是单一框架缺口。见evolution-log.md"
+  },
+  "make-doom-for-mips": {
+    "tag": "abandoned",
+    "reason": "官方task.toml确认expert_time_estimate_min=480(专家人类预计8小时)、junior_time_estimate_min=1920(32小时),agent预算仅900s(15分钟),相差32倍。官方solve.sh(diff共11538行)用clang→LLVM IR→llc(-relocation-model=static)→MIPS汇编→mips-linux-gnu-as/ld的迂回路径从根上避开GCC默认abicalls/PIC假设,并重写约80个doomgeneric源文件配合完整自制freestanding libc。两次独立千帆账号复测(0725-qf/0725-qf-r2)均未见'反复重推不收敛'反模式,各自真实推进到不同更深阶段(第一次:全部.o编译通过、卡在链接阶段abicalls/PIC冲突;第二次:链接成功产出可运行MIPS二进制、node vm.js真实跑起来、doom.wad被打开,卡在更深的IWAD识别运行时逻辑),均在900秒硬超时打断时仍在做正确方向的线性排查而非空转循环。与此前同一题另一次trial(volcengine账号)判定的'反模式'结论相矛盾,本轮以官方元数据+两次交叉验证为准,判定为任务本身工程量超预算的真实难度,非DAO框架/提示词缺陷。用户2026-07-25确认标记abandoned,见evolution-log.md"
+  },
+  "gcode-to-text": {
+    "tag": "abandoned",
+    "reason": "创造性几何洞察缺口(同raman-fitting类型):任务需从G-code反推3D打印机压印文字。模型正确解析出压印文字对象坐标、也正确观察到异常信号(推理原文'Z range goes from 0.2 up to 64.88mm... very high for text'),但把异常归因为'物体本身有这么高',而非'文字所在面在3D空间被整体倾斜/旋转了'——参考解法的关键洞察是抓原始3D坐标做欧拉旋转校正把倾斜面转正、再正交投影渲染成图用OCR识别。模型反而在错误的平面假设上反复调整分辨率/切片方式(20-37次调用共18次高度雷同的小改动),直到900秒超时截断,全程0次Write,未收敛出任何候选答案。此前另一trial(u2XmF3R)是猜出错误答案'Embossed text',本次(8JH28Ai)是压根没收敛。需要G-code/3D坐标系统专门领域知识+创造性几何洞察,不是通用的'重新检查假设'提示词能补上的缺口,n=1过窄领域知识写进提示词有过拟合单题风险。用户2026-07-25确认标记abandoned,见evolution-log.md"
+  },
+  "largest-eigenval": {
+    "tag": "abandoned",
+    "reason": "四轮快速验证(5种性质完全不同的候选:2版Action Discipline文字改动/1次真实loop.ts进度提醒机制注入/Engineering Restraint重新定性/事实性剩余时间信号)累计0/15命中率,达debug-evolve规定的5轮验证上限。真实trial(t≈841s)已用benchmark验证dgeev方案在全部5个尺寸(2x2-10x10)上稳定超过numpy(1.07x-1.83x),满足任务字面要求\"consistentlyfaster\",但模型认为幅度不够大,继续设想更复杂方案直至900秒超时,eigen.py全程未被写过一次。内省诊断确认模型自己承认\"不是不会写,是不想写\",且推理原文明确写出\"That's consistently faster...it should pass\"却仍不落盘。5个候选覆盖不同章节定位(Action Discipline/Engineering Restraint)、不同信息类型(说理性指令/真实机制文案/纯事实时间信号),推理原文显示模型对全部候选内容均无任何回应或呼应,独立复述同一结论。归入对提示词/机制干预有实证抵抗力的家族(同train-fasttext的dim锚定、torch-tensor-parallelism的意图-行动脱节)。用户2026-07-25确认标记abandoned,见evolution-log.md"
+  },
+  "make-mips-interpreter": {
+    "tag": "abandoned",
+    "reason": "9次独立尝试(2026-07-15至2026-07-26)均确认真实难度:参考解法约2100行完整MIPS指令集+syscall仿真+ELF加载,相对1800s预算天然过大。本轮(0725-qf-retest)重新分析确认非reasoning不收敛/非misstep反复复现——模型全程真实推进(ELF分析→写vm.js→调试BEQ/寄存器),超时前精确诊断出delay slot未执行、JAL/JALR返回地址PC+8误写成PC+4两个真实MIPS语义bug,只是代码未写完就被硬超时切断。9次尝试均显示持续改善(Write调用从0到3,真实编译/调试行为),判定为工程量/预算错配,非框架缺陷。用户2026-07-26确认标记abandoned,见evolution-log.md补排查#33"
+  },
+  "adaptive-rejection-sampler": {
+    "tag": "abandoned",
+    "reason": "2026-07-26的样本(900s全程仅2次工具调用、896秒纯推理文字、0次Write)曾是reasoning不收敛家族第34个样本。但0727 post-fix真实复测(retest-antistall-adaptive-rejection-sampler-0727)已不是这个签名:无异常自然结束(≈936s),56次工具调用(含派后台子代理),verifier 8/9通过,唯一失败是输出格式漏了一个字面冒号字符(判分要求'TEST_NAME: PASS',模型实现输出的是名字和PASS之间用空格而非冒号)——核对任务原文确认这不是隐藏判分细节,原文明确写了带冒号的格式,是实现疏漏,算法本身完全正确。同批还首次撞见VerifyDone被绕过的具体路径:VerifyDone正确提示要逐条对照任务原文,但模型下一步调用TodoWrite勾掉了自己写的宽泛清单就直接收尾,没有真的回去重读原文——已据此追加修复(commit 31124b2)。见evolution-log.md补排查#34及0727 EVOLVE记录"
+  },
+  "dna-assembly": {
+    "tag": "abandoned",
+    "reason": "指令-判分隐藏实现细节落差(同overfull-hbox类型):任务是Golden Gate引物设计,需用primer3的oligotm计算Tm(任务原文明确指定工具和参数,模型确实照做:装primer3、跑oligotm -tp 1 -sc 1 -mv 50 -dv 2 -n 0.8 -d 500)。但判分脚本test_outputs.py的make_fragment()对'退火区'边界的定义比指令原文暗示的更复杂——不是简单取引物结合区子串跑Tm,而是先定位结合区起点后再向上游延伸最多4个碱基(若与引物自身设计的4bp突出端在模板上重叠),这段延伸也要并入送进oligotm的真实退火区,但任务原文(instruction.md)完全没提及这层'重叠延伸'规则。真实复测(0726-progressadvice)显示模型用同一工具同一参数算出input_fwd引物Tm=59.8°C(18nt结合区),判分脚本按其内部更长的延伸边界算出57.684°C(差0.316°C未达58°C下限)——同一工具同一参数,喂入边界不同,是无法单从指令文本推导出的隐藏判分实现细节,不是模型的验证纪律缺失或领域知识缺口。本轮同时发现并修复一个独立的真实框架缺口:DAO内置的进度提醒机制(loop.ts noProgress计数器)默认关闭,需显式传--progress-advice才激活,而harbor_dao_agent.py评测命令行从未传过这个参数,导致该机制在所有terminal-bench评测里从未真正生效过(此前make-mips-interpreter/path-tracing-reverse两次会话已独立发现同一缺口,本次首次动手修复并加入命令行)。修复后真实复测显示明确正向变化:此前3次trial(fix-promptaction-dna/iter-dna-assembly-0721两次)里2次是'反复推理不落盘'反模式(0次Write,AgentTimeoutError),这次进度提醒真实触发3次(第630/1632/1941行)后agent自然完成(1597s/1800s,非超时),primers.fasta真的被创建——但暴露出的是上述指令-判分落差这个新的、不同性质的问题,不是同一反模式的延续。--progress-advice这个全局开关本身独立于这题的abandoned判定,予以保留提交,对整个'反复推理不落盘'家族(regex-chess/gpt2-codegolf/path-tracing等7+题)有潜在正向影响。用户2026-07-26确认dna-assembly标记abandoned,见evolution-log.md"
+  },
+  "video-processing": {
+    "tag": "abandoned",
+    "reason": "与raman-fitting/gcode-to-text同属\"创造性/领域特定算法洞察缺口\"家族。干净完成(非超时非反模式,900s预算仅用49%),模型开发的\"背景差分+全身质心Y轨迹谷值检测\"算法在唯一的example_video.mp4上给出合理结果(52,78)后即声称通用并verify_done收尾,但隐藏测试视频上完全失败(输出1,期望[219,223])。参考解法用完全不同的技术:裁剪画面底部专门追踪双脚/脚踝区域的步幅模式中断,而非全身质心。三层内省诊断(未跳过)确认:模型自陈这不是\"没想到脚部\"而是\"质心是背景差分思路的自然延伸,唯一样本上给出合理数字后探索就终止了\"——本质是概念层面的重构缺口(把\"跳跃\"分解为\"脚离地→空中→脚触地\"这个更底层物理事件链),不是调参层面的精进。明确判断:\"即使把提示词里所有关于验证/过拟合/泛化的警告都提到最高优先级,只要没有具体的领域hint,大概率还是会选质心信号\"。n=1过窄领域知识写进提示词有过拟合单题风险。与此前两次独立历史分析结论一致。用户2026-07-26确认标记abandoned,见evolution-log.md补排查#35"
+  },
+  "write-compressor": {
+    "tag": "abandoned",
+    "reason": "2026-07-26的样本(886s跨度内758s纯文字手推、0次真正执行)曾是reasoning不收敛家族第22例。但0727 post-fix真实复测(retest-antistall-write-compressor-0727)已不是这个签名:27条消息/12次工具调用(Bash×8/Write×2/Read×2)、0个纯文字回合,真实写出仪表化C追踪器拿到解码轨迹,写出compress.rs(194行)后自我判断'这个思路不对,重新来',正准备重写第二版时约980s超时打断——这一版compress.rs从未编译验证过。是真实推进但中途重启第二稿没写完,不是零交付物纯复述。--progress-advice等四处反停滞修复均未触发(没有停滞可抓)。见evolution-log.md补排查#36及0727 EVOLVE记录"
+  }
+}

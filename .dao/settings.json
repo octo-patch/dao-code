@@ -20,7 +20,6 @@
       "Bash(rm -rf ~:*)",
       "Bash(rm -rf ~/*:*)"
     ],
-    "additionalDirectories": [],
-    "defaultMode": "default"
+    "additionalDirectories": []
   }
 }

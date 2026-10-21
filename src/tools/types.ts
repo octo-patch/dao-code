@@ -22,12 +22,38 @@ export interface ToolContext {
     branch: string;
     cleanup: () => void;
     hasChanges: () => boolean;
+    hasUnpushedCommits: () => boolean;
     previousCwd: string | undefined;
   };
   // 本会话已读文件的绝对路径集合(写工具据此判断"覆盖/编辑前是否已读");可选。
   readFiles?: Set<string>;
   // P2-23 读时元信息(mtime/size):写前复核,文件自上次读后被外部改动则拒绝(防覆盖并发改动)。
   readMeta?: Map<string, { mtime: number; size: number }>;
+  // 已写入但自那以后还没有任何 Bash/exec_shell 调用发生的路径集合(真实撞见:write-compressor
+  // 复测里模型写完 compress.rs 从未编译运行过,凭记忆判断"这版思路不对"就整篇重写,第二版又被
+  // 超时打断,整个 trial 没有任何可运行的交付物——system_prompt.ts 里"写完就跑,别推倒重来"
+  // 那条规则本身已经写得很直白,模型读过仍然违反了)。Write 工具据此判断"对同一路径的第二次
+  // 整篇重写,前面有没有真的跑过一次" ——参照 readFiles 的先例(覆盖前必须先 Read,没读拒绝),
+  // 这里是同一类"用具体状态硬拦,而不是只在文字里劝"的机制,只挡 Write→Write,不挡 Edit
+  // (那正是规则本身推荐的局部修正替代方案)。exec_shell 每次调用(无论成败,哪怕只是
+  // 报错)都清空整个集合——任何一次真实执行都算"已经有过反馈",不做"这次执行到底测的是不是
+  // 这个文件"的脆弱字符串匹配。
+  pendingUnverifiedWrites?: Set<string>;
+  // headless 会话(ctx.headless)"第一步必须先用 TodoWrite 拆子步骤"的运行时硬拦截状态。
+  // 2026-07-31 的系统提示词文案版本(09d0725)只在开局提了这条要求,真实复测(gpt2-codegolf
+  // 0731-r3)确认:指令确实注入了,但模型全程 38 次工具调用 0 次 TodoWrite——文字层面的要求
+  // 说了不代表会照做。这里用"真拒绝,不是提醒"机制:headless 会话第一批 tool_calls
+  // 里没有 TodoWrite 就整批拒绝执行,直到 TodoWrite 被调用过一次(done=true)才放行——
+  // 只管"有没有迈出第一步",不追踪后续是否持续维护清单。
+  // 只在主会话注入(src/index.ts 构造根 ctx 时);子代理的 ToolContext 不设置这个字段,天然
+  // 不受影响(与 09d0725 的系统提示词文案覆盖面保持一致,子代理本来就不会拿到那段 headless
+  // 文案)。用对象包一层是为了跨调用可变,裸 boolean 做不到。
+  // 2026-08-01 扩展:done=true 后不是永久放行——exec_shell.ts 检测到运行时崩溃信号(见
+  // matchesCrashSignature,segfault/SIGABRT/malloc corrupted 这类)会把它重新置回 false,
+  // 逼下一步先过一遍 TodoWrite 再继续。背景:对 187 个真实历史会话的普查显示,63% 的多次
+  // TodoWrite 调用只是原样重发勾状态,内容从不随执行过程中冒出的新信息演化——崩溃是最容易
+  // 判定、最该触发重新规划的具体信号之一,不是唯一场景,但是目前唯一已实现的重新武装入口。
+  todoWriteRequired?: { done: boolean };
   // 向用户提问(AskUserQuestion 用);注入,便于测试。
   ask?: (question: string) => Promise<string>;
   // 结构化选择(AskUserQuestion 带 options 时用):单选 ↑↓/数字 选 + Enter;多选(multi)用 checkbox(空格/数字切换 + Enter 确认)。
@@ -35,6 +61,9 @@ export interface ToolContext {
   askChoice?: (question: string, options: string[], multi?: boolean) => Promise<string>;
   // 网络抓取(WebSearch/WebFetch 用);注入,默认全局 fetch。
   fetchImpl?: typeof fetch;
+  // WebFetch 智能提取(prompt 参数)用:按 prompt 从抓到的页面原文里提取相关内容;注入,便于测试打桩。
+  // 未注入(如子代理/测试环境)= WebFetch 静默退化为不带 prompt 的整页返回。
+  extractFromPage?: (text: string, prompt: string) => Promise<string>;
   // ---- 子代理系统(新:runAgent 统一接口) ----
   // 子代理派发(返回 AsyncGenerator,逐条 yield 消息)
   runAgent?: (params: {
@@ -73,7 +102,7 @@ export interface ToolContext {
   // lsp 工具用:按文件类型路由到对应 language server(懒启动/复用),未配置对应类型时返回 error。
   lsp?: LspManager;
   // 为隔离子代理创建 git worktree(改文件并行不冲突);非 git 仓库返回 null。
-  createWorktree?: (id: string) => { root: string; branch: string; cleanup: () => void; hasChanges: () => boolean } | null;
+  createWorktree?: (id: string) => { root: string; branch: string; cleanup: () => void; hasChanges: () => boolean; hasUnpushedCommits: () => boolean } | null;
   // 完整任务管理器引用(TaskCreate/get/list/update/stop 用):同一个实例贯穿 launch/adopt/create/registerAsyncAgent/
   // registerAgentForeground,不是并行的第二套系统——agent 工具的后台/前台切换也走它。
   taskManager?: TaskManager;
@@ -83,7 +112,7 @@ export interface ToolContext {
   // auto 模式下子代理结束后审查整段转录的分类器(参考 classifyHandoffIfNeeded)。
   // 传入紧凑 transcript(JSONL),返回 {shouldBlock, reason} 或 {unavailable}。非 auto 模式下不会被调用。
   handoffClassifyFn?: (transcript: string) => Promise<ClassifyResult>;
-  // 当前权限模式(auto/default/acceptEdits/plan/bypassPermissions);handoff 审查只在 auto 模式触发
+  // 当前权限模式(auto/default/bypassPermissions);handoff 审查只在 auto 模式触发
   permissionMode?: string;
   // 可用 skill(名字+描述+触发条件+slug+正文+目录),供 skill 工具按需加载正文。
   skills?: { name: string; description: string; whenToUse?: string; paths?: string[]; slug?: string; body: string; dir: string }[];

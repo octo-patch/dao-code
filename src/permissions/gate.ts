@@ -5,7 +5,7 @@ import { rememberRule } from "./identity.js";
 import type { PermissionsConfig, PermissionMode } from "./settings.js";
 import type { ChatMessage } from "../client/types.js";
 
-// 熔断阈值(对标 CC denialTracking.ts):连续 deny 达上限或总 deny 达上限时,
+// 熔断阈值:连续 deny 达上限或总 deny 达上限时,
 // auto 模式回退人工审批,不再调分类器(省 API 调用 + 避免卡死)。
 // 30 分钟后自动重置(分类器可能因为换话题/改 prompt 后表现不同,不该永久熔断)。
 const MAX_CONSECUTIVE_DENIALS = 3;
@@ -37,7 +37,7 @@ export class PermissionGate implements ApprovalGate {
     return this.lastSources.get(id);
   }
 
-  // 熔断状态(对标 CC denialTracking.ts)。
+  // 熔断状态。
   private consecutiveDenials = 0;
   private totalDenials = 0;
   private lastResetTime = Date.now();
@@ -139,16 +139,22 @@ export class PermissionGate implements ApprovalGate {
   async requestBatch(requests: ApprovalRequest[]): Promise<Map<string, boolean>> {
     this.lastSources = new Map(); // 只反映这一批,不跨批累积
     const out = new Map<string, boolean>();
-    // auto 模式:AI 分类器只负责【把确信安全的自动放行】;其余(判定需谨慎 / 评估失败 / 敏感目标)
+    // auto 模式:AI 分类器只负责【把确信安全的自动放行】;其余(判定需谨慎 / 评估失败)
     // 一律【转人工审批】,而不是直接拒绝--auto = "安全的自动过,拿不准的问你",绝不替你拒。
+    // 危险命令强制人工(任何模式);敏感目标也交分类器(分类器对私钥读取会 BLOCK)。
     // (只读类工具 / 只读 shell / 工作区内编辑已在 engine.decide 短路为 allow,根本不会到这。)
     let toAsk = requests;
     if (this.getMode() === "auto" && this.classify) {
       const needHuman: ApprovalRequest[] = [];
-      // 熔断检查:连续/总 deny 超限时跳过分类器,全部转人工(对标 CC denialTracking)。
+      // 熔断检查:连续/总 deny 超限时跳过分类器,全部转人工。
       const tripped = this.isTripped();
       for (const r of requests) {
-        if (r.sensitive || tripped) { needHuman.push(r); continue; } // 敏感/危险 或已熔断:绝不交分类器
+        // 危险命令(rm -rf /、提权等):任何模式强制人工,绝不交分类器。
+        if (r.dangerous) { needHuman.push(r); continue; }
+        // 已熔断:回退人工。
+        if (tripped) { needHuman.push(r); continue; }
+        // 敏感目标(非危险)在 auto 下也交分类器,不再强制人工——分类器 prompt 自带
+        // "读写私钥/凭据 → BLOCK、项目内 .env → 继续"的判定;拿不准仍会转人工。
         let allow = false;
         try { allow = await this.classify(r.toolName, r.argsJson ?? "", this.getMessages()); }
         catch { allow = false; } // 分类器评估失败 -> 不自动放行,转人工(不是拒绝)
@@ -169,6 +175,7 @@ export class PermissionGate implements ApprovalGate {
     for (const r of toAsk) {
       const d = decisions.get(r.id) ?? "deny";
       if ((d === "always" || d === "session") && r.argsJson !== undefined) {
+        // 普通操作加白:记规则(同类不再问)。
         const rule = rememberRule(r.toolName, r.argsJson);
         if (rule) {
           this.addSessionAllow(rule);

@@ -22,8 +22,12 @@ describe("Session", () => {
     const s = new Session("SYS", "m");
     s.addUser("a");
     s.messages.push({ role: "assistant", content: "b" });
+    s.lastPromptTokens = 50000;
+    s.lastSentLength = 10;
     s.clear();
     expect(s.messages).toEqual([{ role: "system", content: "SYS" }]);
+    expect(s.lastPromptTokens).toBeUndefined();
+    expect(s.lastSentLength).toBe(0);
   });
 
   it("setModel changes the model without touching messages", () => {

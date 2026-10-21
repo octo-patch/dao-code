@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { defineTool, type ToolContext } from "./types.js";
+import { t } from "../i18n/i18n.js";
 
 // 选项(label + 可选描述);旧签名 options: string[] 仍兼容(无描述)
 const optionSchema = z.object({
@@ -65,9 +66,23 @@ export const askUserTool = defineTool({
     // ---- 完整模式:多问题 ----
     if (args.questions && args.questions.length > 0) {
       const results: string[] = [];
-      for (const q of args.questions) {
+      const discussValue = t("ui.choice.discussValue");
+      let discussAt = -1; // 哪个问题触发了"先讨论一下"
+      for (let i = 0; i < args.questions.length; i++) {
+        const q = args.questions[i]!;
+        if (discussAt >= 0) {
+          // 用户已要求先讨论,后续问题不再问——但要在结果里标注"未问",
+          // 让模型知道这些信息还缺,讨论结束后需要补问。
+          results.push(`[${i + 1}. ${q.question}] (未问——用户要求先讨论)`);
+          continue;
+        }
         const answer = await askOne(ctx, q.question, q.options, q.multiSelect);
-        results.push(answer);
+        if (answer === discussValue) {
+          results.push(`[${i + 1}. ${q.question}] ⚠ 用户想先讨论一下,先别急着定方向。`);
+          discussAt = i;
+        } else {
+          results.push(`[${i + 1}. ${q.question}] ${answer}`);
+        }
       }
       return results.join("\n");
     }

@@ -24,7 +24,14 @@ export const execShellKillTool = defineTool({
     id: z.string().describe("Bash 返回的后台进程 id"),
   }),
   handler: async (args) => {
-    processManager.kill(args.id);
-    return msg(`已发送终止信号给 ${args.id}`, `Sent termination signal to ${args.id}`);
+    let recovery: string | undefined;
+    try {
+      recovery = await processManager.kill(args.id);
+    } catch {
+      // 未知 id(不存在或已被 reset 清理)——描述里承诺"不会报错",返回友好提示而非抛错。
+      return msg(`${args.id} 不存在或已清理,无需终止。`, `${args.id} does not exist or has already been cleaned up; nothing to terminate.`);
+    }
+    const base = msg(`已发送终止信号给 ${args.id}`, `Sent termination signal to ${args.id}`);
+    return recovery ? `${base}\n${recovery}` : base;
   },
 });

@@ -62,6 +62,8 @@ describe("t / setLang", () => {
     setLang("en"); expect(t("onboard.provider.volcengine")).toBe("Volcengine (Coding Plan)");
     setLang("zh"); expect(t("onboard.provider.qianfan")).toBe("千帆 Token Plan");
     setLang("en"); expect(t("onboard.provider.qianfan")).toBe("Qianfan (Token Plan)");
+    setLang("zh"); expect(t("onboard.provider.zhipu")).toBe("智谱(Coding Plan)");
+    setLang("en"); expect(t("onboard.provider.zhipu")).toBe("Zhipu GLM (Coding Plan)");
     setLang("en"); expect(t("onboard.progress", 2, 4)).toBe("Step 2 / 4");
   });
   it("运行时通知/工具标签 ui.* 抽样 zh/en", () => {

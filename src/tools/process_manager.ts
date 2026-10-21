@@ -1,8 +1,38 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, exec, type ChildProcess } from "node:child_process";
 import { openSync, closeSync, readSync, statSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import { scrubbedEnv } from "./safe_env.js";
 import { sandboxSpawn } from "./sandbox.js";
+import { PKG_MGR_TIMEOUT_RE } from "./pkg_mgr_pattern.js";
+
+const execAsync = promisify(exec);
+
+// 包管理器命令(apt-get/apt/dpkg/aptitude)被后台 KillShell 打断,和 exec_shell.ts 里前台
+// abort 打断是同一个根因:dpkg 事务被留在半途(interrupted 态),不自动恢复的话这个损坏会
+// 悄悄传染到本次会话之后所有包管理操作,甚至连累到 verifier 自己要装的东西(真实撞见:
+// pytorch-model-cli,模型后台起了两次 apt-get install gcc、KillShell 杀掉其中一个,dpkg
+// 锁没释放,验收阶段自己装 curl/uv 全部失败)。exec_shell.ts 的前台 abort 分支已经有这段
+// 恢复逻辑,但 KillShell 走的是完全独立的代码路径,原来没覆盖到。
+async function attemptDpkgRecovery(): Promise<{ ok: boolean; stderr: string }> {
+  const tryOnce = async (): Promise<{ ok: boolean; stderr: string }> => {
+    try {
+      await execAsync("dpkg --configure -a");
+      return { ok: true, stderr: "" };
+    } catch (e) {
+      const stderr = e && typeof e === "object" && "stderr" in e ? String((e as { stderr: unknown }).stderr) : String(e);
+      return { ok: false, stderr };
+    }
+  };
+  let result = await tryOnce();
+  if (!result.ok) {
+    // 刚被杀掉的包管理器进程可能还没来得及释放 dpkg 锁,恢复命令撞了个空;
+    // 等一小段时间再试一次,dpkg --configure -a 本身幂等安全,重试不会有副作用。
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    result = await tryOnce();
+  }
+  return result;
+}
 
 // 杀整个进程组(detached 下 child 是组长,-pid 杀它及其 shell 派生的所有孙进程,避免孤儿)。
 function killTree(child: ChildProcess, sig: NodeJS.Signals): void {
@@ -77,6 +107,19 @@ class ProcessManager {
   private onChangeCb: (() => void) | undefined;
   private notify = () => this.onChangeCb?.();
 
+  // 已退出进程保留供 BashOutput 查最终状态,但无限累积会泄漏内存。
+  // 超过上限时删掉最老的已退出进程条目。
+  private static readonly MAX_FINISHED_PROCS = 200;
+  private gcFinished() {
+    let finished = 0;
+    for (const p of this.procs.values()) if (p.status === "exited") finished++;
+    if (finished <= ProcessManager.MAX_FINISHED_PROCS) return;
+    const old = [...this.procs.values()]
+      .filter((p) => p.status === "exited")
+      .sort((a, b) => (b.exitCode ?? 0) - (a.exitCode ?? 0)); // 顺序不重要,只要稳定删一批
+    for (const p of old.slice(0, finished - ProcessManager.MAX_FINISHED_PROCS)) this.procs.delete(p.id);
+  }
+
   onChange(cb: () => void): void { this.onChangeCb = cb; }
   drainNotifications(): string[] { return this.notifications.splice(0); }
   hasShellNotifications(): boolean { return this.notifications.length > 0; }
@@ -119,11 +162,14 @@ class ProcessManager {
       proc.signal = signal;
       // 进程退出时自动入队通知 -- 模型在下一个回合边界收到,不需要手动轮询。
       // notified 标记防止 poll()/kill() 路径二次入队同一个退出事件。
-      if (!proc.notified) {
+      // reset() 会 clear procs 并赋值新 notifications 数组——此时 procs 里已没有这个 id,
+      // 不检查就会往新数组里 push 上一个会话残留进程的退出通知,污染下一轮。
+      if (!proc.notified && this.procs.has(id)) {
         proc.notified = true;
         this.notifications.push(shellNotificationXml(id, command, code, signal));
         this.notify();
       }
+      this.gcFinished();
     });
     this.procs.set(id, proc);
     return id;
@@ -157,15 +203,25 @@ class ProcessManager {
     // 见 exec_shell.ts 的过继逻辑;这里只管接手之后的部分,不关心过继前谁在监听)。
     child.stdout?.on("data", (d: Buffer) => appendFileSync(stdoutPath, d));
     child.stderr?.on("data", (d: Buffer) => appendFileSync(stderrPath, d));
+    // adopt 的子进程用 pipe(不是文件 fd),exit 后 pipe 里可能还有未读完的 data。
+    // 用 close(stdio 流完全关闭)而非 exit 标记 exited,确保 poll() 看到 exited 时
+    // 文件里已包含全部输出——exit 先触发但 data 事件可能还在 flush pipe 残留。
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
     child.on("exit", (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+    });
+    child.on("close", () => {
       proc.status = "exited";
-      proc.exitCode = code;
-      proc.signal = signal;
-      if (!proc.notified) {
+      proc.exitCode = exitCode;
+      proc.signal = exitSignal;
+      if (!proc.notified && this.procs.has(id)) {
         proc.notified = true;
-        this.notifications.push(shellNotificationXml(id, command, code, signal));
+        this.notifications.push(shellNotificationXml(id, command, exitCode, exitSignal));
         this.notify();
       }
+      this.gcFinished();
     });
     this.procs.set(id, proc);
     return id;
@@ -187,10 +243,20 @@ class ProcessManager {
     };
   }
 
-  kill(id: string): void {
+  // 返回值:非包管理器命令时 resolve undefined;包管理器命令时 resolve 一段恢复结果说明
+  // (成功/失败都有文案,供 KillShell 工具的返回值里附带告知模型)。未知 id 仍然是同步抛错——
+  // 不是 async function,throw 发生在返回 Promise 之前,调用方 expect(() => kill(...)).toThrow()
+  // 这类同步断言不受影响。
+  kill(id: string): Promise<string | undefined> {
     const p = this.procs.get(id);
     if (!p) throw new Error(`未知后台进程:${id}`);
     killTree(p.child, "SIGTERM");
+    if (!PKG_MGR_TIMEOUT_RE.test(p.command)) return Promise.resolve(undefined);
+    return attemptDpkgRecovery().then((fix) =>
+      fix.ok
+        ? "[自动恢复] 检测到后台包管理器命令被终止,已跑 `dpkg --configure -a` 修复 dpkg 状态,可以重试。"
+        : `[自动恢复失败] 检测到后台包管理器命令被终止,尝试 \`dpkg --configure -a\` 修复但仍失败(已重试1次)——继续前建议手动确认 dpkg 状态。${fix.stderr.trim() ? `\n[恢复命令输出]\n${fix.stderr.trim()}` : ""}`,
+    );
   }
 
   runningCount(): number {

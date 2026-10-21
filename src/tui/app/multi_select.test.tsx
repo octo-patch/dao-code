@@ -18,8 +18,8 @@ function makeDeps(over: Partial<AppDeps> = {}): AppDeps {
     },
     submit: async () => {},
     runCommand: () => ({ handled: true, output: "" }),
-    compact: async () => {},
-    getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: false, branch: "main", contextPct: 0.1 }),
+    compact: async () => ({ before: 0, after: 0 }),
+    getStatus: () => ({ model: "m", mode: "normal", promptTokens: 0, completionTokens: 0, cacheHitRatio: 0, yolo: false, branch: "main", contextPct: 0.1, contextWindow: 1_000_000, contextUsed: 1000 }),
     register: () => {},
     ...over,
   };

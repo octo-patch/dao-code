@@ -7,7 +7,8 @@ export interface ApprovalRequest {
   capability: Capability;
   summary: string; // 给用户看的摘要(人类可读,命令含真实换行)
   argsJson?: string; // 原始参数(用于"允许并记住"生成规则)
-  sensitive?: boolean; // 触及敏感目标(.ssh/.git/凭据…):审批只给 是/否,不提供"始终允许"
+  sensitive?: boolean; // 触及敏感目标(.ssh/.git/凭据…)或危险命令。
+  dangerous?: boolean; // 极端危险命令(rm -rf /、提权等):任何模式强制人工确认,不提供"始终允许"。
   noPersist?: boolean; // 记不成有用规则(复合/一次性命令):也不提供"始终允许"(参考——不为永不再匹配的命令存规则)
 }
 

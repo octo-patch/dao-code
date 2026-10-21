@@ -32,10 +32,30 @@ describe("BashOutput / KillShell", () => {
     expect(processManager.poll(id).status).toBe("exited");
   });
 
+  it("KillShell 对不存在的 id 不抛错,返回友好提示(描述承诺'不会报错')", async () => {
+    const out = await execShellKillTool.handler({ id: "proc-nonexistent" }, ctx);
+    expect(out).toContain("不存在");
+  });
+
   it("declares auto approval", () => {
     expect(execShellPollTool.approval).toBe("auto");
     expect(execShellKillTool.approval).toBe("auto");
     expect(execShellPollTool.name).toBe("BashOutput");
     expect(execShellKillTool.name).toBe("KillShell");
+  });
+
+  it("单次 poll 输出超 2 万字符时截断(保留首尾,标注实际字符数)", async () => {
+    // 产出大量 stdout:用 perl 一次写 5 万个 'a' 到 stdout(实际可能因缓冲多写一些)
+    const id = processManager.start("perl -e 'print \"a\" x 50000'", process.cwd());
+    // 不用 waitFor(它会 poll 消费输出),直接等进程退出
+    await new Promise((r) => setTimeout(r, 500));
+    // handler 内部 poll 一次读走全部输出,应截断到 2 万
+    const formatted = await execShellPollTool.handler({ id }, ctx);
+    // 截断标注存在
+    expect(formatted).toContain("已截断");
+    // 返回值总长度应远小于原始输出(截断后约 2 万 + 标注)
+    expect(formatted.length).toBeLessThan(25000);
+    // 首尾都保留了(头部 'a' 和尾部 'a')
+    expect(formatted).toContain("a");
   });
 });

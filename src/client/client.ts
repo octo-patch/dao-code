@@ -61,11 +61,23 @@ export async function* streamChat(
   opts: StreamChatOptions,
 ): AsyncGenerator<StreamDelta, AssistantMessage> {
   const fetchImpl = opts.fetchImpl ?? fetch;
-  // 发给 API 的消息绝不带 reasoningContent(那是上一轮落盘用的思维链,不是该重放给模型的上下文——
-  // 多数 reasoning 模型的最佳实践是不要把旧思维链塞回上下文,也没必要多花 token)。
+  // DeepSeek 官方文档(api-docs.deepseek.com/guides/thinking_mode):两个 user 消息之间,
+  // 若这一轮 assistant 发起过工具调用,思维链必须在后续所有请求里原样带回去(reasoning_content
+  // 字段);没发起工具调用的轮次则不需要、也不应该带(原生 API 甚至会 400)。2026-07-24 用真实
+  // 火山方舟(ARK)网关做过对照实验:两种做法都不报错(ARK 比原生 API 宽松),但带上时
+  // prompt_tokens 确实按思维链长度真实增长——说明 ARK 会读这个字段喂给模型,不是静默丢弃。
   const wireMessages = opts.messages.map((m) => {
-    if (m.role === "assistant" && m.reasoningContent) {
-      return { role: m.role, content: m.content, ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}) };
+    if (m.role === "assistant") {
+      // 火山方舟(ARK)等网关对 assistant 消息的 content 字段要求非 null——纯工具调用回合
+      // 的 content: null(OpenAI 规范允许)发给这类网关会返回空响应或 400。DeepSeek 原生 API
+      // 接受 null,空字符串 "" 对两者都合法,统一转成 ""。
+      const content = m.content ?? "";
+      if (m.reasoningContent) {
+        return m.tool_calls
+          ? { role: m.role, content, tool_calls: m.tool_calls, reasoning_content: m.reasoningContent }
+          : { role: m.role, content };
+      }
+      return { ...m, content };
     }
     if (m.role === "tool" && m.imageData) {
       // imageData 是内部字段(图片已通过单独的 user message 注入),不发给 API
@@ -79,9 +91,13 @@ export async function* streamChat(
   // 还会被原样存进历史,下一轮把这条坏消息重发给 API 时直接 400 崩掉(千帆/ARK 对
   // tool_calls[].function.arguments 的 JSON 合法性校验比 DeepSeek 严格)。给一个远高于
   // 常见隐式默认值的显式上限,从源头上让这类大段单次输出不那么容易被截断。
-  // 8192 起步、可用 DAO_MAX_OUTPUT_TOKENS 覆盖;调用方也可用 opts.maxTokens 单次覆盖
-  // (如权限分类器这类只需要几个字的场景,虽然不设也无妨——上限只是天花板,不影响实际生成量)。
-  const maxTokens = opts.maxTokens ?? (Number(process.env.DAO_MAX_OUTPUT_TOKENS) || 16000);
+  // 128000 起步(2026-08-01 由 64000 再上调一档——真实撞见:adaptive-rejection-sampler
+  // flash 模型复测,第一轮纯文字推导直接吐满 64000 上限才被截断,没留下任何工具调用,
+  // 说明 64000 对"高频撞见需要大段代数推导/长脚本"的任务仍不够宽松;配合 loop.ts 把空响应
+  // 重试档同步上调到 256000,保持重试档相对基线的翻倍余量不塌缩)、可用 DAO_MAX_OUTPUT_TOKENS
+  // 覆盖;调用方也可用 opts.maxTokens 单次覆盖(如权限分类器这类只需要几个字的场景,虽然不设
+  // 也无妨——上限只是天花板,不影响实际生成量)。
+  const maxTokens = opts.maxTokens ?? (Number(process.env.DAO_MAX_OUTPUT_TOKENS) || 128000);
   // OpenAI 的推理层模型(o1 系列、gpt-5 等)把 max_tokens 参数换成了 max_completion_tokens,
   // 传旧字段名会直接 400;其余(DeepSeek/火山方舟/千帆等 OpenAI-legacy 兼容网关)仍用 max_tokens。
   const maxTokensField = /^(gpt-5|o1|o3|o4)/i.test(opts.model) ? "max_completion_tokens" : "max_tokens";
@@ -191,6 +207,17 @@ export async function* streamChat(
       parsed = JSON.parse(payload);
     } catch {
       return []; // 半个 JSON 不该出现(已按 \n\n 切),保险跳过
+    }
+    // SSE 流内 error 事件(如 brpc 网关 E2004 max_concurrency 过载):服务端在 200 响应的流里
+    // 直接返回 {"error":{"code":"E2004","message":"..."}},没有 choices/delta。旧逻辑只看
+    // choices[0].delta、不识别 error 字段,静默跳过 → 流式"成功"结束但无产出 → loop.ts 当成
+    // 空响应 → 重试一次还是 E2004 → "连续两次空响应,结束本轮"。这里识别后抛出可重试错误,
+    // 让下面的流式重试逻辑(指数退避)处理。
+    if (parsed?.error) {
+      const errMsg = typeof parsed.error === "string"
+        ? parsed.error
+        : `${parsed.error.code ?? "unknown"}: ${parsed.error.message ?? ""}`;
+      throw Object.assign(new Error(`SSE error from ${apiLabel(opts)}: ${errMsg}`), { retryableStatus: true });
     }
     // usage chunk(choices 常为空)在 [DONE] 前到达——先抓它再判 delta。
     if (parsed?.usage) opts.onUsage?.(normalizeUsage(parsed.usage as Usage));

@@ -5,6 +5,9 @@ import path from "node:path";
 // 影子 git:用独立的 git 目录(.dao/shadow.git)对工作区做快照/回滚,
 // 完全不碰用户自己的 .git、不改用户提交历史。每个回合前后 snapshot 一个点,/restore 回退文件。
 // add -A 会自动尊重工作区的 .gitignore(node_modules/.dao 等已被排除)。
+//
+// 默认关闭:需通过 settings.json 的 checkpoint.enabled = true 或环境变量 DAO_CHECKPOINT=1 显式开启。
+// DAO_NO_CHECKPOINT 仍保留为强制关闭(优先级最高,用于排障/禁用)。
 
 export interface Checkpointer {
   enabled: boolean;
@@ -27,8 +30,20 @@ const EXCLUDES = [
   "",
 ];
 
-export function createCheckpointer(workspaceRoot: string): Checkpointer {
-  if (process.env.DAO_NO_CHECKPOINT) return noop; // 显式关闭
+// 解析是否启用:DAO_NO_CHECKPOINT 强制关闭(最高优先级);options.enabled 为显式开启;
+// DAO_CHECKPOINT=1/true 环境变量也可开启。默认关闭。
+function shouldEnable(optEnabled?: boolean): boolean {
+  if (process.env.DAO_NO_CHECKPOINT) return false; // 显式关闭,最高优先级
+  if (optEnabled !== undefined) return optEnabled; // 调用方显式指定
+  if (process.env.DAO_CHECKPOINT) {
+    const v = process.env.DAO_CHECKPOINT.toLowerCase();
+    return v === "1" || v === "true" || v === "yes" || v === "on";
+  }
+  return false; // 默认关闭
+}
+
+export function createCheckpointer(workspaceRoot: string, options: { enabled?: boolean } = {}): Checkpointer {
+  if (!shouldEnable(options.enabled)) return noop;
   const daoDir = path.join(workspaceRoot, ".dao");
   // 防冲突:用户真实 git 不应把 .dao/(影子库/会话/导出)纳入版本管理。写一个忽略一切的 .gitignore
   // (含其自身),用户的 git 从此完全看不到 .dao。幂等。
@@ -37,11 +52,17 @@ export function createCheckpointer(workspaceRoot: string): Checkpointer {
     if (!existsSync(path.join(daoDir, ".gitignore"))) writeFileSync(path.join(daoDir, ".gitignore"), "*\n");
   } catch {}
   const gitDir = path.join(daoDir, "shadow.git");
+  // 硬超时:execFileSync 真同步阻塞 Node 主线程(不是等网络那种可被 ESC/Ctrl-C 打断的 await)——
+  // 超大工作区(实测撞见:108GB、一堆未被 EXCLUDES 覆盖的 .rar/.exe/.xp3/.mpg 大文件目录)下
+  // `git add -A` 首次快照要给每个文件算哈希,能卡到 6 分钟+ 完全无响应。超时后 execFileSync
+  // 抛错,走既有 catch 分支优雅降级(不打快照),不再无限期冻结整个回合。
+  const HARD_TIMEOUT_MS = Number(process.env.DAO_CHECKPOINT_TIMEOUT_MS) || 10000;
   const run = (args: string[], opts: { gitOnly?: boolean } = {}) =>
     execFileSync("git", ["--git-dir", gitDir, ...args], {
       cwd: workspaceRoot,
       stdio: ["ignore", "pipe", "ignore"],
       encoding: "utf8",
+      timeout: HARD_TIMEOUT_MS,
     });
   try {
     if (!existsSync(gitDir)) {
@@ -75,6 +96,7 @@ export function createCheckpointer(workspaceRoot: string): Checkpointer {
         if (Date.now() - t0 > MAX_MS) tooSlow = true; // 太慢 → 后续跳过
         return sha;
       } catch {
+        tooSlow = true; // 失败(含硬超时被杀)大概率下次还是慢/还会卡,后续跳过而不是每回合重试
         return null;
       }
     },

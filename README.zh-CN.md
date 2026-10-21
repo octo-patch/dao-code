@@ -56,7 +56,10 @@ Dao Code(命令 `dao`)是终端原生的 AI 编码助手:在你的终端里读�
 
 ### ✅ 已被验证
 
-真实开源近期 bug-fix 评测(SWE-bench 风格,fail2pass + pass2pass 双轨判定,测试文件对 agent 隐藏以防 reward-hacking):**稳定解决 13/14**。详见 [测试与评测](#-测试与评测)。
+- 真实开源近期 bug-fix 评测(SWE-bench 风格,fail2pass + pass2pass 双轨判定,测试文件对 agent 隐藏以防 reward-hacking):**稳定解决 13/14**。
+- 在 **Terminal-Bench 2.1**(第三方基准,89 道题,经 [Harbor](https://www.harborframework.com/) 跑,覆盖系统管理、安全、数据科学、科学计算、调试、机器学习等领域)上:`deepseek-v4-pro`、官方 1× 超时口径下**通过 70/89(78.7%)**。有意思的不是分数本身,而是这轮迭代本身就是一次**评测驱动的工程优化**——读真实失败轨迹定位并修复的是框架层真实 bug,不是靠调提示词刷分。详见下文。
+
+详见 [测试与评测](#-测试与评测)。
 
 ---
 
@@ -139,7 +142,7 @@ npm install && npm run build && npm link   # 之后可全局 dao
 |---|---|
 | `/init` | 扫描本仓库生成 `DAO.md`(项目概览/约定,供以后会话自动加载) |
 | `/model [id]` | 切换模型(不带参数在 `deepseek-v4-pro` / `deepseek-v4-flash` 间切换) |
-| `/mode [x]` | 权限模式 `default` / `acceptEdits` / `auto`(智能审批)/ `plan`(亦 **Shift+Tab** 循环) |
+| `/mode [x]` | 权限模式 `default` / `auto`(智能审批)/ `yolo`(亦 **Shift+Tab** 循环) |
 | `/plan` | 快捷切换 plan(只读+提方案)/ normal |
 | `/goal <目标>` | 长任务自主模式(自动批准 + 连续推进,大任务自动分阶段) |
 | `/cost` | 查看 token 用量与缓存命中率 |
@@ -209,10 +212,10 @@ dao "把 src/utils.ts 里的 formatDate 改成支持时区"
 
 ## 🧩 扩展系统
 
-- **权限控制**:规则三态 `allow / ask / deny`,语法 `Tool(specifier)`——`Bash(npm run test:*)`(命令前缀)、`Edit(src/**)`/`Read(//etc/**)`(gitignore 式路径 glob)、`WebFetch(domain:example.com)`、裸工具名、`mcp__server__tool`。优先级 **deny > ask > allow > 模式/能力默认**(deny 是硬黑名单,YOLO 下也拦)。
+- **权限控制**:规则三态 `allow / ask / deny`,语法 `Tool(specifier)`——`Bash(npm run test:*)`(命令前缀)、`Edit(src/**)`/`Read(//etc/**)`(gitignore 式路径 glob)、`WebFetch(domain:example.com)`、裸工具名、`mcp__server__tool`。优先级 **deny > 危险命令 > bypass > 敏感目标 > ask > allow > 模式/能力默认**(deny 是硬黑名单,YOLO 下也拦;`rm -rf /` 这类危险命令任何模式都强制确认)。
   - **分层**(低→高优先级):`~/.dao/settings.json`(用户)< `.dao/settings.json`(项目,入库)< `.dao/settings.local.json`(本地,不入库)< **CLI**(`--allow`/`--deny`/`--add-dir`/`--permission-mode`)< **企业托管策略**(`/etc/dao/managed-settings.json` 等,不可被下层覆盖)。
   - **复合命令逐段检查**:`cd /tmp && rm -rf x` 会按 `&&`/`||`/`;`/`|` 拆开,任一子命令命中 deny 即整条拦截(杜绝绕过)。
-  - **权限模式**(`/mode <x>` 或 **Shift+Tab** 循环;状态栏显示):`default`(按需审批)/ `acceptEdits`(自动批准文件编辑)/ `auto`(AI 分类器智能审批:只读与工作区内编辑自动放行、拿不准转人工)/ `plan`(只读规划);`bypassPermissions`(=YOLO)仅 `dao --yolo` 启动时开。
+  - **权限模式**(`/mode <x>` 或 **Shift+Tab** 循环;状态栏显示):`default`(按需审批)/ `auto`(AI 分类器智能审批:只读与工作区内编辑自动放行,敏感目标与拿不准的调用交分类器——私钥如 `~/.ssh/id_rsa` 会被分类器 BLOCK、拿不准转人工)/ `bypassPermissions`(=YOLO,免审批,仅 deny 与危险命令仍拦;可 `/mode yolo` 或 `/yolo` 会话内切换)。`plan`(只读规划,写/exec 一律 deny)也是权限模式,但不参与 `/mode` 切换——用 `/plan`、`settings.defaultMode` 或 `--permission-mode plan` 进入。
   - **审批四档**:`[y]` 本次 / `[s]` 本会话 / `[a]` 记住(写 allow 规则到 `.dao/settings.local.json`)/ `[n]` 拒绝。
   - `additionalDirectories`:预授权的工作区外目录,读取不弹窗。
   - 引擎:`src/permissions/`(rules / identity / settings / engine / gate),含端到端测试。
@@ -271,6 +274,22 @@ EVAL_RUNS=1 node evals/run.mjs # 冒烟
 ```
 
 > 评测真实调用模型、产生费用;每题在抛弃式临时目录跑,无人值守时设 `DAO_AUTO_APPROVE=1` 自动放行。详见 [`evals/README.md`](evals/README.md)。
+
+### Terminal-Bench 2.1 —— 评测驱动的工程优化
+
+[Terminal-Bench](https://www.tbench.ai/) 是第三方终端/编程能力基准,题目跑在沙盒容器里由隐藏的判分脚本裁决,这里通过 [Harbor](https://www.harborframework.com/) 跑。89 道题(4 easy / 55 medium / 30 hard)覆盖系统管理、安全、数据科学、科学计算、调试、机器学习等领域。Dao Code 用 `deepseek-v4-pro`、官方 1× 超时口径(从不为了让题目更容易而放大)**通过 70/89(78.7%)**。
+
+这个分数的背后是一套闭环,不是"读日志、改代码"这么简单——**内省 → 启发式优化 → 复查**:
+
+- **内省**——不满足于表面现象("900 秒 0 次工具调用"),要往下确定"为什么":模型是不知道该做什么、知道但不肯做、还是做了但技术上没做对。三种成因对应完全不同的修法。且一个改动必须能解释**至少 2 道题共享同一根因**才够格立案,单题的怪癖不算,避免对着题库过拟合。
+- **启发式优化**——按内省结论选一个"够用但不过度"的干预强度,能用软提醒解决就不上硬机制,证据不够就不轻易升级。
+- **复查**——真实复测,并且对"看起来生效了"保持怀疑:机制触发了不等于任务通过。这一步不核对到 reward 数字和归因链条都对上,闭环就不算完。
+
+**最能体现这套方法论的案例是 `TodoWrite` 硬拦截。** headless 会话会闷头推理满 15 分钟预算、一次工具都不调。*内省*:先核对系统提示词——"先规划再动手"这句话确实原样注入了(逐字节核对过转录),问题不是指令没送到,而是**软性文字指令对模型没有真实约束力**这个更根本的结论。*启发式优化*:既然软文字层已经验证无效,直接升级到机制层——不是建议,是运行时硬拦截:headless 会话首批工具调用里不含 `TodoWrite` 就整批拒绝执行。*复查*:真实复测确认机制本身确实生效(模型第一步就是 `TodoWrite`)——但复查没有止步于此,继续往下看 reward:某道题机制正确触发后 reward 依然是 0,因为真正的卡点早就转移到一个和"要不要先规划"毫无关系的内存损坏 bug。如果复查只满足于"机制触发了"就收工,会记出一个虚假的胜利;闭环只有在 reward 和归因链条都对得上时才算真正闭合。
+
+同一套内省-启发式优化-复查纪律,在其它题上也抓到了单靠调提示词永远抓不到的问题:超时被强杀前用后台快照循环保住自己的诊断证据;一道 `qemu` 家族题其实是被宿主机(Rosetta 2 的能力缺口)杀掉而不是模型的锅,改成本地原生构建;评测模式的联网权限让模型抓到了泄漏的参考答案而不是自己解题,加了一个显式开关禁用联网。
+
+剩下未通过的题也都归到了具体的根因类别(真实工程量超出时间预算、思路正确但实现有 bug、需要特定领域洞察、指令与判分脚本本身的落差),不是一个说不清楚的分数;任何可能影响可比性的环境改动(比如某道密码学题被裁剪过的密码字典)也如实披露,不悄悄算进通过率。完整逐题结果、失败归因台账、跑分脚本本身见 [`evals/terminal-bench/`](evals/terminal-bench/README.md)。
 
 ---
 

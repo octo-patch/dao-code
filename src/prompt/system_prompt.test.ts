@@ -17,6 +17,14 @@ describe("buildSystemPrompt (zh)", () => {
     expect(prompt).toContain("- Write:写文件");
   });
 
+  it("model self-identification (zh): states model id + vision support", () => {
+    expect(prompt).toContain("你当前运行的模型是 deepseek-v4-pro");
+    expect(prompt).toContain("不支持图片输入");
+    const visionPrompt = buildSystemPrompt({ modelId: "kimi-k2.7-code", toolSummaries: "- a:b" });
+    expect(visionPrompt).toContain("你当前运行的模型是 kimi-k2.7-code");
+    expect(visionPrompt).toContain("这个模型支持图片输入");
+  });
+
 
   it("reflectMemoryEnabled/reflectChallengerEnabled 默认都关闭 → 整段审视/反思提醒都不出现", () => {
     expect(prompt).not.toContain("[审视者]");
@@ -121,6 +129,18 @@ describe("buildSystemPrompt (zh)", () => {
     expect(p).toContain("会话特定指引");
     expect(p).toContain("AskUserQuestion 不会有人来回答");
     expect(p).toContain("合理默认");
+  });
+
+  it("interactive: false → 强制要求开局先用 TodoWrite 拆子步骤(headless 没有中途纠偏机会)", () => {
+    const p = buildSystemPrompt({ modelId: "m", toolSummaries: "- a:b", interactive: false });
+    expect(p).toContain("第一步必须先调用 TodoWrite 把任务拆成具体子步骤");
+  });
+
+  it("interactive 省略/true → 不出现 headless 专属的 TodoWrite 强制要求(交互式让模型自己判断)", () => {
+    const p1 = buildSystemPrompt({ modelId: "m", toolSummaries: "- a:b" });
+    const p2 = buildSystemPrompt({ modelId: "m", toolSummaries: "- a:b", interactive: true });
+    expect(p1).not.toContain("第一步必须先调用 TodoWrite 把任务拆成具体子步骤");
+    expect(p2).not.toContain("第一步必须先调用 TodoWrite 把任务拆成具体子步骤");
   });
 
   it("行动纪律区分'设计决定'与'行为预测':说'让我测试一下'却用文字模拟结果算破戒", () => {
@@ -234,6 +254,18 @@ describe("buildSystemPrompt (en)", () => {
     expect(p).toContain("reasonable default");
   });
 
+  it("interactive: false → requires TodoWrite plan up front (no one available to redirect mid-course)", () => {
+    const p = buildSystemPrompt({ modelId: "m", toolSummaries: "- a:b", lang: "en", interactive: false });
+    expect(p).toContain("the first step must be calling TodoWrite to break the task into concrete sub-steps");
+  });
+
+  it("interactive omitted/true → no headless-only TodoWrite requirement (interactive lets the model judge)", () => {
+    const p1 = buildSystemPrompt({ modelId: "m", toolSummaries: "- a:b", lang: "en" });
+    const p2 = buildSystemPrompt({ modelId: "m", toolSummaries: "- a:b", lang: "en", interactive: true });
+    expect(p1).not.toContain("the first step must be calling TodoWrite to break the task into concrete sub-steps");
+    expect(p2).not.toContain("the first step must be calling TodoWrite to break the task into concrete sub-steps");
+  });
+
   it("interactive 省略/true → no unattended-session guidance", () => {
     const p1 = buildSystemPrompt({ modelId: "m", toolSummaries: "- a:b", lang: "en" });
     const p2 = buildSystemPrompt({ modelId: "m", toolSummaries: "- a:b", lang: "en", interactive: true });
@@ -258,6 +290,20 @@ describe("buildSystemPrompt (en)", () => {
     expect(prompt).toContain("categorically different approach");
     expect(prompt).toContain("retrying a 3rd");
     expect(prompt).toContain("Don't confuse \"viable\"");
+  });
+
+  it("model self-identification: states the running model id and vision support (positive case)", () => {
+    const p = buildSystemPrompt({ modelId: "kimi-k2.6", toolSummaries: "- a:b", lang: "en" });
+    expect(p).toContain("You are currently running as kimi-k2.6");
+    expect(p).toContain("This model supports image input");
+    expect(p).not.toContain("does not support image input");
+  });
+
+  it("model self-identification: non-vision model gets the negative note, not the positive one", () => {
+    const p = buildSystemPrompt({ modelId: "deepseek-v4-pro", toolSummaries: "- a:b", lang: "en" });
+    expect(p).toContain("You are currently running as deepseek-v4-pro");
+    expect(p).toContain("does not support image input");
+    expect(p).not.toContain("This model supports image input");
   });
 });
 

@@ -1,4 +1,5 @@
 import type { ApiTool } from "../client/types.js";
+import type { ZodTypeAny } from "zod";
 import { toJsonSchema } from "./schema.js";
 import type { Tool, ToolContext, ToolDispatcher } from "./types.js";
 import type { Lang } from "../i18n/i18n.js";
@@ -44,6 +45,67 @@ function describeTruncatedArgs(partial: Record<string, unknown>): string {
       return `${k}(${v.length} 字符,结尾"${tail}")`;
     })
     .join("; ");
+}
+
+// 从 zod schema 提取字段清单(名/类型/是否必填/描述),用于 ZodError 翻译时告诉模型"这个工具接受哪些参数"。
+// 走 zodToJsonSchema 而非手翻 _def,保证和发给模型的 function calling parameters 一致。
+function describeToolParams(schema: ZodTypeAny): string {
+  const js = toJsonSchema(schema);
+  const props = (js.properties ?? {}) as Record<string, Record<string, unknown>>;
+  const required = new Set((js.required ?? []) as string[]);
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(props)) {
+    const req = required.has(k) ? "必填" : "可选";
+    const type = v.enum ? `enum(${(v.enum as unknown[]).join("|")})` : (v.type as string ?? "any");
+    const desc = v.description ? `, ${v.description as string}` : "";
+    parts.push(`${k}(${type}, ${req}${desc})`);
+  }
+  return parts.length ? parts.join("; ") : "(无参数)";
+}
+
+// 把 ZodError 翻译成对模型更友好的提示。原始 ZodError.message 是一段 JSON 数组,模型能解析但不够直白——
+// 真实撞见(20260916-154427-ebx2):模型把 Glob 的 `glob` 参数写成了 `pattern`(和 Grep 记串),zod 报
+// "invalid_type / expected string / received undefined / path [glob] / Required",模型看到后虽然能纠正,
+// 但如果提示里直接点出"你传了 pattern,但 Glob 需要 glob",纠正会更快、更少重试。
+// 只处理最常见的 invalid_type(缺字段/类型错)和 unrecognized_keys(多余字段),其余回退原始 message。
+function formatZodError(name: string, schema: ZodTypeAny, rawArgs: string, err: unknown): string {
+  const issues = (err as { issues?: unknown[] }).issues;
+  if (!Array.isArray(issues) || issues.length === 0) return (err as Error).message;
+
+  const passedKeys = (() => { try { return Object.keys(JSON.parse(rawArgs) as object); } catch { return []; } })();
+  const paramList = describeToolParams(schema);
+
+  // 当工具只有一个必填字段且模型漏传时,附一个最小调用示例——比参数列表更直接,模型纠正更快。
+  // 真实撞见:Grep 缺 pattern、Glob 缺 glob、Read 缺 path,模型反复重试同一错误调用。
+  const requiredFields = ((toJsonSchema(schema).required ?? []) as string[]);
+  const missingFields = issues
+    .filter((i) => (i as { code?: string; received?: string }).code === "invalid_type" && (i as { received?: string }).received === "undefined")
+    .map((i) => ((i as { path?: (string | number)[] }).path ?? []).join("."))
+    .filter(Boolean);
+  const minCallHint = (missingFields.length > 0 && requiredFields.length === 1)
+    ? ` 最小调用示例:${name}({"${requiredFields[0]}": "<值>"})`
+    : "";
+
+  const lines: string[] = [];
+  for (const issue of issues) {
+    const iss = issue as { code?: string; path?: (string | number)[]; expected?: string; received?: string; keys?: string[]; message?: string };
+    const field = iss.path?.length ? iss.path.join(".") : "(root)";
+    if (iss.code === "invalid_type" && iss.received === "undefined") {
+      // 缺必填字段:最可能是参数名写错(传了 X 但工具要 Y)或漏传
+      const hint = passedKeys.length > 0
+        ? `你传了 [${passedKeys.join(", ")}],但 ${name} 不含名为「${field}」的字段——参数名可能写错了(比如把别的工具的参数名用到了这里)。`
+        : `${name} 需要参数「${field}」,但你没传任何参数。`;
+      lines.push(`${name} 缺少必填参数「${field}」(${iss.expected})。${hint} ${name} 接受的参数:${paramList}${minCallHint}`);
+    } else if (iss.code === "invalid_type") {
+      lines.push(`${name} 参数「${field}」需要 ${iss.expected},收到 ${iss.received}。${name} 接受的参数:${paramList}`);
+    } else if (iss.code === "unrecognized_keys") {
+      lines.push(`${name} 不接受参数 [${(iss.keys ?? []).join(", ")}]——这些字段不在它的 schema 里。${name} 接受的参数:${paramList}`);
+    } else {
+      // 其他类型(enum 值非法、数值越界等)回退原始 message
+      lines.push(`${name} 参数「${field}」校验失败:${iss.message ?? (err as Error).message}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 export class ToolRegistry implements ToolDispatcher {
@@ -219,7 +281,7 @@ export class ToolRegistry implements ToolDispatcher {
       if (partial) {
         throw new Error(
           `invalid JSON arguments for ${name}(输出在生成过程中被截断,未执行——已生成到:${describeTruncatedArgs(partial)}。` +
-          `这次内容太长,把它拆成更小的几次调用:比如先用 Write 写一部分,再用 Edit/MultiEdit 续写剩余内容,不要试图一次性重新生成同样长度的内容。)`,
+          `这次内容太长,把它拆成更小的几次调用:比如先用 Write 写一部分,再用 Edit 续写剩余内容,不要试图一次性重新生成同样长度的内容。)`,
         );
       }
       throw new Error(`invalid JSON arguments for ${name}`);
@@ -240,7 +302,10 @@ export class ToolRegistry implements ToolDispatcher {
           `原始校验错误:${(e as Error).message}`,
         );
       }
-      throw e;
+      // 非 ZodError(不该发生但兜底)或 ZodError 但 issues 为空:原样抛
+      const issues = (e as { issues?: unknown[] }).issues;
+      if (!Array.isArray(issues) || issues.length === 0) throw e;
+      throw new Error(formatZodError(name, tool.schema, rawArgs, e));
     }
     return tool.handler(args, ctx);
   }

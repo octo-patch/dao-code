@@ -12,7 +12,7 @@ describe("parseSettings", () => {
         ask: ["Edit(src/**)"],
         deny: ["Read(.env)"],
         additionalDirectories: ["/tmp/x"],
-        defaultMode: "acceptEdits",
+        defaultMode: "auto",
       },
     });
     expect(parseSettings(raw)).toEqual({
@@ -20,7 +20,7 @@ describe("parseSettings", () => {
       ask: ["Edit(src/**)"],
       deny: ["Read(.env)"],
       additionalDirectories: ["/tmp/x"],
-      defaultMode: "acceptEdits",
+      defaultMode: "auto",
     });
   });
   it("缺 permissions / 损坏 JSON → 空配置", () => {
@@ -94,9 +94,9 @@ describe("mergePermissions — 低→高优先级", () => {
   });
   it("高层未定义 defaultMode 时沿用低层", () => {
     expect(mergePermissions([
-      { ...emptyPermissions(), defaultMode: "acceptEdits" },
+      { ...emptyPermissions(), defaultMode: "auto" },
       emptyPermissions(),
-    ]).defaultMode).toBe("acceptEdits");
+    ]).defaultMode).toBe("auto");
   });
 });
 
@@ -135,11 +135,11 @@ describe("loadPermissions — 文件分层(缺文件跳过)", () => {
     const user = path.join(dir, "user.json");
     const local = path.join(dir, "local.json");
     await fs.writeFile(user, JSON.stringify({ permissions: { deny: ["Bash(rm:*)"], defaultMode: "default" } }));
-    await fs.writeFile(local, JSON.stringify({ permissions: { allow: ["Bash(npm:*)"], defaultMode: "acceptEdits" } }));
+    await fs.writeFile(local, JSON.stringify({ permissions: { allow: ["Bash(npm:*)"], defaultMode: "auto" } }));
     const merged = await loadPermissions([user, path.join(dir, "missing.json"), local]);
     expect(merged.config.deny).toEqual(["Bash(rm:*)"]);
     expect(merged.config.allow).toEqual(["Bash(npm:*)"]);
-    expect(merged.config.defaultMode).toBe("acceptEdits"); // local 最高层
+    expect(merged.config.defaultMode).toBe("auto"); // local 最高层
     // per-source 追踪:每条规则知道来自哪个文件
     expect(merged.sources.get("deny:Bash(rm:*)")).toBe(user);
     expect(merged.sources.get("allow:Bash(npm:*)")).toBe(local);

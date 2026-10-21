@@ -1,6 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { dispatchCommand } from "./commands.js";
 import { Session } from "../session/session.js";
+import { setLang, getLang } from "../i18n/i18n.js";
+
+// /lang 测试会写 ~/.dao/settings.json(真实持久化路径,测试环境属可接受副作用);
+// 用例内显式 setLang 起点,避免依赖文件残留状态。
+afterEach(() => setLang("zh"));
 
 function sess() {
   return new Session("SYS", "deepseek-v4-pro");
@@ -66,7 +71,7 @@ describe("dispatchCommand", () => {
     expect(s.model).toBe("glm-5.1");
   });
 
-  it("/model 无参在 volcengine 下按完整 10 档循环回到 pro", () => {
+  it("/model 无参在 volcengine 下按完整 11 档循环回到 pro", () => {
     const s = sess(); // 初始 deepseek-v4-pro
     const order = [
       "deepseek-v4-flash",
@@ -78,6 +83,7 @@ describe("dispatchCommand", () => {
       "kimi-k2.7-code",
       "minimax-m2.7",
       "minimax-m3",
+      "ark-code-latest",
       "deepseek-v4-pro",
     ];
     for (const expected of order) {
@@ -129,8 +135,19 @@ describe("dispatchCommand", () => {
   it("/clear resets the conversation", () => {
     const s = sess();
     s.addUser("a");
+    s.lastPromptTokens = 50000;
+    s.lastSentLength = 10;
+    s.addUsage({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_cache_hit_tokens: 50 }, "deepseek-v4-pro");
     dispatchCommand("/clear", s);
     expect(s.messages).toHaveLength(1);
+    expect(s.lastPromptTokens).toBeUndefined();
+    expect(s.lastSentLength).toBe(0);
+    // usage 也应归零(Input/Output/Cache hit/Cost 都重置)
+    expect(s.usage.promptTokens).toBe(0);
+    expect(s.usage.completionTokens).toBe(0);
+    expect(s.usage.cacheHitTokens).toBe(0);
+    expect(s.cacheHitRatio()).toBe(0);
+    expect(s.costCNY()).toBe(0);
   });
 
   it("/exit signals exit", () => {
@@ -141,6 +158,33 @@ describe("dispatchCommand", () => {
     const r = dispatchCommand("/compact", sess());
     expect(r.handled).toBe(true);
     expect(r.compact).toBe(true);
+  });
+
+  it("/lang 带参切换语言并生效", async () => {
+    setLang("en");
+    const r = dispatchCommand("/lang zh", sess());
+    expect(r.handled).toBe(true);
+    expect(r.output).toContain("中文");
+    await vi.waitFor(() => expect(getLang()).toBe("zh")); // switchLang 异步持久化,语言先行生效
+    const r2 = dispatchCommand("/lang en", sess());
+    expect(r2.output).toContain("English");
+    await vi.waitFor(() => expect(getLang()).toBe("en"));
+  });
+
+  it("/lang 无参在 zh/en 间切换", async () => {
+    setLang("zh");
+    dispatchCommand("/lang", sess());
+    await vi.waitFor(() => expect(getLang()).toBe("en"));
+    dispatchCommand("/lang", sess());
+    await vi.waitFor(() => expect(getLang()).toBe("zh"));
+  });
+
+  it("/lang 非法参数报错且不改动语言", () => {
+    setLang("zh");
+    const r = dispatchCommand("/lang fr", sess());
+    expect(r.handled).toBe(true);
+    expect(r.output).toContain("zh / en");
+    expect(getLang()).toBe("zh");
   });
 
   it("unknown command is handled with a hint", () => {

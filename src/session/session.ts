@@ -114,6 +114,16 @@ export class Session {
 
   clear(): void {
     this.messages = [{ role: "system", content: this.systemPrompt }];
+    this.lastPromptTokens = undefined; // 清空后上下文用量归零,StatusBar/shouldCompact 不再误报旧值
+    this.lastSentLength = 0;
+    // /clear 应彻底重置本会话用量统计:Input/Output/Cache hit/Cost 都归零,
+    // 否则 StatusBar 仍显示清空前的累计值,与"已清空对话"的语义矛盾。
+    this.usage.promptTokens = 0;
+    this.usage.completionTokens = 0;
+    this.usage.cacheHitTokens = 0;
+    this.usage.cacheMissTokens = 0;
+    this.modelUsage.clear();
+    this.lastCall = undefined;
   }
 
   setModel(model: string): void {

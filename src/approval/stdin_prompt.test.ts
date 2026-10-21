@@ -35,4 +35,31 @@ describe("makeApprovalPrompt", () => {
     expect(askCalled).toBe(false);
     expect(decisions.size).toBe(0);
   });
+
+  it("敏感请求(非危险):给 [a] 始终允许(同类不再问)", async () => {
+    let promptText = "";
+    const ask = async (p: string) => { promptText = p; return "a"; };
+    const prompt = makeApprovalPrompt(ask, true);
+    const decisions = await prompt([{ ...req("s"), sensitive: true }]);
+    expect(decisions.get("s")).toBe("always");
+    expect(promptText).toContain("[a]始终允许(同类不再问)");
+  });
+
+  it("极端危险请求(dangerous):只给 [y]/[n],不提供始终允许", async () => {
+    let promptText = "";
+    const ask = async (p: string) => { promptText = p; return "a"; };
+    const prompt = makeApprovalPrompt(ask, true);
+    const decisions = await prompt([{ ...req("d"), sensitive: true, dangerous: true }]);
+    expect(decisions.get("d")).toBe("deny"); // [a] 无效 → 按拒绝处理
+    expect(promptText).toContain("[y]是(仅本次) [n]否");
+    expect(promptText).not.toContain("[a]");
+  });
+
+  it("非敏感请求:普通文案'同类不再问'", async () => {
+    let promptText = "";
+    const ask = async (p: string) => { promptText = p; return "y"; };
+    const prompt = makeApprovalPrompt(ask, true);
+    await prompt([req("n")]);
+    expect(promptText).toContain("[a]始终允许(记住,同类不再问)");
+  });
 });
