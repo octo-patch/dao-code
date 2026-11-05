@@ -42,7 +42,7 @@ export const KNOWN_PRICES: Record<string, Prices> = {
   // MiniMax official USD prices converted at the repository's 6.8 CNY/USD rate.
   // M3 uses the published standard-tier baseline; the >512k tier is retained in
   // the source inventory because the published threshold is not an integer expansion.
-  "minimax-m3.1-flash": { inputHit: 0.102, inputMiss: 1.02, output: 4.08 },
+  "minimax-m3-1-flash": { inputHit: 0.102, inputMiss: 1.02, output: 4.08 },
   "minimax-m3": { inputHit: 0.408, inputMiss: 2.04, output: 8.16 },
   // Legacy Volcengine alias retained for explicit saved/custom profiles.
   "minimax-m2.7": { inputHit: 0.42, inputMiss: 2.1, output: 8.4 },
